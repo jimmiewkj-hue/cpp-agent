@@ -273,14 +273,19 @@ class AnsiTui {
         GetConsoleMode(stdoutHandle, &consoleMode)) {
       SetConsoleMode(stdoutHandle,
                      consoleMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING |
-                         ENABLE_WINDOW_INPUT);
+                         ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT);
     }
+    WriteAnsi("\x1b[?1000h");
+    WriteAnsi("\x1b[?1006h");
     RedrawAll();
   }
 
   void Shutdown() {
     ShowCursor();
+    WriteAnsi("\x1b[?1000l");
+    WriteAnsi("\x1b[?1006l");
     WriteAnsi("\x1b[0m");
+    WriteAnsi("\x1b[?25h");
     std::cout << std::endl << "Session saved. Bye." << std::endl;
   }
 
@@ -310,13 +315,30 @@ class AnsiTui {
       while (static_cast<int>(state_.logLines.size()) > 200)
         state_.logLines.pop_front();
     }
+    scrollOffset_ = 999999;
     RefreshMessages();
   }
 
   void RefreshMessages() {
     const auto sz = GetConsoleSize();
+    int totalLines = 0;
+    {
+      std::lock_guard<std::mutex> lock(state_.mutex);
+      totalLines = static_cast<int>(state_.logLines.size());
+    }
+    int maxVisible = msgHeight_ - 2;
+    if (maxVisible < 1) maxVisible = 1;
+    if (scrollOffset_ < 0) scrollOffset_ = 0;
+    int maxOffset = totalLines - maxVisible;
+    if (maxOffset < 0) maxOffset = 0;
+    if (scrollOffset_ > maxOffset) scrollOffset_ = maxOffset;
     RenderMessageArea(msgTop_, msgHeight_, sz.width);
     SetCursorPosition(2, sz.height - 1);
+  }
+
+  void ScrollBy(int delta) {
+    scrollOffset_ += delta;
+    RefreshMessages();
   }
 
   void RefreshStatus() {
@@ -333,11 +355,97 @@ class AnsiTui {
     WriteAnsi("\x1b[0K");
     std::cout << "\x1b[37m> \x1b[0m" << std::flush;
     ShowCursor();
+
     std::string line;
-    if (!std::getline(std::cin, line)) {
+    HANDLE inHandle = GetStdHandle(STD_INPUT_HANDLE);
+
+    DWORD consoleMode = 0;
+    bool isConsole = GetConsoleMode(inHandle, &consoleMode) != 0;
+
+    if (!isConsole) {
+      if (!std::getline(std::cin, line)) {
+        HideCursor();
+        return "";
+      }
       HideCursor();
-      return "";
+      SetCursorPosition(2, inputY);
+      WriteAnsi("\x1b[0K");
+      std::cout << "> " << std::flush;
+      return line;
     }
+
+    while (true) {
+      INPUT_RECORD record;
+      DWORD eventsRead = 0;
+      if (!ReadConsoleInputW(inHandle, &record, 1, &eventsRead) || eventsRead == 0)
+        break;
+
+      if (record.EventType == MOUSE_EVENT) {
+        MOUSE_EVENT_RECORD& mouse = record.Event.MouseEvent;
+        if (mouse.dwEventFlags & MOUSE_WHEELED) {
+          int delta = static_cast<int>(mouse.dwButtonState >> 16);
+          int scrollDelta = (delta > 0) ? -3 : 3;
+          ScrollBy(scrollDelta);
+          continue;
+        }
+        continue;
+      }
+
+      if (record.EventType != KEY_EVENT) continue;
+      KEY_EVENT_RECORD& key = record.Event.KeyEvent;
+      if (!key.bKeyDown) continue;
+
+      if (key.wVirtualKeyCode == VK_PRIOR) {
+        ScrollBy(-(msgHeight_ - 4));
+        continue;
+      }
+      if (key.wVirtualKeyCode == VK_NEXT) {
+        ScrollBy(msgHeight_ - 4);
+        continue;
+      }
+      if (key.wVirtualKeyCode == VK_UP) {
+        ScrollBy(-1);
+        continue;
+      }
+      if (key.wVirtualKeyCode == VK_HOME) {
+        scrollOffset_ = 0;
+        RefreshMessages();
+        continue;
+      }
+      if (key.wVirtualKeyCode == VK_END) {
+        scrollOffset_ = 999999;
+        RefreshMessages();
+        continue;
+      }
+      if (key.wVirtualKeyCode == VK_DOWN) {
+        ScrollBy(1);
+        continue;
+      }
+      if (key.wVirtualKeyCode == VK_ESCAPE) {
+        state_.quitRequested.store(true);
+        line = "/exit";
+        break;
+      }
+      if (key.wVirtualKeyCode == VK_RETURN) {
+        if (!line.empty()) break;
+        continue;
+      }
+
+      for (int i = 0; i < key.wRepeatCount && key.uChar.AsciiChar != 0; ++i) {
+        char ch = key.uChar.AsciiChar;
+        if (ch == '\r' || ch == '\n') continue;
+        if (ch >= 32 && ch < 127) {
+          line.push_back(ch);
+          std::cout << ch << std::flush;
+        } else if (ch == 8 || ch == 127) {
+          if (!line.empty()) {
+            line.pop_back();
+            std::cout << "\b \b" << std::flush;
+          }
+        }
+      }
+    }
+
     HideCursor();
     SetCursorPosition(2, inputY);
     WriteAnsi("\x1b[0K");
@@ -415,12 +523,14 @@ class AnsiTui {
     }
 
     int maxVisible = height - 2;
-    std::size_t startIdx = 0;
-    if (static_cast<int>(logLines.size()) > maxVisible) {
-      startIdx = logLines.size() - maxVisible;
-    }
+    if (maxVisible < 1) maxVisible = 1;
+    int totalLines = static_cast<int>(logLines.size());
+    int maxOffset = totalLines - maxVisible;
+    if (maxOffset < 0) maxOffset = 0;
+    if (scrollOffset_ > maxOffset) scrollOffset_ = maxOffset;
+    std::size_t startIdx = static_cast<std::size_t>(scrollOffset_);
 
-    for (int row = 1; row < height - 1; ++row) {
+    for (int row = 1; row < height - 2; ++row) {
       SetCursorPosition(0, startY + row);
       std::cout << "\x1b[32m\xe2\x94\x82\x1b[0m ";
       std::size_t idx = startIdx + row - 1;
@@ -432,6 +542,20 @@ class AnsiTui {
       }
       std::cout << "\x1b[32m\xe2\x94\x82\x1b[0m";
     }
+
+    SetCursorPosition(0, startY + height - 2);
+    std::cout << "\x1b[32m\xe2\x94\x82\x1b[0m ";
+    {
+       std::ostringstream hint;
+       int visibleEnd = scrollOffset_ + maxVisible;
+       if (visibleEnd > totalLines) visibleEnd = totalLines;
+       hint << "[PgUp/PgDn or mouse]  " << visibleEnd << "/" << totalLines;
+      std::string hintStr = hint.str();
+      if (static_cast<int>(hintStr.size()) > boxW - 2)
+        hintStr = hintStr.substr(0, boxW - 2);
+      std::cout << PadRight(hintStr, boxW - 2);
+    }
+    std::cout << "\x1b[32m\xe2\x94\x82\x1b[0m";
 
     SetCursorPosition(0, startY + height - 1);
     std::cout << "\x1b[32m\xe2\x94\x94";
@@ -472,6 +596,7 @@ class AnsiTui {
   int msgTop_ = 0;
   int msgHeight_ = 0;
   int welcomeLines_ = 0;
+  int scrollOffset_ = 0;
 };
 
 }  // namespace
@@ -536,6 +661,7 @@ int main() {
   engine.SetConfig(config);
   engine.SetModel(llmCfg.mainModel);
   engine.SetFallbackModel(llmCfg.fallbackModel);
+  engine.SetValidatorModel(llmCfg.validatorModel);
   engine.SetMemoryIndex(&memoryIndex);
   engine.SetSubAgentManager(&subAgentManager);
   engine.SetSessionDir(sessionDir);

@@ -2,7 +2,6 @@
 
 #include "api/ModelClient.h"
 #include "api/SideQueryClient.h"
-#include "core/StreamingToolExecutor.h"
 #include "permissions/PermissionEngine.h"
 #include "tools/ToolOrchestrator.h"
 #include "tools/ToolRegistry.h"
@@ -251,6 +250,25 @@ std::string BuildValidatorSystemPrompt() {
          "Return only <validation_json>{...}</validation_json> with "
          "corrected_text, tool_interventions (rewrite/block), "
          "and final_response_action (approve/retry_from_tools).";
+}
+
+std::string BuildToolsJson(const tools::ToolRegistry* toolRegistry) {
+  if (!toolRegistry) return "[]";
+  const auto tools = toolRegistry->ListTools();
+  json jarr = json::array();
+  for (const auto& tool : tools) {
+    json jtool;
+    jtool["type"] = "function";
+    jtool["function"]["name"] = tool.name;
+    jtool["function"]["description"] = tool.description;
+    try {
+      jtool["function"]["parameters"] = json::parse(tool.inputSchemaJson);
+    } catch (...) {
+      jtool["function"]["parameters"] = json::object();
+    }
+    jarr.push_back(jtool);
+  }
+  return jarr.dump();
 }
 
 void PersistOversizedResult(const std::string& sessionDir,
@@ -505,9 +523,6 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
   state.assistantMessages.clear();
   state.toolUseBlocks.clear();
 
-  StreamingToolExecutor executor(
-      const_cast<tools::ToolOrchestrator&>(toolOrchestrator_), ctx.messages);
-
   Message currentAssistant;
   currentAssistant.role = MessageRole::Assistant;
   currentAssistant.uuid = "stream-asst";
@@ -541,16 +556,6 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
         ContentBlock tb = ContentBlock::MakeToolUse(toolId, toolName, inputJson);
         currentAssistant.content.push_back(tb);
         state.toolUseBlocks.push_back(tb);
-        executor.AddTool(tb);
-        if (toolName == "FileRead" || toolName == "Grep" || toolName == "Glob") {
-          executor.ExecutePending();
-          for (auto& r : executor.YieldCompletedResults()) {
-            if (r.type == BlockType::ToolResult) {
-              Message em; em.role = MessageRole::User;
-              em.content.push_back(r); ctx.messages.push_back(em);
-            }
-          }
-        }
       }
     } else if (event == "stop_reason") {
       currentAssistant.stopReason = data;
@@ -561,7 +566,9 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
   };
 
   modelClient_.StreamResponse(ctx.messages, ctx.systemPrompt,
-                              ctx.model, callback);
+                              ctx.model,
+                              BuildToolsJson(toolOrchestrator_.GetToolRegistry()),
+                              callback);
 
   if (!textBuffer.str().empty())
     currentAssistant.content.push_back(
@@ -573,16 +580,6 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
     state.assistantMessages.push_back(currentAssistant);
   }
 
-  if (!state.toolUseBlocks.empty()) {
-    executor.ExecutePending();
-    for (auto& r : executor.YieldCompletedResults()) {
-      if (r.type == BlockType::ToolResult) {
-        Message lm; lm.role = MessageRole::User;
-        lm.content.push_back(r); ctx.messages.push_back(lm);
-      }
-    }
-  }
-
   return !state.toolUseBlocks.empty();
 }
 
@@ -590,13 +587,16 @@ void QueryLoop::ApplyStepValidator(QueryLoopContext& ctx,
                                    QueryLoopInternalState& state) {
   if (!IsValidationEnabled()) return;
 
+  const std::string validatorModel = ctx.validatorModel.empty()
+                                         ? ctx.model : ctx.validatorModel;
+
   std::string contextJson = BuildValidationContext(
       ctx.messages, state.assistantMessages, state.toolUseBlocks,
       toolOrchestrator_.GetToolRegistry());
 
   api::SideQueryRequest request;
   request.querySource = "validator";
-  request.model = ctx.model;
+  request.model = validatorModel;
   request.systemPrompt = BuildValidatorSystemPrompt();
   request.messages.clear();
 

@@ -80,6 +80,10 @@ void QueryEngine::SetFallbackModel(const std::string& model) {
   fallbackModel_ = model;
 }
 
+void QueryEngine::SetValidatorModel(const std::string& model) {
+  validatorModel_ = model;
+}
+
 void QueryEngine::SetMemoryIndex(memory::MemoryIndex* memoryIndex) {
   memoryIndex_ = memoryIndex;
 }
@@ -129,6 +133,7 @@ void QueryEngine::RunTurn() {
   loopCtx_.systemPrompt = BuildEffectiveSystemPrompt();
   loopCtx_.model = model_;
   loopCtx_.fallbackModel = fallbackModel_;
+  loopCtx_.validatorModel = validatorModel_;
   loopCtx_.sessionDir = sessionDir_;
 
   QueryLoop loop(toolOrchestrator_, permissionEngine_, modelClient_,

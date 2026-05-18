@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <winhttp.h>
 
+#include <chrono>
 #include <sstream>
 
 namespace agent {
@@ -179,18 +180,30 @@ std::string ExtractOpenAIDeltaToolArgs(const std::string& jsonData) {
   auto pos = jsonData.find(key);
   if (pos == std::string::npos) return std::string();
   pos += key.size();
+  auto end = pos;
+  int depth = 0;
+  bool inString = false;
+  while (end < jsonData.size()) {
+    char c = jsonData[end];
+    if (c == '\\' && end + 1 < jsonData.size()) { end += 2; continue; }
+    if (c == '"' && !inString) break;
+    if (c == '{') { if (!inString) depth++; }
+    else if (c == '}') { if (!inString) depth--; }
+    inString = (c == '"' && !inString);
+    ++end;
+  }
+  if (end >= jsonData.size()) return std::string();
+  std::string raw = jsonData.substr(pos, end - pos);
   std::string result;
-  while (pos < jsonData.size()) {
-    if (jsonData[pos] == '\\' && pos + 1 < jsonData.size()) {
-      char next = jsonData[pos + 1];
-      if (next == 'n') { result.push_back('\n'); pos += 2; continue; }
-      if (next == '"') { result.push_back('"'); pos += 2; continue; }
-      if (next == '\\') { result.push_back('\\'); pos += 2; continue; }
-      result.push_back(jsonData[pos]); ++pos; continue;
+  for (std::size_t i = 0; i < raw.size(); ++i) {
+    if (raw[i] == '\\' && i + 1 < raw.size()) {
+      char next = raw[i + 1];
+      if (next == 'n') { result.push_back('\n'); ++i; continue; }
+      if (next == '"') { result.push_back('"'); ++i; continue; }
+      if (next == '\\') { result.push_back('\\'); ++i; continue; }
+      result.push_back(raw[i]); continue;
     }
-    if (jsonData[pos] == '"') break;
-    result.push_back(jsonData[pos]);
-    ++pos;
+    result.push_back(raw[i]);
   }
   return result;
 }
@@ -207,42 +220,93 @@ std::string ExtractOpenAIDeltaFinishReason(const std::string& jsonData) {
 
 void ParseOpenAISseDelta(const std::string& rawBody,
                          const SseEventCallback& onEvent) {
+  std::string pendingToolName;
+  std::string pendingToolArgs;
+  std::string pendingToolId;
+
   SseEventCallback wrapper = [&](const std::string& /*event*/, const std::string& data) {
     if (data == "[DONE]") {
+      if (!pendingToolName.empty() && !pendingToolArgs.empty()) {
+        std::ostringstream toolEvent;
+        toolEvent << "{\"id\":\"" << pendingToolId << "\",\"name\":\""
+                  << pendingToolName << "\",\"input\":" << pendingToolArgs << "}";
+        if (onEvent) onEvent("tool_use", toolEvent.str());
+        pendingToolName.clear();
+        pendingToolArgs.clear();
+        pendingToolId.clear();
+      }
       if (onEvent) onEvent("stop_reason", "stop");
       return;
     }
 
     auto content = ExtractOpenAIDeltaContent(data);
     if (!content.empty()) {
+      if (!pendingToolName.empty() && !pendingToolArgs.empty()) {
+        std::ostringstream toolEvent;
+        toolEvent << "{\"id\":\"" << pendingToolId << "\",\"name\":\""
+                  << pendingToolName << "\",\"input\":" << pendingToolArgs << "}";
+        if (onEvent) onEvent("tool_use", toolEvent.str());
+        pendingToolName.clear();
+        pendingToolArgs.clear();
+        pendingToolId.clear();
+      }
       if (onEvent) onEvent("text_delta", content);
       return;
     }
 
     auto toolName = ExtractOpenAIDeltaToolName(data);
     if (!toolName.empty()) {
-      auto toolArgs = ExtractOpenAIDeltaToolArgs(data);
-      if (toolArgs.empty()) toolArgs = "{}";
-      std::ostringstream toolEvent;
-      toolEvent << "{\"id\":\"oaitu-001\",\"name\":\""
-                << toolName << "\",\"input\":" << toolArgs << "}";
-      if (onEvent) onEvent("tool_use", toolEvent.str());
+      if (!pendingToolName.empty() && !pendingToolArgs.empty()) {
+        std::ostringstream toolEvent;
+        toolEvent << "{\"id\":\"" << pendingToolId << "\",\"name\":\""
+                  << pendingToolName << "\",\"input\":" << pendingToolArgs << "}";
+        if (onEvent) onEvent("tool_use", toolEvent.str());
+        pendingToolArgs.clear();
+      }
+      pendingToolName = toolName;
+      pendingToolArgs.clear();
+      pendingToolId = "oaitu-" + std::to_string(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch()).count());
+      return;
+    }
+
+    auto toolArgs = ExtractOpenAIDeltaToolArgs(data);
+    if (!toolArgs.empty()) {
+      pendingToolArgs += toolArgs;
       return;
     }
 
     auto finishReason = ExtractOpenAIDeltaFinishReason(data);
     if (!finishReason.empty() && finishReason != "null") {
+      if (!pendingToolName.empty() && !pendingToolArgs.empty()) {
+        std::ostringstream toolEvent;
+        toolEvent << "{\"id\":\"" << pendingToolId << "\",\"name\":\""
+                  << pendingToolName << "\",\"input\":" << pendingToolArgs << "}";
+        if (onEvent) onEvent("tool_use", toolEvent.str());
+        pendingToolName.clear();
+        pendingToolArgs.clear();
+        pendingToolId.clear();
+      }
       if (onEvent) onEvent("stop_reason", finishReason);
       return;
     }
   };
   ParseSseBody(rawBody, wrapper);
+
+  if (!pendingToolName.empty() && !pendingToolArgs.empty()) {
+    std::ostringstream toolEvent;
+    toolEvent << "{\"id\":\"" << pendingToolId << "\",\"name\":\""
+              << pendingToolName << "\",\"input\":" << pendingToolArgs << "}";
+    if (onEvent) onEvent("tool_use", toolEvent.str());
+  }
 }
 
 }  // namespace
 
 void ModelClient::StreamResponse(
     const std::vector<core::Message>&,
+    const std::string&,
     const std::string&,
     const std::string&,
     const SseEventCallback&) {}
@@ -279,6 +343,7 @@ std::vector<core::Message> SkeletonModelClient::GenerateResponse(
 
 void SkeletonModelClient::StreamResponse(
     const std::vector<core::Message>&,
+    const std::string&,
     const std::string&,
     const std::string&,
     const SseEventCallback& onEvent) {
@@ -346,15 +411,19 @@ std::string HttpLlmClient::BuildRequestBody(
     const std::vector<core::Message>& messages,
     const std::string& systemPrompt,
     const std::string& model,
-    int maxTokens, bool stream) const {
+    int maxTokens, bool stream,
+    const std::string& toolsJson) const {
   std::ostringstream body;
   body << "{"
        << "\"model\":\"" << EscapeJson(model) << "\","
        << "\"max_tokens\":" << maxTokens << ","
        << "\"stream\":" << (stream ? "true" : "false") << ","
        << "\"system\":\"" << EscapeJson(systemPrompt) << "\","
-       << "\"messages\":" << BuildMessagesJson(messages)
-       << "}";
+       << "\"messages\":" << BuildMessagesJson(messages);
+  if (!toolsJson.empty()) {
+    body << ",\"tools\":" << toolsJson;
+  }
+  body << "}";
   return body.str();
 }
 
@@ -485,7 +554,7 @@ std::vector<core::Message> HttpLlmClient::GenerateResponse(
     const std::string& model) {
   std::string actualModel = model.empty() ? config_.mainModel : model;
   std::string body = BuildRequestBody(messages, systemPrompt, actualModel,
-                                      4096, false);
+                                      4096, false, "");
   std::string error;
   std::string raw = SendHttpPost(body, actualModel, nullptr, &error);
   (void)raw;
@@ -504,10 +573,11 @@ void HttpLlmClient::StreamResponse(
     const std::vector<core::Message>& messages,
     const std::string& systemPrompt,
     const std::string& model,
+    const std::string& toolsJson,
     const SseEventCallback& onEvent) {
   std::string actualModel = model.empty() ? config_.mainModel : model;
   std::string body = BuildRequestBody(messages, systemPrompt, actualModel,
-                                      4096, true);
+                                      4096, true, toolsJson);
   std::string error;
   std::string raw = SendHttpPost(body, actualModel, nullptr, &error);
   if (!error.empty()) {
@@ -528,7 +598,7 @@ std::vector<core::Message> HttpLlmClient::SideQuery(
   std::string actualModel = model.empty() ? config_.validatorModel : model;
   if (actualModel.empty()) actualModel = config_.mainModel;
   std::string body = BuildRequestBody(messages, systemPrompt, actualModel,
-                                      1024, false);
+                                      1024, false, "");
   std::string error;
   std::string raw = SendHttpPost(body, actualModel, nullptr, &error);
   if (!error.empty()) {

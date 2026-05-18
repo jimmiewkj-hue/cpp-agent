@@ -100,7 +100,7 @@ void TestSkeletonModelClientStream() {
     ++eventCount;
   };
 
-  client.StreamResponse(msgs, "system", "model", cb);
+  client.StreamResponse(msgs, "system", "model", "", cb);
   Check(eventCount > 0, "SkeletonModelClient stream should emit events");
 }
 

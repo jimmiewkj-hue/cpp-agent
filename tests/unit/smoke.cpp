@@ -224,6 +224,7 @@ class RecordingModelClient : public agent::api::ModelClient {
       const std::vector<agent::core::Message>&,
       const std::string& systemPrompt,
       const std::string&,
+      const std::string&,
       const agent::api::SseEventCallback& onEvent) override {
     lastSystemPrompt = systemPrompt;
     if (onEvent) {

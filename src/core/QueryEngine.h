@@ -53,6 +53,7 @@ struct QueryLoopContext {
   std::string systemPrompt;
   std::string model;
   std::string fallbackModel;
+  std::string validatorModel;
   ContentReplacementState replacementState;
   AutoCompactTrackingState autoCompactTracking;
   int maxOutputTokensRecoveryCount = 0;
@@ -88,6 +89,7 @@ class QueryEngine {
   void SetSystemPrompt(const std::string& systemPrompt);
   void SetModel(const std::string& model);
   void SetFallbackModel(const std::string& model);
+  void SetValidatorModel(const std::string& model);
   void SetMemoryIndex(memory::MemoryIndex* memoryIndex);
   void SetSubAgentManager(agents::SubAgentManager* subAgentManager);
   void SetStabilityWatchdog(infra::StabilityWatchdog* watchdog);
@@ -116,6 +118,7 @@ class QueryEngine {
   std::string systemPrompt_;
   std::string model_;
   std::string fallbackModel_;
+  std::string validatorModel_;
   std::vector<Message> messages_;
   SessionMetadata metadata_;
   QueryLoopContext loopCtx_;
