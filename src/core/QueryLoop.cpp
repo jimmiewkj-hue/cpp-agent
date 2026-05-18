@@ -5,6 +5,8 @@
 #include "core/StreamingToolExecutor.h"
 #include "permissions/PermissionEngine.h"
 #include "tools/ToolOrchestrator.h"
+#include "tools/ToolRegistry.h"
+#include "third_party/nlohmann_json.hpp"
 
 #include <windows.h>
 
@@ -12,6 +14,8 @@
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
+
+using json = nlohmann::json;
 
 namespace agent {
 namespace core {
@@ -87,52 +91,36 @@ ValidationResult ParseValidationResponse(const std::string& text) {
   std::string jsonBlock = ExtractXml(text, "validation_json");
 
   if (!jsonBlock.empty()) {
-    auto correctedText = ExtractJsonStringField(jsonBlock, "corrected_text");
-    if (!correctedText.empty()) result.correctedText = correctedText;
+    try {
+      auto j = json::parse(jsonBlock);
 
-    auto action = ExtractJsonStringField(jsonBlock, "final_response_action");
-    if (action == "retry_from_tools")
-      result.finalResponseAction = "retry_from_tools";
+      if (j.contains("corrected_text") && j["corrected_text"].is_string())
+        result.correctedText = j["corrected_text"].get<std::string>();
 
-    auto guidance = ExtractJsonStringField(jsonBlock, "retry_guidance");
-    if (!guidance.empty()) result.retryGuidance = guidance;
+      if (j.contains("final_response_action") && j["final_response_action"].is_string())
+        result.finalResponseAction = j["final_response_action"].get<std::string>();
 
-    std::string ti = "\"tool_interventions\":";
-    auto tiPos = jsonBlock.find(ti);
-    if (tiPos != std::string::npos) {
-      auto arrStart = jsonBlock.find('[', tiPos);
-      if (arrStart != std::string::npos) {
-        int depth = 0;
-        auto arrEnd = arrStart;
-        for (; arrEnd < jsonBlock.size(); ++arrEnd) {
-          if (jsonBlock[arrEnd] == '[') ++depth;
-          else if (jsonBlock[arrEnd] == ']') { --depth; if (!depth) break; }
-        }
-        std::string arr = jsonBlock.substr(arrStart, arrEnd - arrStart + 1);
+      if (j.contains("retry_guidance") && j["retry_guidance"].is_string())
+        result.retryGuidance = j["retry_guidance"].get<std::string>();
 
-        int objDepth = 0;
-        std::size_t objStart = std::string::npos;
-        for (std::size_t i = 0; i < arr.size(); ++i) {
-          if (arr[i] == '{') {
-            if (objDepth == 0) objStart = i;
-            ++objDepth;
-          } else if (arr[i] == '}') {
-            --objDepth;
-            if (objDepth == 0 && objStart != std::string::npos) {
-              std::string obj = arr.substr(objStart, i - objStart + 1);
-              ValidationToolIntervention vti;
-              vti.toolUseId = ExtractJsonStringField(obj, "tool_use_id");
-              vti.action = ExtractJsonStringField(obj, "action");
-              vti.correctedName = ExtractJsonStringField(obj, "corrected_name");
-              vti.correctedInputJson = ExtractJsonStringField(obj, "corrected_input");
-              vti.blockGuidance = ExtractJsonStringField(obj, "block_reason");
-              if (!vti.toolUseId.empty() && !vti.action.empty())
-                result.toolInterventions.push_back(vti);
-              objStart = std::string::npos;
-            }
-          }
+      if (j.contains("tool_interventions") && j["tool_interventions"].is_array()) {
+        for (const auto& ti : j["tool_interventions"]) {
+          ValidationToolIntervention vti;
+          if (ti.contains("tool_use_id"))
+            vti.toolUseId = ti["tool_use_id"].get<std::string>();
+          if (ti.contains("action"))
+            vti.action = ti["action"].get<std::string>();
+          if (ti.contains("corrected_name"))
+            vti.correctedName = ti["corrected_name"].get<std::string>();
+          if (ti.contains("corrected_input"))
+            vti.correctedInputJson = ti["corrected_input"].dump();
+          if (ti.contains("block_reason"))
+            vti.blockGuidance = ti["block_reason"].get<std::string>();
+          if (!vti.toolUseId.empty() && !vti.action.empty())
+            result.toolInterventions.push_back(vti);
         }
       }
+    } catch (...) {
     }
   }
 
@@ -183,7 +171,8 @@ void ApplyToolInterventions(
 std::string BuildValidationContext(
     const std::vector<Message>& messages,
     const std::vector<Message>& assistantMessages,
-    const std::vector<ContentBlock>& toolUseBlocks) {
+    const std::vector<ContentBlock>& toolUseBlocks,
+    const tools::ToolRegistry* toolRegistry) {
   std::ostringstream ctx;
   ctx << "{\"user_goal\":\"";
 
@@ -236,6 +225,21 @@ std::string BuildValidationContext(
         ctx << (ch == '"' ? "\\\"" : ch == '\n' ? "\\n" : std::string(1, ch));
       ctx << "\"";
       ++evCount;
+    }
+  }
+  ctx << "],\"available_tool_schemas\":[";
+  if (toolRegistry != nullptr) {
+    const auto tools = toolRegistry->ListTools();
+    bool firstSchema = true;
+    for (const auto& tool : tools) {
+      if (!firstSchema) ctx << ","; firstSchema = false;
+      ctx << "{\"name\":\"" << tool.name << "\"";
+      ctx << ",\"description\":\"";
+      for (char ch : tool.description)
+        ctx << (ch == '"' ? "\\\"" : ch == '\n' ? "\\n" : std::string(1, ch));
+      ctx << "\"";
+      ctx << ",\"schema\":" << (tool.inputSchemaJson.empty() ? "{}" : tool.inputSchemaJson);
+      ctx << "}";
     }
   }
   ctx << "]}";
@@ -520,27 +524,18 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
             ContentBlock::MakeText(textBuffer.str()));
         textBuffer.str(""); textBuffer.clear();
       }
-      auto extractStr = [&](const char* key) -> std::string {
-        std::string n = std::string("\"") + key + "\":\"";
-        auto p = data.find(n); if (p == std::string::npos) return {};
-        auto s = p + n.size(); auto e = data.find('"', s);
-        if (e == std::string::npos) return {};
-        return data.substr(s, e - s);
-      };
-      std::string toolId = extractStr("id");
-      std::string toolName = extractStr("name");
+      std::string toolId;
+      std::string toolName;
       std::string inputJson = "{}";
-      auto ip = data.find("\"input\":");
-      if (ip != std::string::npos) {
-        auto s = data.find('{', ip);
-        if (s != std::string::npos) {
-          int d = 0; auto e = s;
-          for (; e < data.size(); ++e) {
-            if (data[e] == '{') ++d;
-            else if (data[e] == '}') { --d; if (!d) { ++e; break; } }
-          }
-          inputJson = data.substr(s, e - s);
-        }
+      try {
+        auto j = json::parse(data);
+        if (j.contains("id") && j["id"].is_string())
+          toolId = j["id"].get<std::string>();
+        if (j.contains("name") && j["name"].is_string())
+          toolName = j["name"].get<std::string>();
+        if (j.contains("input"))
+          inputJson = j["input"].dump();
+      } catch (...) {
       }
       if (!toolId.empty()) {
         ContentBlock tb = ContentBlock::MakeToolUse(toolId, toolName, inputJson);
@@ -596,7 +591,8 @@ void QueryLoop::ApplyStepValidator(QueryLoopContext& ctx,
   if (!IsValidationEnabled()) return;
 
   std::string contextJson = BuildValidationContext(
-      ctx.messages, state.assistantMessages, state.toolUseBlocks);
+      ctx.messages, state.assistantMessages, state.toolUseBlocks,
+      toolOrchestrator_.GetToolRegistry());
 
   api::SideQueryRequest request;
   request.querySource = "validator";

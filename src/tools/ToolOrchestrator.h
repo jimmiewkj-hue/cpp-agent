@@ -22,6 +22,7 @@ class ToolOrchestrator {
   ToolOrchestrator();
 
   void SetToolRegistry(const ToolRegistry* registry);
+  const ToolRegistry* GetToolRegistry() const { return toolRegistry_; }
   void SetSubAgentManager(agents::SubAgentManager* subAgentManager);
 
   std::vector<ToolBatch> PartitionToolCalls(
@@ -62,8 +63,6 @@ class ToolOrchestrator {
                           int maxResultSize,
                           std::string* error) const;
 
-  static std::string ExtractJsonString(const std::string& json,
-                                       const std::string& key);
   static std::string TruncateResult(const std::string& result,
                                     int maxSize);
 

@@ -2,6 +2,7 @@
 
 #include "agents/SubAgentManager.h"
 #include "tools/ToolRegistry.h"
+#include "third_party/nlohmann_json.hpp"
 
 #include <windows.h>
 
@@ -10,6 +11,8 @@
 #include <fstream>
 #include <sstream>
 
+using json = nlohmann::json;
+
 namespace agent {
 namespace tools {
 
@@ -17,6 +20,51 @@ namespace {
 
 static const int kDefaultMaxResultChars = 100000;
 static const int kMaxToolResultTruncation = 400000;
+
+std::string JsonGetString(const std::string& jsonStr,
+                          const std::string& key,
+                          const std::string& fallback = std::string()) {
+  try {
+    auto j = json::parse(jsonStr);
+    if (j.contains(key) && j[key].is_string()) {
+      return j[key].get<std::string>();
+    }
+  } catch (...) {
+  }
+  return fallback;
+}
+
+std::string JsonGetStringMultiKey(const std::string& jsonStr,
+                                  const std::vector<std::string>& keys,
+                                  const std::string& fallback = std::string()) {
+  try {
+    auto j = json::parse(jsonStr);
+    for (const auto& key : keys) {
+      if (j.contains(key) && j[key].is_string()) {
+        return j[key].get<std::string>();
+      }
+    }
+  } catch (...) {
+  }
+  return fallback;
+}
+
+bool JsonGetBool(const std::string& jsonStr,
+                 const std::string& key,
+                 bool fallback = false) {
+  try {
+    auto j = json::parse(jsonStr);
+    if (j.contains(key) && j[key].is_boolean()) {
+      return j[key].get<bool>();
+    }
+    if (j.contains(key) && j[key].is_string()) {
+      const std::string val = j[key].get<std::string>();
+      return val == "true" || val == "1";
+    }
+  } catch (...) {
+  }
+  return fallback;
+}
 
 bool CaseInsensitiveCompare(const std::string& a, const std::string& b) {
   if (a.size() != b.size()) return false;
@@ -258,46 +306,6 @@ std::vector<ToolBatch> ToolOrchestrator::PartitionToolCalls(
   return batches;
 }
 
-std::string ToolOrchestrator::ExtractJsonString(const std::string& json,
-                                                const std::string& key) {
-  const std::string token = "\"" + key + "\"";
-  std::size_t pos = json.find(token);
-  if (pos == std::string::npos) return std::string();
-
-  pos = json.find(':', pos + token.size());
-  if (pos == std::string::npos) return std::string();
-
-  pos = json.find('"', pos + 1);
-  if (pos == std::string::npos) return std::string();
-
-  std::size_t end = pos + 1;
-  while (end < json.size()) {
-    if (json[end] == '\\') {
-      end += 2;
-      continue;
-    }
-    if (json[end] == '"') break;
-    ++end;
-  }
-  if (end >= json.size()) return std::string();
-
-  std::string value;
-  for (std::size_t i = pos + 1; i < end; ++i) {
-    if (json[i] == '\\' && i + 1 < end) {
-      char next = json[i + 1];
-      if (next == 'n') { value.push_back('\n'); ++i; }
-      else if (next == 'r') { value.push_back('\r'); ++i; }
-      else if (next == 't') { value.push_back('\t'); ++i; }
-      else if (next == '"') { value.push_back('"'); ++i; }
-      else if (next == '\\') { value.push_back('\\'); ++i; }
-      else { value.push_back(json[i]); }
-    } else {
-      value.push_back(json[i]);
-    }
-  }
-  return value;
-}
-
 std::string ToolOrchestrator::TruncateResult(const std::string& result,
                                              int maxSize) {
   if (maxSize <= 0 || static_cast<int>(result.size()) <= maxSize) {
@@ -352,10 +360,7 @@ std::string ToolOrchestrator::ExecuteToolBlock(
 std::string ToolOrchestrator::ExecuteBash(const std::string& inputJson,
                                           int maxResultSize,
                                           std::string* error) const {
-  std::string command = ExtractJsonString(inputJson, "command");
-  if (command.empty()) {
-    command = ExtractJsonString(inputJson, "cmd");
-  }
+  std::string command = JsonGetStringMultiKey(inputJson, {"command", "cmd"});
   if (command.empty()) {
     if (error) *error = "Bash tool requires 'command' parameter";
     return std::string();
@@ -391,10 +396,7 @@ std::string ToolOrchestrator::ExecuteBash(const std::string& inputJson,
 std::string ToolOrchestrator::ExecuteFileRead(const std::string& inputJson,
                                               int maxResultSize,
                                               std::string* error) const {
-  std::string filePath = ExtractJsonString(inputJson, "file_path");
-  if (filePath.empty()) {
-    filePath = ExtractJsonString(inputJson, "path");
-  }
+  std::string filePath = JsonGetStringMultiKey(inputJson, {"file_path", "path"});
   if (filePath.empty()) {
     if (error) *error = "FileRead tool requires 'file_path' parameter";
     return std::string();
@@ -448,11 +450,8 @@ std::string ToolOrchestrator::ExecuteFileRead(const std::string& inputJson,
 std::string ToolOrchestrator::ExecuteFileWrite(const std::string& inputJson,
                                                int maxResultSize,
                                                std::string* error) const {
-  std::string filePath = ExtractJsonString(inputJson, "file_path");
-  if (filePath.empty()) {
-    filePath = ExtractJsonString(inputJson, "path");
-  }
-  std::string content = ExtractJsonString(inputJson, "content");
+  std::string filePath = JsonGetStringMultiKey(inputJson, {"file_path", "path"});
+  std::string content = JsonGetString(inputJson, "content");
 
   if (filePath.empty()) {
     if (error) *error = "FileWrite tool requires 'file_path' parameter";
@@ -481,14 +480,8 @@ std::string ToolOrchestrator::ExecuteFileWrite(const std::string& inputJson,
 std::string ToolOrchestrator::ExecuteGrep(const std::string& inputJson,
                                           int maxResultSize,
                                           std::string* error) const {
-  std::string pattern = ExtractJsonString(inputJson, "pattern");
-  if (pattern.empty()) {
-    pattern = ExtractJsonString(inputJson, "query");
-  }
-  std::string searchPath = ExtractJsonString(inputJson, "path");
-  if (searchPath.empty()) {
-    searchPath = ExtractJsonString(inputJson, "directory");
-  }
+  std::string pattern = JsonGetStringMultiKey(inputJson, {"pattern", "query"});
+  std::string searchPath = JsonGetStringMultiKey(inputJson, {"path", "directory"});
   if (searchPath.empty()) {
     searchPath = ".";
   }
@@ -524,11 +517,8 @@ std::string ToolOrchestrator::ExecuteGrep(const std::string& inputJson,
 std::string ToolOrchestrator::ExecuteGlob(const std::string& inputJson,
                                           int maxResultSize,
                                           std::string* error) const {
-  std::string pattern = ExtractJsonString(inputJson, "pattern");
-  if (pattern.empty()) {
-    pattern = ExtractJsonString(inputJson, "glob");
-  }
-  std::string directory = ExtractJsonString(inputJson, "path");
+  std::string pattern = JsonGetStringMultiKey(inputJson, {"pattern", "glob"});
+  std::string directory = JsonGetString(inputJson, "path");
   if (directory.empty()) {
     directory = ".";
   }
@@ -572,16 +562,11 @@ std::string ToolOrchestrator::ExecuteAgent(const std::string& inputJson,
     return "Error: Agent tool requires SubAgentManager configuration";
   }
 
-  std::string prompt = ExtractJsonString(inputJson, "prompt");
-  if (prompt.empty()) {
-    prompt = ExtractJsonString(inputJson, "description");
-  }
-  std::string subagentType = ExtractJsonString(inputJson, "subagent_type");
-  std::string isolation = ExtractJsonString(inputJson, "isolation");
+  std::string prompt = JsonGetStringMultiKey(inputJson, {"prompt", "description"});
+  std::string subagentType = JsonGetString(inputJson, "subagent_type");
+  std::string isolation = JsonGetString(inputJson, "isolation");
 
-  bool runInBackground = false;
-  std::string bg = ExtractJsonString(inputJson, "run_in_background");
-  if (bg == "true" || bg == "1") runInBackground = true;
+  bool runInBackground = JsonGetBool(inputJson, "run_in_background");
 
   if (prompt.empty()) {
     if (error) *error = "Agent tool requires 'prompt' parameter";

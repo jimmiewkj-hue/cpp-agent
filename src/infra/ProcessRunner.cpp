@@ -37,17 +37,31 @@ ProcessRunResult ProcessRunner::Run(const ProcessRunOptions& options) const {
   HANDLE stdoutWrite = nullptr;
   if (!CreatePipe(&stdoutRead, &stdoutWrite, &securityAttributes, 0)) {
     result.spawnFailed = true;
-    result.errorMessage = "CreatePipe failed";
+    result.errorMessage = "CreatePipe stdout failed";
     return result;
   }
-
   SetHandleInformation(stdoutRead, HANDLE_FLAG_INHERIT, 0);
+
+  HANDLE stdinRead = nullptr;
+  HANDLE stdinWrite = nullptr;
+  if (!options.stdinData.empty()) {
+    if (!CreatePipe(&stdinRead, &stdinWrite, &securityAttributes, 0)) {
+      result.spawnFailed = true;
+      result.errorMessage = "CreatePipe stdin failed";
+      CloseHandle(stdoutRead);
+      CloseHandle(stdoutWrite);
+      return result;
+    }
+    SetHandleInformation(stdinWrite, HANDLE_FLAG_INHERIT, 0);
+  }
 
   STARTUPINFOW startupInfo;
   ZeroMemory(&startupInfo, sizeof(startupInfo));
   startupInfo.cb = sizeof(startupInfo);
   startupInfo.dwFlags = STARTF_USESTDHANDLES;
-  startupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  startupInfo.hStdInput = options.stdinData.empty()
+                              ? GetStdHandle(STD_INPUT_HANDLE)
+                              : stdinRead;
   startupInfo.hStdOutput = stdoutWrite;
   startupInfo.hStdError = stdoutWrite;
 
@@ -64,26 +78,51 @@ ProcessRunResult ProcessRunner::Run(const ProcessRunOptions& options) const {
   LPCWSTR workingDirPtr =
       workingDirectory.empty() ? nullptr : workingDirectory.c_str();
 
+  std::vector<wchar_t> envBlock;
+  LPVOID envPtr = nullptr;
+  if (!options.envVars.empty()) {
+    std::wstring envStr;
+    for (const auto& kv : options.envVars) {
+      envStr += ToWide(kv.first);
+      envStr.push_back(L'=');
+      envStr += ToWide(kv.second);
+      envStr.push_back(L'\0');
+    }
+    envStr.push_back(L'\0');
+    envBlock.assign(envStr.begin(), envStr.end());
+    envPtr = envBlock.data();
+  }
+
   const BOOL created = CreateProcessW(
       nullptr,
       mutableCommand.data(),
       nullptr,
       nullptr,
       TRUE,
-      CREATE_NO_WINDOW,
-      nullptr,
+      CREATE_NO_WINDOW | (options.envVars.empty() ? 0 : CREATE_UNICODE_ENVIRONMENT),
+      envPtr,
       workingDirPtr,
       &startupInfo,
       &processInfo);
 
   CloseHandle(stdoutWrite);
   stdoutWrite = nullptr;
+  if (stdinRead != nullptr) { CloseHandle(stdinRead); stdinRead = nullptr; }
 
   if (!created) {
     result.spawnFailed = true;
     result.errorMessage = "CreateProcessW failed";
     CloseHandle(stdoutRead);
+    if (stdinWrite != nullptr) { CloseHandle(stdinWrite); stdinWrite = nullptr; }
     return result;
+  }
+
+  if (!options.stdinData.empty() && stdinWrite != nullptr) {
+    DWORD written = 0;
+    WriteFile(stdinWrite, options.stdinData.data(),
+              static_cast<DWORD>(options.stdinData.size()), &written, nullptr);
+    CloseHandle(stdinWrite);
+    stdinWrite = nullptr;
   }
 
   const DWORD waitCode =
@@ -101,6 +140,7 @@ ProcessRunResult ProcessRunner::Run(const ProcessRunOptions& options) const {
   result.stdoutText = ReadFromPipe(stdoutRead);
 
   CloseHandle(stdoutRead);
+  if (stdinWrite != nullptr) { CloseHandle(stdinWrite); }
   CloseHandle(processInfo.hThread);
   CloseHandle(processInfo.hProcess);
   return result;

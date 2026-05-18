@@ -11,6 +11,8 @@ struct ProcessRunOptions {
   std::string executable;
   std::vector<std::string> arguments;
   std::string workingDirectory;
+  std::string stdinData;
+  std::vector<std::pair<std::string, std::string>> envVars;
   unsigned long timeoutMs = 30000;
 };
 
