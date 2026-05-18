@@ -58,6 +58,7 @@ struct AgentConfig {
   bool historySnipEnabled = true;
   bool cachedMicrocompactEnabled = true;
   bool validatorEnabled = false;
+  bool streamingToolExecutionEnabled = true;
   bool failClosedGate = true;
   bool autoModeEnabled = false;
 

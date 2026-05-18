@@ -29,6 +29,7 @@ struct QueryLoopInternalState {
   std::vector<Message> assistantMessages;
   std::vector<ContentBlock> toolUseBlocks;
   bool completed = false;
+  bool validatorRequestedRetry = false;
   std::string terminalReason;
   int turnCount = 0;
   int consecutiveAutoCompactFailures = 0;

@@ -59,6 +59,7 @@ struct QueryLoopContext {
   int maxOutputTokensRecoveryCount = 0;
   bool hasAttemptedReactiveCompact = false;
   std::string sessionDir;
+  infra::SessionManager* sessionManager = nullptr;
 };
 
 struct ValidationToolIntervention {

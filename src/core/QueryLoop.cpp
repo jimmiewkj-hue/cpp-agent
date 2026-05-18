@@ -2,6 +2,8 @@
 
 #include "api/ModelClient.h"
 #include "api/SideQueryClient.h"
+#include "core/StreamingToolExecutor.h"
+#include "infra/SessionManager.h"
 #include "permissions/PermissionEngine.h"
 #include "tools/ToolOrchestrator.h"
 #include "tools/ToolRegistry.h"
@@ -12,6 +14,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <map>
+#include <set>
 #include <sstream>
 
 using json = nlohmann::json;
@@ -46,6 +50,14 @@ bool IsValidationEnabled() {
   char buffer[256] = {0};
   DWORD len = GetEnvironmentVariableA(
       "LOCALMODEL_VALIDATION_MODEL", buffer, sizeof(buffer));
+  return len > 0 && len < sizeof(buffer);
+}
+
+bool HasConfiguredValidatorModel(const QueryLoopContext& ctx) {
+  if (!ctx.validatorModel.empty()) return true;
+  char buffer[256] = {0};
+  DWORD len = GetEnvironmentVariableA(
+      "CPP_AGENT_VALIDATOR_MODEL", buffer, sizeof(buffer));
   return len > 0 && len < sizeof(buffer);
 }
 
@@ -133,37 +145,58 @@ ValidationResult ParseValidationResponse(const std::string& text) {
 void ApplyTextCorrection(const std::string& correctedText,
                          std::vector<Message>& assistantMessages) {
   if (correctedText.empty() || assistantMessages.empty()) return;
-  for (auto& block : assistantMessages.back().content) {
-    if (block.type == BlockType::Text) {
-      block.asText.text = correctedText;
-      return;
+  bool applied = false;
+  for (auto& msg : assistantMessages) {
+    for (auto& block : msg.content) {
+      if (block.type == BlockType::Text) {
+        block.asText.text = correctedText;
+        msg.isMeta = true;
+        applied = true;
+        return;
+      }
+    }
+  }
+  if (!applied) {
+    for (auto& msg : assistantMessages) {
+      msg.isMeta = true;
     }
   }
 }
 
+struct ToolInterventionResult {
+  std::vector<ContentBlock> rewrittenBlocks;
+  std::set<std::string> blockedIds;
+  std::map<std::string, std::string> blockGuidance;
+};
+
 void ApplyToolInterventions(
     const std::vector<ValidationToolIntervention>& interventions,
     std::vector<ContentBlock>& toolUseBlocks,
-    std::vector<Message>& messages) {
-  for (const auto& ti : interventions) {
-    for (auto& block : toolUseBlocks) {
+    ToolInterventionResult& result) {
+  result.rewrittenBlocks.clear();
+  result.blockedIds.clear();
+  result.blockGuidance.clear();
+
+  for (const auto& block : toolUseBlocks) {
+    bool matched = false;
+    for (const auto& ti : interventions) {
       if (block.asToolUse.id != ti.toolUseId) continue;
+      matched = true;
       if (ti.action == "rewrite") {
+        ContentBlock rewritten = block;
         if (!ti.correctedName.empty())
-          block.asToolUse.name = ti.correctedName;
+          rewritten.asToolUse.name = ti.correctedName;
         if (!ti.correctedInputJson.empty())
-          block.asToolUse.inputJson = ti.correctedInputJson;
+          rewritten.asToolUse.inputJson = ti.correctedInputJson;
+        result.rewrittenBlocks.push_back(rewritten);
       } else if (ti.action == "block") {
-        Message synthetic;
-        synthetic.role = MessageRole::User;
-        synthetic.content.push_back(ContentBlock::MakeToolResult(
-            ti.toolUseId,
-            "Tool call blocked by validation: " +
-                (ti.blockGuidance.empty() ? "unsafe" : ti.blockGuidance),
-            true));
-        messages.push_back(synthetic);
+        result.blockedIds.insert(ti.toolUseId);
+        result.blockGuidance[ti.toolUseId] =
+            ti.blockGuidance.empty() ? "unsafe" : ti.blockGuidance;
       }
+      break;
     }
+    if (!matched) result.rewrittenBlocks.push_back(block);
   }
 }
 
@@ -280,6 +313,12 @@ void PersistOversizedResult(const std::string& sessionDir,
   std::string path = dir + "\\" + toolUseId + ".txt";
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   if (out) out << content;
+}
+
+void PersistMessagesToTranscript(infra::SessionManager* sm,
+                                  const std::vector<Message>& msgs) {
+  if (!sm) return;
+  for (const auto& m : msgs) sm->AppendMessageToTranscript(m);
 }
 
 }  // namespace
@@ -522,12 +561,18 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
                                    QueryLoopInternalState& state) {
   state.assistantMessages.clear();
   state.toolUseBlocks.clear();
+  state.validatorRequestedRetry = false;
 
   Message currentAssistant;
   currentAssistant.role = MessageRole::Assistant;
   currentAssistant.uuid = "stream-asst";
 
   std::ostringstream textBuffer;
+
+  bool useStreamingExecution = true;
+  if (IsValidationEnabled() || HasConfiguredValidatorModel(ctx))
+    useStreamingExecution = false;
+  StreamingToolExecutor streamingExecutor(toolOrchestrator_, ctx.messages);
 
   api::SseEventCallback callback =
       [&](const std::string& event, const std::string& data) {
@@ -556,6 +601,7 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
         ContentBlock tb = ContentBlock::MakeToolUse(toolId, toolName, inputJson);
         currentAssistant.content.push_back(tb);
         state.toolUseBlocks.push_back(tb);
+        if (useStreamingExecution) streamingExecutor.AddTool(tb);
       }
     } else if (event == "stop_reason") {
       currentAssistant.stopReason = data;
@@ -585,7 +631,7 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
 
 void QueryLoop::ApplyStepValidator(QueryLoopContext& ctx,
                                    QueryLoopInternalState& state) {
-  if (!IsValidationEnabled()) return;
+  if (!IsValidationEnabled() && !HasConfiguredValidatorModel(ctx)) return;
 
   const std::string validatorModel = ctx.validatorModel.empty()
                                          ? ctx.model : ctx.validatorModel;
@@ -619,13 +665,27 @@ void QueryLoop::ApplyStepValidator(QueryLoopContext& ctx,
   if (!vresult.correctedText.empty())
     ApplyTextCorrection(vresult.correctedText, state.assistantMessages);
 
-  if (!vresult.toolInterventions.empty())
-    ApplyToolInterventions(vresult.toolInterventions, state.toolUseBlocks,
-                           ctx.messages);
+  if (!vresult.toolInterventions.empty()) {
+    ToolInterventionResult tir;
+    ApplyToolInterventions(vresult.toolInterventions, state.toolUseBlocks, tir);
+    state.toolUseBlocks = tir.rewrittenBlocks;
+    for (const auto& [blockId, guidance] : tir.blockGuidance) {
+      Message synthetic;
+      synthetic.role = MessageRole::User;
+      synthetic.uuid = "blocked-" + blockId;
+      synthetic.isMeta = true;
+      synthetic.content.push_back(ContentBlock::MakeToolResult(
+          blockId,
+          "Tool call blocked by validation: " + guidance,
+          true));
+      ctx.messages.push_back(synthetic);
+    }
+  }
 
   if (vresult.finalResponseAction == "retry_from_tools") {
+    state.validatorRequestedRetry = true;
     Message guidance;
-    guidance.role = MessageRole::System;
+    guidance.role = MessageRole::User;
     guidance.uuid = "validator-retry";
     guidance.isMeta = true;
     guidance.content.push_back(ContentBlock::MakeText(
@@ -707,7 +767,9 @@ bool QueryLoop::HandleMaxOutputTokens(QueryLoopContext& ctx,
         "Break remaining work into smaller pieces."));
     for (const auto& am : state.assistantMessages)
       ctx.messages.push_back(am);
+    PersistMessagesToTranscript(ctx.sessionManager, state.assistantMessages);
     ctx.messages.push_back(recovery);
+    PersistMessagesToTranscript(ctx.sessionManager, {recovery});
     state.assistantMessages.clear();
     state.toolUseBlocks.clear();
     state.transition = TransitionReason::MaxOutputTokensRecovery;
@@ -732,7 +794,9 @@ bool QueryLoop::HandleTokenBudget(QueryLoopContext& ctx,
       "Token budget approaching limit. Be concise and focus on essentials."));
   for (const auto& am : state.assistantMessages)
     ctx.messages.push_back(am);
+  PersistMessagesToTranscript(ctx.sessionManager, state.assistantMessages);
   ctx.messages.push_back(nudge);
+  PersistMessagesToTranscript(ctx.sessionManager, {nudge});
   state.assistantMessages.clear();
   state.toolUseBlocks.clear();
   state.transition = TransitionReason::TokenBudgetContinuation;
@@ -788,6 +852,8 @@ bool QueryLoop::ApplyStepRunTools(QueryLoopContext& ctx,
     ctx.messages.push_back(msg);
   for (const auto& rm : execResult.userMessages)
     ctx.messages.push_back(rm);
+  PersistMessagesToTranscript(ctx.sessionManager, state.assistantMessages);
+  PersistMessagesToTranscript(ctx.sessionManager, execResult.userMessages);
   state.assistantMessages.clear();
   state.toolUseBlocks.clear();
   if (execResult.errorCount > 0 &&
@@ -804,6 +870,7 @@ bool QueryLoop::ApplyStepTerminate(QueryLoopContext& ctx,
   if (state.toolUseBlocks.empty()) {
     for (const auto& msg : state.assistantMessages)
       ctx.messages.push_back(msg);
+    PersistMessagesToTranscript(ctx.sessionManager, state.assistantMessages);
     auto& at = ctx.autoCompactTracking;
     if (at.compacted) { at.compacted = false; at.turnId.clear(); }
     state.completed = true;
@@ -815,6 +882,13 @@ bool QueryLoop::ApplyStepTerminate(QueryLoopContext& ctx,
 
 void QueryLoop::RunFull(QueryLoopContext& ctx) {
   QueryLoopInternalState state;
+
+  auto persistMsg = [&ctx](const Message& msg) {
+    if (ctx.sessionManager) ctx.sessionManager->AppendMessageToTranscript(msg);
+  };
+  auto persistMsgs = [&persistMsg](const std::vector<Message>& msgs) {
+    for (const auto& m : msgs) persistMsg(m);
+  };
 
   while (!state.completed) {
     switch (state.stage) {
@@ -851,6 +925,7 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
       }
       case QueryStage::ModelCall: {
         bool hasTools = ApplyStepModelCall(ctx, state);
+        persistMsgs(state.assistantMessages);
 
         if (Handle413Recovery(ctx, state)) {
           state.stage = QueryStage::ModelCall; continue;
@@ -873,18 +948,37 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
           state.completed = true;
           state.terminalReason = "api_error"; continue;
         }
-        if (hasTools) {
+        (void)hasTools;
+        if (IsValidationEnabled() || HasConfiguredValidatorModel(ctx)) {
           state.stage = QueryStage::Validator;
-        } else {
+        } else if (state.toolUseBlocks.empty()) {
           state.stage = QueryStage::Completed;
           if (!ApplyStepTerminate(ctx, state)) continue;
           state.stage = QueryStage::ToolResultBudget;
           state.turnCount = 0;
+        } else {
+          state.stage = QueryStage::StopHooks;
         }
         continue;
       }
       case QueryStage::Validator: {
         ApplyStepValidator(ctx, state);
+        if (state.validatorRequestedRetry) {
+          for (const auto& msg : state.assistantMessages)
+            ctx.messages.push_back(msg);
+          persistMsgs(state.assistantMessages);
+          state.assistantMessages.clear();
+          state.toolUseBlocks.clear();
+          state.stage = QueryStage::ToolResultBudget;
+          continue;
+        }
+        if (state.toolUseBlocks.empty()) {
+          state.stage = QueryStage::Completed;
+          if (!ApplyStepTerminate(ctx, state)) continue;
+          state.stage = QueryStage::ToolResultBudget;
+          state.turnCount = 0;
+          continue;
+        }
         state.stage = QueryStage::StopHooks;
         continue;
       }
@@ -898,8 +992,10 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
         if (!hooksResult.blockingErrors.empty()) {
           for (const auto& am : state.assistantMessages)
             ctx.messages.push_back(am);
+          persistMsgs(state.assistantMessages);
           for (const auto& err : hooksResult.blockingErrors)
             ctx.messages.push_back(err);
+          persistMsgs(hooksResult.blockingErrors);
           state.assistantMessages.clear();
           state.toolUseBlocks.clear();
           state.transition = TransitionReason::StopHookBlocking;

@@ -228,7 +228,12 @@ class RecordingModelClient : public agent::api::ModelClient {
       const agent::api::SseEventCallback& onEvent) override {
     lastSystemPrompt = systemPrompt;
     if (onEvent) {
-      onEvent("text_delta", "recorded streaming prompt");
+      onEvent("text_delta", streamResponseText);
+      if (emitToolUse) {
+        onEvent("tool_use",
+                "{\"id\":\"recording-tool-1\",\"name\":\"" + streamToolName +
+                    "\",\"input\":" + streamToolInputJson + "}");
+      }
       onEvent("stop_reason", "end_turn");
     }
   }
@@ -236,18 +241,25 @@ class RecordingModelClient : public agent::api::ModelClient {
   std::vector<agent::core::Message> SideQuery(
       const std::vector<agent::core::Message>&,
       const std::string& systemPrompt,
-      const std::string&) override {
+      const std::string& model) override {
     lastSideQueryPrompt = systemPrompt;
+    lastSideQueryModel = model;
     agent::core::Message message;
     message.role = agent::core::MessageRole::Assistant;
     message.uuid = "recording-side";
     message.content.push_back(
-        agent::core::ContentBlock::MakeText("side query"));
+        agent::core::ContentBlock::MakeText(sideQueryResponseText));
     return {message};
   }
 
   std::string lastSystemPrompt;
   std::string lastSideQueryPrompt;
+  std::string lastSideQueryModel;
+  std::string streamResponseText = "recorded streaming prompt";
+  std::string sideQueryResponseText = "side query";
+  std::string streamToolName = "FileRead";
+  std::string streamToolInputJson = R"({"path":"README.md"})";
+  bool emitToolUse = false;
 };
 
 }  // namespace
@@ -431,6 +443,34 @@ int main() {
     const auto response = sideQueryClient.Query(request);
     Check(response.ok, "SideQuery should succeed");
     Check(!response.messages.empty(), "SideQuery should return messages");
+  }
+
+  // Test 10b: Validator runs with configured validatorModel even without env gate
+  {
+    SetEnvironmentVariableA("LOCALMODEL_VALIDATION_MODEL", nullptr);
+    RecordingModelClient validationModelClient;
+    validationModelClient.streamResponseText = "draft answer";
+    validationModelClient.sideQueryResponseText =
+        "<validation_json>{\"corrected_text\":\"validated answer\","
+        "\"final_response_action\":\"approve\"}</validation_json>";
+    agent::api::SideQueryClient validationSideClient(validationModelClient);
+    agent::core::QueryEngine validationEngine(
+        toolOrchestrator, permissionEngine, validationModelClient,
+        validationSideClient, toolRegistry, sessionManager);
+    validationEngine.SetConfig(config);
+    validationEngine.SetValidatorModel("gemma-test");
+    validationEngine.SubmitUserPrompt("validator no-tool path");
+    validationEngine.RunTurn();
+    const auto& validationMsgs = validationEngine.messages();
+    Check(validationModelClient.lastSideQueryModel == "gemma-test",
+          "Validator should use configured validator model");
+    Check(!validationMsgs.empty(), "Validator run should produce messages");
+    Check(validationMsgs.back().content.size() == 1,
+          "Validated assistant should contain one text block");
+    Check(validationMsgs.back().content[0].type == agent::core::BlockType::Text,
+          "Validated assistant should end with text");
+    Check(validationMsgs.back().content[0].asText.text == "validated answer",
+          "Validator should correct final no-tool response");
   }
 
   // Test 11: ProcessRunner can launch a small Windows process

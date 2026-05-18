@@ -130,6 +130,40 @@ std::string Shorten(const std::string& value, std::size_t maxLength) {
   return value.substr(0, maxLength - 3) + "...";
 }
 
+std::wstring Utf8ToWide(const std::string& text) {
+  if (text.empty()) return std::wstring();
+  const int size = MultiByteToWideChar(
+      CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
+  if (size <= 0) return std::wstring();
+  std::wstring wide(static_cast<std::size_t>(size), L'\0');
+  MultiByteToWideChar(
+      CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), &wide[0], size);
+  return wide;
+}
+
+std::string WideToUtf8(const std::wstring& text) {
+  if (text.empty()) return std::string();
+  const int size = WideCharToMultiByte(
+      CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+      nullptr, 0, nullptr, nullptr);
+  if (size <= 0) return std::string();
+  std::string utf8(static_cast<std::size_t>(size), '\0');
+  WideCharToMultiByte(
+      CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+      &utf8[0], size, nullptr, nullptr);
+  return utf8;
+}
+
+void EraseLastWideCodepoint(std::wstring* text) {
+  if (text == nullptr || text->empty()) return;
+  text->pop_back();
+  if (!text->empty()) {
+    wchar_t tail = (*text)[text->size() - 1];
+    if (tail >= 0xD800 && tail <= 0xDBFF)
+      text->pop_back();
+  }
+}
+
 std::vector<std::string> SplitLines(const std::string& text) {
   std::vector<std::string> lines;
   std::istringstream stream(text);
@@ -357,6 +391,7 @@ class AnsiTui {
     ShowCursor();
 
     std::string line;
+    std::wstring wideLine;
     HANDLE inHandle = GetStdHandle(STD_INPUT_HANDLE);
 
     DWORD consoleMode = 0;
@@ -373,6 +408,12 @@ class AnsiTui {
       std::cout << "> " << std::flush;
       return line;
     }
+
+    auto redrawInput = [&]() {
+      SetCursorPosition(2, inputY);
+      WriteAnsi("\x1b[0K");
+      std::cout << "\x1b[37m> \x1b[0m" << WideToUtf8(wideLine) << std::flush;
+    };
 
     while (true) {
       INPUT_RECORD record;
@@ -427,25 +468,28 @@ class AnsiTui {
         break;
       }
       if (key.wVirtualKeyCode == VK_RETURN) {
+        line = WideToUtf8(wideLine);
         if (!line.empty()) break;
         continue;
       }
 
-      for (int i = 0; i < key.wRepeatCount && key.uChar.AsciiChar != 0; ++i) {
-        char ch = key.uChar.AsciiChar;
-        if (ch == '\r' || ch == '\n') continue;
-        if (ch >= 32 && ch < 127) {
-          line.push_back(ch);
-          std::cout << ch << std::flush;
-        } else if (ch == 8 || ch == 127) {
-          if (!line.empty()) {
-            line.pop_back();
-            std::cout << "\b \b" << std::flush;
-          }
-        }
+      if (key.wVirtualKeyCode == VK_BACK) {
+        EraseLastWideCodepoint(&wideLine);
+        redrawInput();
+        continue;
       }
+
+      const wchar_t wideChar = key.uChar.UnicodeChar;
+      if (wideChar == 0 || wideChar == L'\r' || wideChar == L'\n')
+        continue;
+
+      for (int i = 0; i < key.wRepeatCount; ++i) {
+        wideLine.push_back(wideChar);
+      }
+      redrawInput();
     }
 
+    line = WideToUtf8(wideLine);
     HideCursor();
     SetCursorPosition(2, inputY);
     WriteAnsi("\x1b[0K");

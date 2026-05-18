@@ -1,5 +1,6 @@
 #include "infra/SessionManager.h"
 #include "infra/ProtoLite.h"
+#include "third_party/nlohmann_json.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -2052,6 +2053,10 @@ std::string SessionManager::LatestTranscriptPath() const {
   return sessionDir_ + "\\transcript.txt";
 }
 
+std::string SessionManager::TranscriptJsonlPath() const {
+  return sessionDir_ + "\\transcript.jsonl";
+}
+
 std::string SessionManager::SnapshotPath() const {
   return sessionDir_ + "\\snapshot.pb";
 }
@@ -2062,6 +2067,102 @@ std::string SessionManager::LegacyBinarySnapshotPath() const {
 
 std::string SessionManager::LegacySnapshotPath() const {
   return sessionDir_ + "\\snapshot.txt";
+}
+
+namespace {
+
+using json = nlohmann::json;
+
+std::string BlockTypeToJsonStr(core::BlockType type) {
+  switch (type) {
+    case core::BlockType::Text: return "text";
+    case core::BlockType::ToolUse: return "tool_use";
+    case core::BlockType::ToolResult: return "tool_result";
+  }
+  return "text";
+}
+
+std::string RoleToJsonStr(core::MessageRole role) {
+  switch (role) {
+    case core::MessageRole::User: return "user";
+    case core::MessageRole::Assistant: return "assistant";
+    case core::MessageRole::System: return "system";
+  }
+  return "user";
+}
+
+std::string MessageToJsonl(const core::Message& msg) {
+  json j;
+  j["type"] = RoleToJsonStr(msg.role);
+  j["uuid"] = msg.uuid;
+  j["isMeta"] = msg.isMeta;
+  if (msg.isApiErrorMessage) j["isApiErrorMessage"] = true;
+
+  json jmsg;
+  jmsg["role"] = RoleToJsonStr(msg.role);
+  json content = json::array();
+  for (const auto& block : msg.content) {
+    json b;
+    b["type"] = BlockTypeToJsonStr(block.type);
+    if (block.type == core::BlockType::Text) {
+      b["text"] = block.asText.text;
+    } else if (block.type == core::BlockType::ToolUse) {
+      b["id"] = block.asToolUse.id;
+      b["name"] = block.asToolUse.name;
+      try {
+        b["input"] = json::parse(block.asToolUse.inputJson);
+      } catch (...) {
+        b["input"] = json::object();
+      }
+    } else if (block.type == core::BlockType::ToolResult) {
+      b["tool_use_id"] = block.asToolResult.toolUseId;
+      b["content"] = block.asToolResult.content;
+      if (block.asToolResult.isError) b["is_error"] = true;
+    }
+    content.push_back(b);
+  }
+  jmsg["content"] = content;
+  if (!msg.stopReason.empty()) jmsg["stop_reason"] = msg.stopReason;
+  if (msg.usage.inputTokens > 0) {
+    jmsg["usage"] = {
+      {"input_tokens", msg.usage.inputTokens},
+      {"output_tokens", msg.usage.outputTokens},
+      {"cache_read_input_tokens", msg.usage.cacheReadInputTokens},
+      {"cache_creation_input_tokens", msg.usage.cacheCreationInputTokens},
+    };
+  }
+  j["message"] = jmsg;
+
+  return j.dump();
+}
+
+}  // namespace
+
+void SessionManager::AppendTranscriptLine(const std::string& jsonLine) {
+  std::lock_guard<std::mutex> lock(transcriptMutex_);
+  transcriptBuffer_.push_back(jsonLine);
+  if (transcriptBuffer_.size() >= 50) {
+    FlushTranscriptBuffer();
+  }
+}
+
+void SessionManager::FlushTranscriptBuffer() {
+  std::lock_guard<std::mutex> lock(transcriptMutex_);
+  if (transcriptBuffer_.empty()) return;
+
+  std::string path = TranscriptJsonlPath();
+  EnsureDirectoryRecursive(sessionDir_);
+  std::ofstream out(path, std::ios::app | std::ios::binary);
+  if (!out) return;
+
+  for (const auto& line : transcriptBuffer_) {
+    out << line << "\n";
+  }
+  transcriptBuffer_.clear();
+}
+
+void SessionManager::AppendMessageToTranscript(const core::Message& msg) {
+  AppendTranscriptLine(MessageToJsonl(msg));
 }
 
 }  // namespace infra

@@ -135,6 +135,7 @@ void QueryEngine::RunTurn() {
   loopCtx_.fallbackModel = fallbackModel_;
   loopCtx_.validatorModel = validatorModel_;
   loopCtx_.sessionDir = sessionDir_;
+  loopCtx_.sessionManager = &sessionManager_;
 
   QueryLoop loop(toolOrchestrator_, permissionEngine_, modelClient_,
                  sideQueryClient_);
@@ -143,6 +144,8 @@ void QueryEngine::RunTurn() {
 
   messages_ = loopCtx_.messages;
   SyncSessionState();
+
+  sessionManager_.FlushTranscriptBuffer();
 
   if (stabilityWatchdog_) {
     ++metadata_.turnCount;

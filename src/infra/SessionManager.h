@@ -47,19 +47,26 @@ class SessionManager {
   bool RestoreFromDisk();
 
   std::string LatestTranscriptPath() const;
+  std::string TranscriptJsonlPath() const;
   std::string SnapshotPath() const;
   std::string LegacyBinarySnapshotPath() const;
   std::string LegacySnapshotPath() const;
+
+  void AppendTranscriptLine(const std::string& jsonLine);
+  void AppendMessageToTranscript(const core::Message& message);
+  void FlushTranscriptBuffer();
 
  private:
   SessionSnapshot BuildSnapshot() const;
 
   mutable std::mutex mutex_;
+  mutable std::mutex transcriptMutex_;
   std::string sessionDir_;
   std::vector<core::Message> messages_;
   std::vector<agents::SubAgentTaskLifecycle> subAgentTasks_;
   std::vector<agents::SubAgentExecutorSlot> subAgentExecutors_;
   core::SessionMetadata metadata_;
+  std::vector<std::string> transcriptBuffer_;
 };
 
 }  // namespace infra

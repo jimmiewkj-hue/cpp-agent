@@ -1,4 +1,5 @@
 #include "api/ModelClient.h"
+#include "third_party/nlohmann_json.hpp"
 
 #include <windows.h>
 #include <winhttp.h>
@@ -8,6 +9,8 @@
 
 namespace agent {
 namespace api {
+
+using json = nlohmann::json;
 
 namespace {
 
@@ -141,8 +144,8 @@ void ParseSseBody(const std::string& rawBody, const SseEventCallback& onEvent) {
   flush();
 }
 
-std::string ExtractOpenAIDeltaContent(const std::string& jsonData) {
-  const std::string key = "\"content\":\"";
+std::string ExtractJsonStringValue(const std::string& jsonData,
+                                   const std::string& key) {
   auto pos = jsonData.find(key);
   if (pos == std::string::npos) return std::string();
   pos += key.size();
@@ -165,8 +168,20 @@ std::string ExtractOpenAIDeltaContent(const std::string& jsonData) {
   return result;
 }
 
+std::string ExtractOpenAIDeltaContent(const std::string& jsonData) {
+  std::string content = ExtractJsonStringValue(
+      jsonData, "\"delta\":{\"content\":\"");
+  if (!content.empty()) return content;
+  return ExtractJsonStringValue(
+      jsonData, "\"delta\":{\"reasoning_content\":\"");
+}
+
 std::string ExtractOpenAIDeltaToolName(const std::string& jsonData) {
-  const std::string key = "\"name\":\"";
+  return ExtractJsonStringValue(jsonData, "\"function\":{\"name\":\"");
+}
+
+std::string ExtractOpenAIDeltaToolId(const std::string& jsonData) {
+  const std::string key = "\"tool_calls\":[{\"index\":0,\"id\":\"";
   auto pos = jsonData.find(key);
   if (pos == std::string::npos) return std::string();
   pos += key.size();
@@ -176,36 +191,7 @@ std::string ExtractOpenAIDeltaToolName(const std::string& jsonData) {
 }
 
 std::string ExtractOpenAIDeltaToolArgs(const std::string& jsonData) {
-  const std::string key = "\"arguments\":\"";
-  auto pos = jsonData.find(key);
-  if (pos == std::string::npos) return std::string();
-  pos += key.size();
-  auto end = pos;
-  int depth = 0;
-  bool inString = false;
-  while (end < jsonData.size()) {
-    char c = jsonData[end];
-    if (c == '\\' && end + 1 < jsonData.size()) { end += 2; continue; }
-    if (c == '"' && !inString) break;
-    if (c == '{') { if (!inString) depth++; }
-    else if (c == '}') { if (!inString) depth--; }
-    inString = (c == '"' && !inString);
-    ++end;
-  }
-  if (end >= jsonData.size()) return std::string();
-  std::string raw = jsonData.substr(pos, end - pos);
-  std::string result;
-  for (std::size_t i = 0; i < raw.size(); ++i) {
-    if (raw[i] == '\\' && i + 1 < raw.size()) {
-      char next = raw[i + 1];
-      if (next == 'n') { result.push_back('\n'); ++i; continue; }
-      if (next == '"') { result.push_back('"'); ++i; continue; }
-      if (next == '\\') { result.push_back('\\'); ++i; continue; }
-      result.push_back(raw[i]); continue;
-    }
-    result.push_back(raw[i]);
-  }
-  return result;
+  return ExtractJsonStringValue(jsonData, "\"function\":{\"arguments\":\"");
 }
 
 std::string ExtractOpenAIDeltaFinishReason(const std::string& jsonData) {
@@ -218,88 +204,102 @@ std::string ExtractOpenAIDeltaFinishReason(const std::string& jsonData) {
   return jsonData.substr(pos, end - pos);
 }
 
+std::string ExtractOpenAIResponseText(const std::string& jsonData) {
+  json parsed = json::parse(jsonData, nullptr, false);
+  if (parsed.is_discarded()) return std::string();
+  if (!parsed.contains("choices") || !parsed["choices"].is_array() ||
+      parsed["choices"].empty())
+    return std::string();
+  const json& choice = parsed["choices"][0];
+  if (!choice.contains("message") || !choice["message"].is_object())
+    return std::string();
+  const json& message = choice["message"];
+  if (message.contains("content") && message["content"].is_string() &&
+      !message["content"].get<std::string>().empty())
+    return message["content"].get<std::string>();
+  if (message.contains("reasoning_content") &&
+      message["reasoning_content"].is_string())
+    return message["reasoning_content"].get<std::string>();
+  return std::string();
+}
+
 void ParseOpenAISseDelta(const std::string& rawBody,
                          const SseEventCallback& onEvent) {
   std::string pendingToolName;
   std::string pendingToolArgs;
   std::string pendingToolId;
 
+  auto emitPendingToolUse = [&]() {
+    if (pendingToolName.empty() || pendingToolArgs.empty()) return;
+    std::ostringstream toolEvent;
+    toolEvent << "{\"id\":\"" << pendingToolId << "\",\"name\":\""
+              << EscapeJson(pendingToolName) << "\",\"input\":"
+              << pendingToolArgs << "}";
+    if (onEvent) onEvent("tool_use", toolEvent.str());
+    pendingToolName.clear();
+    pendingToolArgs.clear();
+    pendingToolId.clear();
+  };
+
   SseEventCallback wrapper = [&](const std::string& /*event*/, const std::string& data) {
     if (data == "[DONE]") {
-      if (!pendingToolName.empty() && !pendingToolArgs.empty()) {
-        std::ostringstream toolEvent;
-        toolEvent << "{\"id\":\"" << pendingToolId << "\",\"name\":\""
-                  << pendingToolName << "\",\"input\":" << pendingToolArgs << "}";
-        if (onEvent) onEvent("tool_use", toolEvent.str());
-        pendingToolName.clear();
-        pendingToolArgs.clear();
-        pendingToolId.clear();
-      }
+      emitPendingToolUse();
       if (onEvent) onEvent("stop_reason", "stop");
       return;
     }
 
-    auto content = ExtractOpenAIDeltaContent(data);
-    if (!content.empty()) {
-      if (!pendingToolName.empty() && !pendingToolArgs.empty()) {
-        std::ostringstream toolEvent;
-        toolEvent << "{\"id\":\"" << pendingToolId << "\",\"name\":\""
-                  << pendingToolName << "\",\"input\":" << pendingToolArgs << "}";
-        if (onEvent) onEvent("tool_use", toolEvent.str());
-        pendingToolName.clear();
-        pendingToolArgs.clear();
-        pendingToolId.clear();
-      }
-      if (onEvent) onEvent("text_delta", content);
+    json parsed = json::parse(data, nullptr, false);
+    if (parsed.is_discarded() || !parsed.contains("choices") ||
+        !parsed["choices"].is_array() || parsed["choices"].empty())
       return;
+
+    const json& choice = parsed["choices"][0];
+    if (choice.contains("delta") && choice["delta"].is_object()) {
+      const json& delta = choice["delta"];
+      std::string textDelta;
+      if (delta.contains("content") && delta["content"].is_string())
+        textDelta = delta["content"].get<std::string>();
+      else if (delta.contains("reasoning_content") &&
+               delta["reasoning_content"].is_string())
+        textDelta = delta["reasoning_content"].get<std::string>();
+
+      if (!textDelta.empty()) {
+        emitPendingToolUse();
+        if (onEvent) onEvent("text_delta", textDelta);
+      }
+
+      if (delta.contains("tool_calls") && delta["tool_calls"].is_array()) {
+        for (const auto& toolCall : delta["tool_calls"]) {
+          if (!toolCall.is_object()) continue;
+          if (toolCall.contains("id") && toolCall["id"].is_string())
+            pendingToolId = toolCall["id"].get<std::string>();
+          else if (pendingToolId.empty())
+            pendingToolId = "oaitu-" + std::to_string(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+
+          if (toolCall.contains("function") && toolCall["function"].is_object()) {
+            const json& fn = toolCall["function"];
+            if (fn.contains("name") && fn["name"].is_string())
+              pendingToolName = fn["name"].get<std::string>();
+            if (fn.contains("arguments") && fn["arguments"].is_string())
+              pendingToolArgs += fn["arguments"].get<std::string>();
+          }
+        }
+      }
     }
 
-    auto toolName = ExtractOpenAIDeltaToolName(data);
-    if (!toolName.empty()) {
-      if (!pendingToolName.empty() && !pendingToolArgs.empty()) {
-        std::ostringstream toolEvent;
-        toolEvent << "{\"id\":\"" << pendingToolId << "\",\"name\":\""
-                  << pendingToolName << "\",\"input\":" << pendingToolArgs << "}";
-        if (onEvent) onEvent("tool_use", toolEvent.str());
-        pendingToolArgs.clear();
+    if (choice.contains("finish_reason") && choice["finish_reason"].is_string()) {
+      const std::string finishReason = choice["finish_reason"].get<std::string>();
+      if (!finishReason.empty() && finishReason != "null") {
+        emitPendingToolUse();
+        if (onEvent) onEvent("stop_reason", finishReason);
       }
-      pendingToolName = toolName;
-      pendingToolArgs.clear();
-      pendingToolId = "oaitu-" + std::to_string(
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              std::chrono::system_clock::now().time_since_epoch()).count());
-      return;
-    }
-
-    auto toolArgs = ExtractOpenAIDeltaToolArgs(data);
-    if (!toolArgs.empty()) {
-      pendingToolArgs += toolArgs;
-      return;
-    }
-
-    auto finishReason = ExtractOpenAIDeltaFinishReason(data);
-    if (!finishReason.empty() && finishReason != "null") {
-      if (!pendingToolName.empty() && !pendingToolArgs.empty()) {
-        std::ostringstream toolEvent;
-        toolEvent << "{\"id\":\"" << pendingToolId << "\",\"name\":\""
-                  << pendingToolName << "\",\"input\":" << pendingToolArgs << "}";
-        if (onEvent) onEvent("tool_use", toolEvent.str());
-        pendingToolName.clear();
-        pendingToolArgs.clear();
-        pendingToolId.clear();
-      }
-      if (onEvent) onEvent("stop_reason", finishReason);
-      return;
     }
   };
   ParseSseBody(rawBody, wrapper);
 
-  if (!pendingToolName.empty() && !pendingToolArgs.empty()) {
-    std::ostringstream toolEvent;
-    toolEvent << "{\"id\":\"" << pendingToolId << "\",\"name\":\""
-              << pendingToolName << "\",\"input\":" << pendingToolArgs << "}";
-    if (onEvent) onEvent("tool_use", toolEvent.str());
-  }
+  emitPendingToolUse();
 }
 
 }  // namespace
@@ -566,7 +566,12 @@ std::vector<core::Message> HttpLlmClient::GenerateResponse(
     errMsg.content.push_back(core::ContentBlock::MakeText("LLM API error: " + error));
     return {errMsg};
   }
-  return {};
+  core::Message response;
+  response.role = core::MessageRole::Assistant;
+  response.uuid = "http-generate";
+  response.content.push_back(core::ContentBlock::MakeText(
+      ExtractOpenAIResponseText(raw)));
+  return {response};
 }
 
 void HttpLlmClient::StreamResponse(
@@ -612,7 +617,9 @@ std::vector<core::Message> HttpLlmClient::SideQuery(
   core::Message r;
   r.role = core::MessageRole::Assistant;
   r.uuid = "side-resp";
-  r.content.push_back(core::ContentBlock::MakeText(raw));
+  const std::string parsed = ExtractOpenAIResponseText(raw);
+  r.content.push_back(core::ContentBlock::MakeText(
+      parsed.empty() ? raw : parsed));
   return {r};
 }
 
