@@ -24,6 +24,8 @@ class ToolOrchestrator {
   void SetToolRegistry(const ToolRegistry* registry);
   const ToolRegistry* GetToolRegistry() const { return toolRegistry_; }
   void SetSubAgentManager(agents::SubAgentManager* subAgentManager);
+  void SetWorkspaceRoot(const std::string& workspaceRoot);
+  const std::string& workspaceRoot() const { return workspaceRoot_; }
 
   std::vector<ToolBatch> PartitionToolCalls(
       const std::vector<core::ContentBlock>& toolUseBlocks) const;
@@ -62,6 +64,21 @@ class ToolOrchestrator {
   std::string ExecuteAgent(const std::string& inputJson,
                           int maxResultSize,
                           std::string* error) const;
+  std::string ExecuteTodoWrite(const std::string& inputJson,
+                               int maxResultSize,
+                               std::string* error) const;
+  std::string ExecuteAskUserQuestion(const std::string& inputJson,
+                                     int maxResultSize,
+                                     std::string* error) const;
+  std::string ExecuteFileEdit(const std::string& inputJson,
+                              int maxResultSize,
+                              std::string* error) const;
+  std::string ExecuteWebFetch(const std::string& inputJson,
+                              int maxResultSize,
+                              std::string* error) const;
+  std::string ExecuteWebSearch(const std::string& inputJson,
+                               int maxResultSize,
+                               std::string* error) const;
 
   static std::string TruncateResult(const std::string& result,
                                     int maxSize);
@@ -69,6 +86,7 @@ class ToolOrchestrator {
   const ToolRegistry* toolRegistry_ = nullptr;
   agents::SubAgentManager* subAgentManager_ = nullptr;
   infra::ProcessRunner processRunner_;
+  std::string workspaceRoot_;
 };
 
 }  // namespace tools

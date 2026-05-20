@@ -19,7 +19,8 @@ void StreamingToolExecutor::AddTool(const ContentBlock& toolUse) {
   tracked.block = toolUse;
   const std::string& name = toolUse.asToolUse.name;
   tracked.isConcurrencySafe =
-      (name == "FileRead" || name == "Grep" || name == "Glob");
+      (name == "FileRead" || name == "Read" ||
+       name == "Grep" || name == "Glob");
   tracked.status = ToolExecStatus::Queued;
   tools_.push_back(tracked);
 }
@@ -92,6 +93,16 @@ void StreamingToolExecutor::ExecutePending() {
 
   if (execResult.errorCount > 0) {
     hasErrored_ = true;
+    for (auto& tool : tools_) {
+      if (tool.status == ToolExecStatus::Queued) {
+        tool.status = ToolExecStatus::Completed;
+        tool.result = ContentBlock::MakeToolResult(
+            tool.id,
+            "[sibling aborted] A concurrent tool error occurred.",
+            true);
+        tool.resultReady = true;
+      }
+    }
   }
 }
 

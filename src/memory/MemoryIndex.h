@@ -1,9 +1,14 @@
 #pragma once
 
+#include "memory/MemoryScanner.h"
+
 #include <string>
 #include <vector>
 
 namespace agent {
+namespace api {
+class SideQueryClient;
+}
 namespace memory {
 
 struct EntrypointTruncation {
@@ -38,6 +43,7 @@ class MemoryIndex {
   explicit MemoryIndex(const std::string& memoryDir);
 
   const std::string& memoryDir() const;
+  void SetSideQueryClient(api::SideQueryClient* sideQueryClient);
   std::string ResolveActiveMemoryDir() const;
   std::string GetEntrypointPath() const;
   std::string GetTopicFilePath(const std::string& fileName) const;
@@ -62,6 +68,16 @@ class MemoryIndex {
       const std::vector<MemoryPointer>& pointers) const;
   bool UpsertPointer(const MemoryPointer& pointer) const;
 
+  struct RelevantMemory {
+    std::string path;
+    std::string fileName;
+    long long mtimeMs = 0;
+    std::string content;
+  };
+  std::vector<RelevantMemory> FindRelevantMemories(
+      const std::string& userQuery,
+      const std::vector<std::string>& alreadySurfaced) const;
+
  private:
   std::string BuildWarningText(
       int lineCount,
@@ -72,6 +88,7 @@ class MemoryIndex {
   std::string TrimTopicForPrompt(const std::string& raw) const;
 
   std::string memoryDir_;
+  api::SideQueryClient* sideQueryClient_ = nullptr;
 };
 
 }  // namespace memory

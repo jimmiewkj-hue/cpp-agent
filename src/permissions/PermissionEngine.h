@@ -21,6 +21,8 @@ class PermissionEngine {
   void SetClassifierCallback(ClassifierCallback callback);
   void SetFailClosed(bool failClosed);
   void AddAutoModeAllowlistedTool(const std::string& token);
+  void SetPermissionMode(core::PermissionMode mode);
+  core::PermissionMode GetPermissionMode() const;
 
   core::CanUseTool BuildCanUseTool();
 
@@ -41,6 +43,7 @@ class PermissionEngine {
   std::vector<std::string> autoModeAllowlistedTools_;
   ClassifierCallback classifierCallback_;
   core::DenialTrackingState denialState_;
+  core::PermissionMode permissionMode_ = core::PermissionMode::Default;
   bool failClosed_ = true;
 };
 

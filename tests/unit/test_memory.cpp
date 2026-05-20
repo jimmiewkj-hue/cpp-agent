@@ -1,5 +1,7 @@
 #include "memory/MemoryIndex.h"
 #include "memory/AutoDream.h"
+#include "api/ModelClient.h"
+#include "api/SideQueryClient.h"
 
 #include <windows.h>
 
@@ -12,6 +14,27 @@ static void Check(bool condition, const char* label) {
 }
 
 namespace {
+
+class FakeModelClient : public agent::api::ModelClient {
+ public:
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return std::vector<agent::core::Message>();
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    agent::core::Message msg;
+    msg.role = agent::core::MessageRole::Assistant;
+    msg.content.push_back(agent::core::ContentBlock::MakeText(
+        "<selected_memories>\nuser_role.md\n</selected_memories>"));
+    return std::vector<agent::core::Message>(1, msg);
+  }
+};
 
 std::string TestMemoryDir() {
   return "build\\test-memory";
@@ -51,6 +74,22 @@ void TestMemoryPromptInjection() {
   Check(!injection.empty() || true, "BuildSystemPromptInjection runs");
 }
 
+void TestFindRelevantMemoriesUsesSideQuery() {
+  EnsureTestMemoryDir();
+  agent::memory::MemoryIndex index(TestMemoryDir());
+  FakeModelClient modelClient;
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  index.SetSideQueryClient(&sideQueryClient);
+
+  const std::vector<agent::memory::MemoryIndex::RelevantMemory> relevant =
+      index.FindRelevantMemories("Who am I?", std::vector<std::string>());
+  Check(relevant.size() == 1, "FindRelevantMemories should return selection");
+  if (!relevant.empty()) {
+    Check(relevant[0].fileName == "user_role.md",
+          "FindRelevantMemories should use side query filenames");
+  }
+}
+
 void TestAutoDreamConfig() {
   agent::memory::AutoDreamConfig cfg;
   cfg.minHours = 24;
@@ -88,6 +127,7 @@ int main() {
   TestMemoryIndexBasic();
   TestMemoryTruncation();
   TestMemoryPromptInjection();
+  TestFindRelevantMemoriesUsesSideQuery();
   TestAutoDreamConfig();
   TestAutoDreamState();
   TestAutoDreamGates();

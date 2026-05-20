@@ -33,9 +33,9 @@ std::vector<ToolSchema> ToolRegistry::GetAllBaseTools() {
   }
   {
     ToolSchema t;
-    t.name = "FileRead";
-    t.description = "Read a file from the filesystem";
-    t.inputSchemaJson = R"({"type":"object","properties":{"file_path":{"type":"string","description":"Path to the file"}},"required":["file_path"]})";
+    t.name = "Read";
+    t.description = "Read a file from the filesystem; relative paths resolve from the trusted workspace root";
+    t.inputSchemaJson = R"({"type":"object","properties":{"file_path":{"type":"string","description":"Path to the file. Use an absolute path for files outside the current workspace."}},"required":["file_path"]})";
     t.category = ToolExecCategory::ReadOnly;
     t.readOnlyHint = true;
     t.destructiveHint = false;
@@ -44,9 +44,31 @@ std::vector<ToolSchema> ToolRegistry::GetAllBaseTools() {
   }
   {
     ToolSchema t;
+    t.name = "FileRead";
+    t.description = "Read a file from the filesystem; relative paths resolve from the trusted workspace root";
+    t.inputSchemaJson = R"({"type":"object","properties":{"file_path":{"type":"string","description":"Path to the file. Use an absolute path for files outside the current workspace."}},"required":["file_path"]})";
+    t.category = ToolExecCategory::ReadOnly;
+    t.readOnlyHint = true;
+    t.destructiveHint = false;
+    t.maxResultSizeChars = 0;
+    tools.push_back(t);
+  }
+  {
+    ToolSchema t;
+    t.name = "Write";
+    t.description = "Write content to a file inside the trusted workspace; use relative paths for project files";
+    t.inputSchemaJson = R"({"type":"object","properties":{"file_path":{"type":"string","description":"Destination path inside the trusted workspace. Relative paths are preferred for project files."},"content":{"type":"string"}},"required":["file_path","content"]})";
+    t.category = ToolExecCategory::FileWrite;
+    t.readOnlyHint = false;
+    t.destructiveHint = true;
+    t.maxResultSizeChars = 100000;
+    tools.push_back(t);
+  }
+  {
+    ToolSchema t;
     t.name = "FileWrite";
-    t.description = "Write content to a file";
-    t.inputSchemaJson = R"({"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]})";
+    t.description = "Write content to a file inside the trusted workspace; use relative paths for project files";
+    t.inputSchemaJson = R"({"type":"object","properties":{"file_path":{"type":"string","description":"Destination path inside the trusted workspace. Relative paths are preferred for project files."},"content":{"type":"string"}},"required":["file_path","content"]})";
     t.category = ToolExecCategory::FileWrite;
     t.readOnlyHint = false;
     t.destructiveHint = true;
@@ -56,8 +78,8 @@ std::vector<ToolSchema> ToolRegistry::GetAllBaseTools() {
   {
     ToolSchema t;
     t.name = "Grep";
-    t.description = "Search for a pattern in files";
-    t.inputSchemaJson = R"({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]})";
+    t.description = "Search for a pattern in files; relative paths resolve from the trusted workspace root";
+    t.inputSchemaJson = R"({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"Optional file or directory path. Use an absolute path for locations outside the current workspace."}},"required":["pattern"]})";
     t.category = ToolExecCategory::ReadOnly;
     t.readOnlyHint = true;
     t.destructiveHint = false;
@@ -67,8 +89,8 @@ std::vector<ToolSchema> ToolRegistry::GetAllBaseTools() {
   {
     ToolSchema t;
     t.name = "Glob";
-    t.description = "Find files matching a glob pattern";
-    t.inputSchemaJson = R"({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]})";
+    t.description = "Find files matching a glob pattern; relative paths resolve from the trusted workspace root";
+    t.inputSchemaJson = R"({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"Optional directory path. Use an absolute path for locations outside the current workspace."}},"required":["pattern"]})";
     t.category = ToolExecCategory::ReadOnly;
     t.readOnlyHint = true;
     t.destructiveHint = false;
@@ -84,6 +106,61 @@ std::vector<ToolSchema> ToolRegistry::GetAllBaseTools() {
     t.readOnlyHint = false;
     t.destructiveHint = true;
     t.maxResultSizeChars = 400000;
+    tools.push_back(t);
+  }
+  {
+    ToolSchema t;
+    t.name = "TodoWrite";
+    t.description = "Create and manage a structured task list for this session";
+    t.inputSchemaJson = R"({"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]},"id":{"type":"string"},"priority":{"type":"string","enum":["high","medium","low"]}},"required":["content","status","id","priority"]}}},"required":["todos"]})";
+    t.category = ToolExecCategory::FileWrite;
+    t.readOnlyHint = false;
+    t.destructiveHint = true;
+    t.maxResultSizeChars = 100000;
+    tools.push_back(t);
+  }
+  {
+    ToolSchema t;
+    t.name = "AskUserQuestion";
+    t.description = "Ask the user clarifying questions when more information is needed";
+    t.inputSchemaJson = R"({"type":"object","properties":{"questions":{"type":"array","items":{"type":"object","properties":{"question":{"type":"string"},"header":{"type":"string"},"options":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}},"required":["label","description"]}},"multiSelect":{"type":"boolean"}},"required":["question","header","options","multiSelect"]}}},"required":["questions"]})";
+    t.category = ToolExecCategory::ReadOnly;
+    t.readOnlyHint = true;
+    t.destructiveHint = false;
+    t.maxResultSizeChars = 50000;
+    tools.push_back(t);
+  }
+  {
+    ToolSchema t;
+    t.name = "FileEdit";
+    t.description = "Make precise edits to an existing file inside the trusted workspace";
+    t.inputSchemaJson = R"({"type":"object","properties":{"file_path":{"type":"string","description":"Path to an existing file inside the trusted workspace."},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["file_path","old_string","new_string"]})";
+    t.category = ToolExecCategory::FileWrite;
+    t.readOnlyHint = false;
+    t.destructiveHint = true;
+    t.maxResultSizeChars = 100000;
+    tools.push_back(t);
+  }
+  {
+    ToolSchema t;
+    t.name = "WebFetch";
+    t.description = "Fetch the contents of a URL and convert HTML to markdown";
+    t.inputSchemaJson = R"({"type":"object","properties":{"url":{"type":"string","description":"The URL to fetch"}},"required":["url"]})";
+    t.category = ToolExecCategory::ReadOnly;
+    t.readOnlyHint = true;
+    t.destructiveHint = false;
+    t.maxResultSizeChars = 200000;
+    tools.push_back(t);
+  }
+  {
+    ToolSchema t;
+    t.name = "WebSearch";
+    t.description = "Search the web for information";
+    t.inputSchemaJson = R"({"type":"object","properties":{"query":{"type":"string","description":"The search query"},"num":{"type":"integer","description":"Max results"}},"required":["query"]})";
+    t.category = ToolExecCategory::ReadOnly;
+    t.readOnlyHint = true;
+    t.destructiveHint = false;
+    t.maxResultSizeChars = 100000;
     tools.push_back(t);
   }
 

@@ -162,39 +162,96 @@ bool AutoDreamEngine::ShouldExecute() {
 
 bool AutoDreamEngine::RunOrientPhase(std::string* context) {
   if (!memoryIndex_ || !context) return false;
-  context->append("=== Memory Directory ===\n");
-  context->append(memoryIndex_->ReadEntrypoint());
-  context->append("\n");
+
+  std::string prompt;
+  prompt += "## Phase 1 - Orient (定位)\n\n";
+  prompt += "### Current Memory Directory\n";
+  prompt += "Path: " + memoryIndex_->memoryDir() + "\n\n";
+
+  std::string entrypoint = memoryIndex_->ReadEntrypoint();
+  if (!entrypoint.empty()) {
+    prompt += "### MEMORY.md Index\n\n";
+    prompt += entrypoint + "\n";
+  } else {
+    prompt += "### MEMORY.md\n(currently empty)\n\n";
+  }
+
+  prompt += "### Existing Topic Files\n";
+  WIN32_FIND_DATAA fd;
+  HANDLE h = FindFirstFileA(
+      (memoryIndex_->memoryDir() + "\\*.md").c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) {
+    prompt += "(no topic files yet)\n";
+  } else {
+    do {
+      if (fd.cFileName[0] == '.') continue;
+      std::string name = fd.cFileName;
+      if (name == "MEMORY.md") continue;
+      prompt += "- " + name + "\n";
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+  }
+
+  *context = prompt;
   return true;
 }
 
 bool AutoDreamEngine::RunGatherPhase(std::string* context) {
   if (!memoryIndex_ || !context) return false;
-  context->append("=== Recent Sessions ===\n");
-  context->append("(gathering from transcripts)\n");
+
+  std::string prompt;
+  prompt += "## Phase 2 - Gather (收集)\n\n";
+  prompt += "### Review recent session transcripts for new signals\n";
+  prompt += "Look for:\n";
+  prompt += "- Explicit user requests to remember something\n";
+  prompt += "- User corrections or feedback on your behavior\n";
+  prompt += "- Project-specific decisions or constraints\n";
+  prompt += "- References to external systems (JIRA, Slack, etc.)\n";
+  prompt += "- Patterns that have changed since last consolidation\n\n";
+
+  prompt += "Search transcript files for these signals.\n";
+  prompt += "Previous consolidation timestamp: " +
+      std::to_string(state_.lastConsolidatedAtMs) + "\n\n";
+
+  *context += prompt;
   return true;
 }
 
 bool AutoDreamEngine::RunConsolidatePhase(const std::string& context) {
   if (!memoryIndex_ || context.empty()) return false;
 
-  if (subAgentManager_) {
-    static const std::vector<std::string> kDreamAllowedTools = {
-      "FileRead", "Grep", "Glob"
-    };
+  std::string prompt;
+  prompt += "## Phase 3 - Consolidate (整合)\n\n";
+  prompt += "Merge new signals with existing memory files:\n";
+  prompt += "1. Update existing topic files when new info relates to them\n";
+  prompt += "2. Create new topic files for entirely new information\n";
+  prompt += "3. Convert relative dates (\"last week\") to absolute dates\n";
+  prompt += "4. Remove contradictory facts — latest evidence wins\n";
+  prompt += "5. Each topic file MUST have frontmatter with type field:\n";
+  prompt += "   type: user | feedback | project | reference\n\n";
 
+  prompt += "## Phase 4 - Prune (修剪)\n\n";
+  prompt += "1. Rebuild MEMORY.md index — one bullet per topic file, under 150 chars\n";
+  prompt += "2. Remove pointers to deleted or empty topic files\n";
+  prompt += "3. Keep MEMORY.md within " +
+      std::to_string(MemoryIndex::kMaxEntrypointLines) +
+      " lines / " +
+      std::to_string(MemoryIndex::kMaxEntrypointBytes) + " bytes\n";
+  prompt += "4. Shorten overly long entries\n";
+  prompt += "5. Use format: - [Title](file.md) — one-line hook\n\n";
+
+  std::string fullPrompt = context + prompt;
+
+  if (subAgentManager_) {
     agents::SubAgentTask task;
-    task.prompt = "Consolidate memories from context. "
-        "Use only FileRead, Grep, Glob tools. "
-        "Merge new signals, resolve contradictions, update entries.\n\n" +
-        context;
+    task.prompt = fullPrompt;
     task.runInBackground = true;
     task.isolation = "dream";
-    task.description = "Auto-Dream memory consolidation";
+    task.description = "Auto-Dream: consolidate " +
+        std::to_string(config_.minSessions) + "+ sessions of memories";
     task.subagentType = "dream";
     task.priority = 10;
-
-    std::string taskId = subAgentManager_->StartSubTask(task);
+    subAgentManager_->StartSubTask(task);
   }
 
   return true;

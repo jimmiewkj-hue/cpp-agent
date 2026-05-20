@@ -8,6 +8,15 @@
 namespace agent {
 namespace core {
 
+enum class PermissionMode {
+  Default,
+  Auto,
+  BypassPermissions,
+  Plan,
+  AcceptEdits,
+  DontAsk
+};
+
 struct LlmConfig {
   std::string apiEndpoint;
   std::string apiKey;
@@ -46,7 +55,15 @@ struct AgentConfig {
   std::string sessionDir;
   std::string logDir;
   std::string defaultModel = "default-model";
-  std::string systemPrompt = "You are a helpful coding agent.";
+  std::string systemPrompt =
+      "You are a coding agent running inside a local project workspace. "
+      "Use the available tools to inspect files, create files, and modify the "
+      "workspace when the user's request implies real project changes. "
+      "Prefer Read/Write-style tool calls over pasting large code blobs into "
+      "chat when the result should exist as a real file on disk. "
+      "Do not reveal chain-of-thought or write 'thinking process' in the "
+      "final answer. Be concise, action-oriented, and continue the turn after "
+      "tool results until the requested file or change is actually completed.";
   int maxToolUseConcurrency = 10;
   int perMessageBudgetLimit = 600000;
   int contextWindow = 200000;
@@ -61,6 +78,7 @@ struct AgentConfig {
   bool streamingToolExecutionEnabled = true;
   bool failClosedGate = true;
   bool autoModeEnabled = false;
+  PermissionMode permissionMode = PermissionMode::Default;
 
   static AgentConfig FromDefaults();
 };

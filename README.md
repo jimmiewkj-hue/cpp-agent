@@ -92,6 +92,19 @@ ctest --test-dir build -C Release --output-on-failure
 .\build\Release\agent_cli.exe
 ```
 
+启动后会先确认当前启动目录是否作为“可信工程工作区”。
+
+- 选择 `yes` 后：当前目录作为工作区根目录，相对路径读写都落在该工程目录下
+- 会话状态与记忆目录放在工作区下的隐藏目录 `.cpp-agent/`
+- 创建新文件默认应写入工作区中的真实项目路径，而不是状态目录
+- 若要引用工程外文件，需要提供本地绝对路径，或先将文件拷贝到工程目录中
+
+当前推荐的状态目录布局：
+
+- `.cpp-agent/session/` - 会话快照与 transcript
+- `.cpp-agent/memory/` - 持久记忆文件
+- 工程产物文件 - 直接写入工作区内对应相对路径
+
 输出示例：
 ```
 cpp-agent bootstrap
@@ -106,7 +119,7 @@ watchdog_healthy=1
 ```
 
 生成的持久化文件：
-- `build/session/snapshot.bin` — 结构化 session 快照
-- `build/session/snapshot.txt` — 兼容/调试快照镜像
-- `build/session/transcript.txt` — 消息转录日志
-- `build/test-memory/MEMORY.md` — 记忆索引
+- `.cpp-agent/session/snapshot.pb` — 结构化 session 快照
+- `.cpp-agent/session/snapshot.txt` — 兼容/调试快照镜像
+- `.cpp-agent/session/transcript.txt` — 消息转录日志
+- `.cpp-agent/memory/MEMORY.md` — 记忆索引

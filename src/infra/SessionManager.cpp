@@ -2057,6 +2057,14 @@ std::string SessionManager::TranscriptJsonlPath() const {
   return sessionDir_ + "\\transcript.jsonl";
 }
 
+std::string SessionManager::MainModelIoPath() const {
+  return sessionDir_ + "\\main-model.jsonl";
+}
+
+std::string SessionManager::ValidatorModelIoPath() const {
+  return sessionDir_ + "\\validator-model.jsonl";
+}
+
 std::string SessionManager::SnapshotPath() const {
   return sessionDir_ + "\\snapshot.pb";
 }
@@ -2091,15 +2099,13 @@ std::string RoleToJsonStr(core::MessageRole role) {
   return "user";
 }
 
-std::string MessageToJsonl(const core::Message& msg) {
+json MessageToJson(const core::Message& msg) {
   json j;
-  j["type"] = RoleToJsonStr(msg.role);
+  j["role"] = RoleToJsonStr(msg.role);
   j["uuid"] = msg.uuid;
   j["isMeta"] = msg.isMeta;
   if (msg.isApiErrorMessage) j["isApiErrorMessage"] = true;
 
-  json jmsg;
-  jmsg["role"] = RoleToJsonStr(msg.role);
   json content = json::array();
   for (const auto& block : msg.content) {
     json b;
@@ -2118,22 +2124,38 @@ std::string MessageToJsonl(const core::Message& msg) {
       b["tool_use_id"] = block.asToolResult.toolUseId;
       b["content"] = block.asToolResult.content;
       if (block.asToolResult.isError) b["is_error"] = true;
+    } else if (block.type == core::BlockType::Image) {
+      b["media_type"] = block.asImage.mediaType;
+      b["base64_size"] = static_cast<int>(block.asImage.base64Data.size());
     }
     content.push_back(b);
   }
-  jmsg["content"] = content;
-  if (!msg.stopReason.empty()) jmsg["stop_reason"] = msg.stopReason;
+  j["content"] = content;
+  if (!msg.stopReason.empty()) j["stop_reason"] = msg.stopReason;
   if (msg.usage.inputTokens > 0) {
-    jmsg["usage"] = {
+    j["usage"] = {
       {"input_tokens", msg.usage.inputTokens},
       {"output_tokens", msg.usage.outputTokens},
       {"cache_read_input_tokens", msg.usage.cacheReadInputTokens},
       {"cache_creation_input_tokens", msg.usage.cacheCreationInputTokens},
     };
   }
-  j["message"] = jmsg;
+  return j;
+}
 
-  return j.dump();
+json MessagesToJson(const std::vector<core::Message>& messages) {
+  json array = json::array();
+  for (const auto& message : messages) {
+    array.push_back(MessageToJson(message));
+  }
+  return array;
+}
+
+std::string MessageToJsonl(const core::Message& msg) {
+  json j;
+  j["type"] = RoleToJsonStr(msg.role);
+  j["message"] = MessageToJson(msg);
+  return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
 }  // namespace
@@ -2163,6 +2185,38 @@ void SessionManager::FlushTranscriptBuffer() {
 
 void SessionManager::AppendMessageToTranscript(const core::Message& msg) {
   AppendTranscriptLine(MessageToJsonl(msg));
+}
+
+void SessionManager::AppendModelIoRecord(
+    ModelIoLogKind kind,
+    const std::string& phase,
+    const std::string& model,
+    const std::string& systemPrompt,
+    const std::vector<core::Message>& messages,
+    int turnCount,
+    const std::string& error) {
+  json record;
+  record["phase"] = phase;
+  record["model"] = model;
+  record["turn"] = turnCount;
+  if (!systemPrompt.empty()) {
+    record["systemPrompt"] = systemPrompt;
+  }
+  record["messages"] = MessagesToJson(messages);
+  if (!error.empty()) {
+    record["error"] = error;
+  }
+
+  const std::string path =
+      kind == ModelIoLogKind::Main ? MainModelIoPath() : ValidatorModelIoPath();
+  const std::string line =
+      record.dump(-1, ' ', false, json::error_handler_t::replace);
+
+  std::lock_guard<std::mutex> lock(transcriptMutex_);
+  EnsureDirectoryRecursive(sessionDir_);
+  std::ofstream out(path, std::ios::app | std::ios::binary);
+  if (!out) return;
+  out << line << "\n";
 }
 
 }  // namespace infra

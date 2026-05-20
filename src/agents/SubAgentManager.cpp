@@ -1074,5 +1074,90 @@ std::string SubAgentManager::RunAsyncAgentLifecycle(
   return kForkPlaceholderResult;
 }
 
+std::vector<SubAgentManager::BuiltInAgentDef>
+SubAgentManager::GetBuiltInAgentDefinitions() {
+  std::vector<BuiltInAgentDef> defs;
+
+  {
+    BuiltInAgentDef d;
+    d.name = "general-purpose";
+    d.description = "General-purpose sub-agent for independent tasks";
+    d.maxTurns = 200;
+    d.model = "inherit";
+    d.permissionMode = "default";
+    d.allowedTools = {"*"};
+    d.systemPromptHook =
+        "You are a general-purpose sub-agent. Complete the assigned task "
+        "using the available tools. Be thorough and self-sufficient.";
+    defs.push_back(d);
+  }
+  {
+    BuiltInAgentDef d;
+    d.name = "plan";
+    d.description = "Planning agent for generating detailed execution plans";
+    d.maxTurns = 100;
+    d.model = "inherit";
+    d.permissionMode = "plan";
+    d.allowedTools = {"FileRead", "Read", "Grep", "Glob"};
+    d.systemPromptHook =
+        "You are a planning agent. Analyze the task and produce a detailed "
+        "step-by-step plan. Do not modify any files.";
+    defs.push_back(d);
+  }
+  {
+    BuiltInAgentDef d;
+    d.name = "explore";
+    d.description = "Exploration agent for codebase analysis";
+    d.maxTurns = 150;
+    d.model = "inherit";
+    d.permissionMode = "default";
+    d.allowedTools = {"FileRead", "Read", "Grep", "Glob"};
+    d.systemPromptHook =
+        "You are an exploration agent. Investigate the codebase thoroughly "
+        "and report your findings.";
+    defs.push_back(d);
+  }
+  {
+    BuiltInAgentDef d;
+    d.name = "verification";
+    d.description = "Verification agent for checking task completion quality";
+    d.maxTurns = 100;
+    d.model = "inherit";
+    d.permissionMode = "default";
+    d.allowedTools = {"FileRead", "Read", "Grep", "Glob"};
+    d.systemPromptHook =
+        "You are a verification agent. Review the completed work and verify "
+        "it meets the specified requirements. Report any issues found.";
+    defs.push_back(d);
+  }
+  {
+    BuiltInAgentDef d;
+    d.name = "claude-code-guide";
+    d.description = "Guide agent for answering usage questions";
+    d.maxTurns = 50;
+    d.model = "inherit";
+    d.permissionMode = "default";
+    d.allowedTools = {};
+    d.systemPromptHook =
+        "You are a guide agent. Answer questions about the agent system "
+        "and its capabilities.";
+    defs.push_back(d);
+  }
+  {
+    BuiltInAgentDef d;
+    d.name = "statusline-setup";
+    d.description = "Status line configuration agent";
+    d.maxTurns = 50;
+    d.model = "inherit";
+    d.permissionMode = "default";
+    d.allowedTools = {"FileRead", "Read", "FileWrite", "Write"};
+    d.systemPromptHook =
+        "You are a status line setup agent. Configure the status display.";
+    defs.push_back(d);
+  }
+
+  return defs;
+}
+
 }  // namespace agents
 }  // namespace agent

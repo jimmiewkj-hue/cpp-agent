@@ -1,5 +1,7 @@
 #include "memory/MemoryIndex.h"
 
+#include "api/SideQueryClient.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
@@ -102,6 +104,10 @@ MemoryIndex::MemoryIndex(const std::string& memoryDir)
 
 const std::string& MemoryIndex::memoryDir() const {
   return memoryDir_;
+}
+
+void MemoryIndex::SetSideQueryClient(api::SideQueryClient* sideQueryClient) {
+  sideQueryClient_ = sideQueryClient;
 }
 
 std::string MemoryIndex::ResolveActiveMemoryDir() const {
@@ -438,6 +444,84 @@ bool MemoryIndex::UpsertPointer(const MemoryPointer& pointer) const {
   }
 
   return WriteEntrypoint(RenderPointers(pointers));
+}
+
+std::vector<MemoryIndex::RelevantMemory> MemoryIndex::FindRelevantMemories(
+    const std::string& userQuery,
+    const std::vector<std::string>& alreadySurfaced) const {
+  std::vector<RelevantMemory> results;
+
+  MemoryScanner scanner(ResolveActiveMemoryDir());
+  const std::vector<MemoryManifestEntry> entries = scanner.ScanMemoryFiles();
+
+  std::vector<MemoryManifestEntry> filtered;
+  for (const auto& entry : entries) {
+    bool alreadyLoaded = false;
+    for (const auto& surfaced : alreadySurfaced) {
+      if (entry.fileName == surfaced) {
+        alreadyLoaded = true;
+        break;
+      }
+    }
+    if (!alreadyLoaded) filtered.push_back(entry);
+  }
+
+  if (filtered.empty()) return results;
+
+  std::vector<agent::memory::RelevantMemory> rawResults;
+  if (sideQueryClient_ != nullptr && !Trim(userQuery).empty()) {
+    const std::string manifest = scanner.FormatMemoryManifest(filtered);
+    const std::string prompt = scanner.BuildSelectorPrompt(userQuery, manifest);
+
+    api::SideQueryRequest request;
+    request.querySource = "memory_selector";
+    request.systemPrompt =
+        "You select memory filenames that are clearly relevant to a user "
+        "query. Return only the requested tag block.";
+
+    core::Message userMsg;
+    userMsg.role = core::MessageRole::User;
+    userMsg.content.push_back(core::ContentBlock::MakeText(prompt));
+    request.messages.push_back(userMsg);
+
+    api::SideQueryResponse response = sideQueryClient_->Query(request);
+    if (response.ok) {
+      std::ostringstream responseText;
+      for (const auto& msg : response.messages) {
+        for (const auto& block : msg.content) {
+          if (block.type == core::BlockType::Text) {
+            responseText << block.asText.text;
+          }
+        }
+      }
+      rawResults = scanner.ParseSelectorResponse(responseText.str());
+    }
+  }
+
+  int count = 0;
+  for (const auto& raw : rawResults) {
+    if (count >= MemoryScanner::kMaxSelectedMemories) break;
+    RelevantMemory mem;
+    mem.path = raw.path;
+    mem.mtimeMs = raw.mtimeMs;
+
+    std::string name = raw.path;
+    std::size_t slashPos = name.find_last_of("\\/");
+    mem.fileName = slashPos == std::string::npos
+                       ? name : name.substr(slashPos + 1);
+
+    std::ifstream input(mem.path, std::ios::binary);
+    if (input) {
+      std::ostringstream buf;
+      buf << input.rdbuf();
+      mem.content = buf.str();
+    }
+
+    results.push_back(mem);
+    ++count;
+  }
+
+  return results;
 }
 
 std::string MemoryIndex::BuildWarningText(

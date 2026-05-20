@@ -153,6 +153,17 @@ class SubAgentManager {
 
   std::string Cwd() const;
 
+  struct BuiltInAgentDef {
+    std::string name;
+    std::string description;
+    int maxTurns = 200;
+    std::string model;
+    std::string permissionMode;
+    std::vector<std::string> allowedTools;
+    std::string systemPromptHook;
+  };
+  static std::vector<BuiltInAgentDef> GetBuiltInAgentDefinitions();
+
   struct AgentToolProgress {
     std::string taskId;
     std::string phase;

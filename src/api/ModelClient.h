@@ -27,7 +27,8 @@ class ModelClient {
       const std::string& systemPrompt,
       const std::string& model,
       const std::string& toolsJson,
-      const SseEventCallback& onEvent);
+      const SseEventCallback& onEvent,
+      int maxTokensOverride = 0);
 
   virtual std::vector<core::Message> SideQuery(
       const std::vector<core::Message>& messages,
@@ -49,7 +50,8 @@ class SkeletonModelClient : public ModelClient {
       const std::string& systemPrompt,
       const std::string& model,
       const std::string& toolsJson,
-      const SseEventCallback& onEvent) override;
+      const SseEventCallback& onEvent,
+      int maxTokensOverride = 0) override;
 
   std::vector<core::Message> SideQuery(
       const std::vector<core::Message>& messages,
@@ -74,7 +76,8 @@ class HttpLlmClient : public ModelClient {
       const std::string& systemPrompt,
       const std::string& model,
       const std::string& toolsJson,
-      const SseEventCallback& onEvent) override;
+      const SseEventCallback& onEvent,
+      int maxTokensOverride = 0) override;
 
   std::vector<core::Message> SideQuery(
       const std::vector<core::Message>& messages,
@@ -89,18 +92,23 @@ class HttpLlmClient : public ModelClient {
       const std::vector<core::Message>& messages,
       const std::string& systemPrompt,
       const std::string& model,
-      int maxTokens, bool stream) const;
+      int maxTokens, bool stream,
+      const std::string& toolsJson,
+      double temperature = -1.0) const;
   std::string BuildOpenAIBody(
       const std::vector<core::Message>& messages,
       const std::string& systemPrompt,
       const std::string& model,
-      int maxTokens, bool stream) const;
+      int maxTokens, bool stream,
+      const std::string& toolsJson,
+      double temperature = -1.0) const;
   std::string BuildRequestBody(
       const std::vector<core::Message>& messages,
       const std::string& systemPrompt,
       const std::string& model,
       int maxTokens, bool stream,
-      const std::string& toolsJson) const;
+      const std::string& toolsJson,
+      double temperature = -1.0) const;
   std::string SendHttpPost(const std::string& body,
                            const std::string& model,
                            std::string* pathOverride,

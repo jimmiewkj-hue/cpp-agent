@@ -15,6 +15,11 @@
 namespace agent {
 namespace infra {
 
+enum class ModelIoLogKind {
+  Main,
+  Validator
+};
+
 struct SessionSnapshot {
   int formatVersion = 3;
   std::string sessionId;
@@ -48,12 +53,22 @@ class SessionManager {
 
   std::string LatestTranscriptPath() const;
   std::string TranscriptJsonlPath() const;
+  std::string MainModelIoPath() const;
+  std::string ValidatorModelIoPath() const;
   std::string SnapshotPath() const;
   std::string LegacyBinarySnapshotPath() const;
   std::string LegacySnapshotPath() const;
 
   void AppendTranscriptLine(const std::string& jsonLine);
   void AppendMessageToTranscript(const core::Message& message);
+  void AppendModelIoRecord(
+      ModelIoLogKind kind,
+      const std::string& phase,
+      const std::string& model,
+      const std::string& systemPrompt,
+      const std::vector<core::Message>& messages,
+      int turnCount,
+      const std::string& error = std::string());
   void FlushTranscriptBuffer();
 
  private:

@@ -29,6 +29,14 @@ void PermissionEngine::AddAutoModeAllowlistedTool(const std::string& token) {
   }
 }
 
+void PermissionEngine::SetPermissionMode(core::PermissionMode mode) {
+  permissionMode_ = mode;
+}
+
+core::PermissionMode PermissionEngine::GetPermissionMode() const {
+  return permissionMode_;
+}
+
 core::CanUseTool PermissionEngine::BuildCanUseTool() {
   return [this](const core::ContentBlock& toolUse,
                 const std::vector<core::Message>& messages) {
@@ -39,6 +47,14 @@ core::CanUseTool PermissionEngine::BuildCanUseTool() {
 core::PermissionDecision PermissionEngine::Evaluate(
     const core::ContentBlock& toolUse,
     const std::vector<core::Message>& messages) {
+  // Step 0: mode-based shortcuts
+  if (permissionMode_ == core::PermissionMode::BypassPermissions) {
+    return {core::PermissionBehavior::Allow, "bypass permissions mode"};
+  }
+  if (permissionMode_ == core::PermissionMode::Plan) {
+    return {core::PermissionBehavior::Allow, "plan mode — tools not actually executed"};
+  }
+
   // Step 1: always deny rules
   if (MatchesAny(toolUse.asToolUse.name, denyRules_)) {
     denialState_.RecordDenial();

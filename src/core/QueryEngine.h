@@ -127,6 +127,7 @@ class QueryEngine {
   std::string sessionDir_;
 
   std::string BuildEffectiveSystemPrompt() const;
+  std::string BuildLatestUserQuery() const;
   void SyncSessionState();
   void ConfigureWatchdogBindings();
   bool RecoverFromSnapshot();

@@ -9,7 +9,7 @@ namespace core {
 
 enum class MessageRole { User, Assistant, System };
 
-enum class BlockType { Text, ToolUse, ToolResult };
+enum class BlockType { Text, ToolUse, ToolResult, Image };
 
 enum class QueryStage {
   ToolResultBudget,
@@ -40,6 +40,11 @@ struct ToolResultBlock {
   bool isError = false;
 };
 
+struct ImageBlock {
+  std::string base64Data;
+  std::string mediaType;
+};
+
 struct Usage {
   int inputTokens = 0;
   int outputTokens = 0;
@@ -52,11 +57,21 @@ struct ContentBlock {
   TextBlock asText;
   ToolUseBlock asToolUse;
   ToolResultBlock asToolResult;
+  ImageBlock asImage;
 
   static ContentBlock MakeText(const std::string& text) {
     ContentBlock b;
     b.type = BlockType::Text;
     b.asText.text = text;
+    return b;
+  }
+
+  static ContentBlock MakeImage(const std::string& base64Data,
+                                const std::string& mediaType) {
+    ContentBlock b;
+    b.type = BlockType::Image;
+    b.asImage.base64Data = base64Data;
+    b.asImage.mediaType = mediaType;
     return b;
   }
 

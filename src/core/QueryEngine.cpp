@@ -86,6 +86,9 @@ void QueryEngine::SetValidatorModel(const std::string& model) {
 
 void QueryEngine::SetMemoryIndex(memory::MemoryIndex* memoryIndex) {
   memoryIndex_ = memoryIndex;
+  if (memoryIndex_ != nullptr) {
+    memoryIndex_->SetSideQueryClient(&sideQueryClient_);
+  }
 }
 
 void QueryEngine::SetSubAgentManager(agents::SubAgentManager* subAgentManager) {
@@ -201,7 +204,18 @@ std::string QueryEngine::BuildEffectiveSystemPrompt() const {
 
   std::string memoryPrompt;
   if (memoryIndex_ != nullptr) {
-    memoryPrompt = memoryIndex_->BuildSystemPromptInjection();
+    std::vector<std::string> relevantTopics;
+    const std::string latestUserQuery = BuildLatestUserQuery();
+    if (!latestUserQuery.empty()) {
+      const std::vector<memory::MemoryIndex::RelevantMemory> relevantMemories =
+          memoryIndex_->FindRelevantMemories(latestUserQuery, {});
+      for (const auto& memory : relevantMemories) {
+        if (!memory.fileName.empty()) {
+          relevantTopics.push_back(memory.fileName);
+        }
+      }
+    }
+    memoryPrompt = memoryIndex_->BuildSystemPromptInjection(relevantTopics);
   } else if (!config_.memoryRoot.empty()) {
     memory::MemoryIndex tempIndex(config_.memoryRoot);
     memoryPrompt = tempIndex.BuildSystemPromptInjection();
@@ -210,6 +224,21 @@ std::string QueryEngine::BuildEffectiveSystemPrompt() const {
   if (memoryPrompt.empty()) return effectivePrompt;
   if (effectivePrompt.empty()) return memoryPrompt;
   return effectivePrompt + "\n\n" + memoryPrompt;
+}
+
+std::string QueryEngine::BuildLatestUserQuery() const {
+  for (std::vector<Message>::const_reverse_iterator it = messages_.rbegin();
+       it != messages_.rend(); ++it) {
+    if (it->role != MessageRole::User) continue;
+    std::ostringstream query;
+    for (const auto& block : it->content) {
+      if (block.type != BlockType::Text) continue;
+      if (query.tellp() > 0) query << "\n";
+      query << block.asText.text;
+    }
+    return query.str();
+  }
+  return std::string();
 }
 
 void QueryEngine::SyncSessionState() {

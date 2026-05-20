@@ -3,6 +3,13 @@ cmake_minimum_required(VERSION 3.20)
 project(cpp_agent LANGUAGES CXX)
 
 option(AGENT_BUILD_TESTS "Build unit and smoke tests" ON)
+option(AGENT_ENABLE_AUTOCOMPACT "Enable auto-compact feature" ON)
+option(AGENT_ENABLE_VALIDATOR "Enable validator layer" OFF)
+option(AGENT_ENABLE_MCP "Enable MCP client integration" ON)
+option(AGENT_ENABLE_AUTODREAM "Enable Auto-Dream background consolidation" ON)
+option(AGENT_ENABLE_STREAMING_TOOLS "Enable streaming tool execution" ON)
+option(AGENT_ENABLE_SANDBOX "Enable OS-level sandbox (requires platform support)" OFF)
+option(AGENT_ENABLE_WEB_TOOLS "Enable WebFetch/WebSearch network tools" OFF)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,9 +36,29 @@ if(WIN32)
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
+if(AGENT_ENABLE_AUTOCOMPACT)
+  add_compile_definitions(AGENT_FEATURE_AUTOCOMPACT)
+endif()
+if(AGENT_ENABLE_VALIDATOR)
+  add_compile_definitions(AGENT_FEATURE_VALIDATOR)
+endif()
+if(AGENT_ENABLE_MCP)
+  add_compile_definitions(AGENT_FEATURE_MCP)
+endif()
+if(AGENT_ENABLE_AUTODREAM)
+  add_compile_definitions(AGENT_FEATURE_AUTODREAM)
+endif()
+if(AGENT_ENABLE_STREAMING_TOOLS)
+  add_compile_definitions(AGENT_FEATURE_STREAMING_TOOLS)
+endif()
+if(AGENT_ENABLE_WEB_TOOLS)
+  add_compile_definitions(AGENT_FEATURE_WEB_TOOLS)
+endif()
+
 add_library(agent_core
   src/agents/SubAgentManager.cpp
   src/agents/SubAgentWorkerProtocol.cpp
+  src/api/CostTracker.cpp
   src/api/ModelClient.cpp
   src/api/SideQueryClient.cpp
   src/core/QueryEngine.cpp
@@ -45,6 +72,8 @@ add_library(agent_core
   src/mcp/McpClientManager.cpp
   src/memory/AutoDream.cpp
   src/memory/MemoryIndex.cpp
+  src/memory/MemoryScanner.cpp
+  src/permissions/BashClassifier.cpp
   src/permissions/PermissionEngine.cpp
   src/tools/ToolOrchestrator.cpp
   src/tools/ToolRegistry.cpp
@@ -123,4 +152,24 @@ if(AGENT_BUILD_TESTS)
   )
   target_link_libraries(agent_test_e2e PRIVATE agent_core)
   add_test(NAME agent_test_e2e COMMAND agent_test_e2e)
+
+  add_executable(agent_benchmark_runner
+    tests/integration/benchmark_runner.cpp
+  )
+  target_link_libraries(agent_benchmark_runner PRIVATE agent_core)
+
+  add_executable(agent_real_project_runner
+    tests/integration/real_project_runner.cpp
+  )
+  target_link_libraries(agent_real_project_runner PRIVATE agent_core)
+
+  add_executable(agent_model_stream_smoke_runner
+    tests/integration/model_stream_smoke_runner.cpp
+  )
+  target_link_libraries(agent_model_stream_smoke_runner PRIVATE agent_core)
+
+  add_executable(agent_gemma_validator_benchmark
+    tests/integration/gemma_validator_benchmark.cpp
+  )
+  target_link_libraries(agent_gemma_validator_benchmark PRIVATE agent_core)
 endif()

@@ -22,16 +22,29 @@ enum class TransitionReason {
   MaxOutputTokensRecovery,
   StopHookBlocking,
   TokenBudgetContinuation,
+  ValidatorRetry,
+  ForcedContinuation,
+  ToolResultContinuation,
 };
 
 struct QueryLoopInternalState {
   QueryStage stage = QueryStage::ToolResultBudget;
+  std::vector<Message> messagesForTurn;
   std::vector<Message> assistantMessages;
+  std::vector<Message> toolResultMessages;
+  std::vector<Message> pendingFollowupMessages;
   std::vector<ContentBlock> toolUseBlocks;
   bool completed = false;
   bool validatorRequestedRetry = false;
+  bool hasPromptedForMissingToolUse = false;
+  bool forceContinuation = false;
+  bool stopHookActive = false;
   std::string terminalReason;
+  std::string forceContinuationReason;
+  std::string activeModel;
+  int forcedContinuationCount = 0;
   int turnCount = 0;
+  int nextTurnCount = 0;
   int consecutiveAutoCompactFailures = 0;
   int maxOutputTokensRecoveryCount = 0;
   bool hasAttemptedReactiveCompact = false;
@@ -42,6 +55,7 @@ struct QueryLoopInternalState {
 
 struct StopHookResult {
   bool preventContinuation = false;
+  std::vector<Message> followupMessages;
   std::vector<Message> blockingErrors;
 };
 
@@ -77,6 +91,24 @@ class QueryLoop {
                          QueryLoopInternalState& state);
   bool ApplyStepTerminate(QueryLoopContext& ctx,
                           QueryLoopInternalState& state);
+  bool HandleNoToolContinuation(QueryLoopContext& ctx,
+                                QueryLoopInternalState& state);
+  bool ContinueWithFollowup(QueryLoopContext& ctx,
+                            QueryLoopInternalState& state,
+                            const std::vector<Message>& followups,
+                            TransitionReason reason,
+                            bool resetTurnCount);
+  bool ShouldForceContinuation(const QueryLoopContext& ctx,
+                               const QueryLoopInternalState& state) const;
+  std::vector<Message> BuildMessagesForTurn(
+      const QueryLoopContext& ctx,
+      const QueryLoopInternalState& state) const;
+  void PostToolTurnProcessing(QueryLoopContext& ctx,
+                              QueryLoopInternalState& state);
+  void AppendTurnArtifacts(QueryLoopContext& ctx,
+                           const std::vector<Message>& assistantMessages,
+                           const std::vector<Message>& toolResults,
+                           const std::vector<Message>& followups) const;
 
   bool Handle413Recovery(QueryLoopContext& ctx,
                          QueryLoopInternalState& state);

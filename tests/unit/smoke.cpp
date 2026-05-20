@@ -11,6 +11,7 @@
 #include "permissions/PermissionEngine.h"
 #include "tools/ToolOrchestrator.h"
 #include "tools/ToolRegistry.h"
+#include "third_party/nlohmann_json.hpp"
 
 #include <windows.h>
 
@@ -262,6 +263,74 @@ class RecordingModelClient : public agent::api::ModelClient {
   bool emitToolUse = false;
 };
 
+class SuccessfulToolThenFinalModelClient : public agent::api::ModelClient {
+ public:
+  explicit SuccessfulToolThenFinalModelClient(std::string outputPath)
+      : outputPath_(outputPath) {}
+
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  void StreamResponse(
+      const std::vector<agent::core::Message>& messages,
+      const std::string&,
+      const std::string&,
+      const std::string&,
+      const agent::api::SseEventCallback& onEvent) override {
+    ++streamCallCount;
+    if (streamCallCount == 2) {
+      sawToolResultOnFollowup = HasToolResult(messages, "success-tool-1");
+    }
+    if (!onEvent) return;
+
+    if (streamCallCount == 1) {
+      nlohmann::json toolEvent;
+      toolEvent["id"] = "success-tool-1";
+      toolEvent["name"] = "FileWrite";
+      toolEvent["input"] = {
+          {"file_path", outputPath_},
+          {"content", "<html><body>ok</body></html>"},
+      };
+      onEvent("text_delta", "Creating HTML file.");
+      onEvent("tool_use", toolEvent.dump());
+      onEvent("stop_reason", "tool_use");
+      return;
+    }
+
+    onEvent("text_delta", "File is ready.");
+    onEvent("stop_reason", "end_turn");
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  static bool HasToolResult(const std::vector<agent::core::Message>& messages,
+                            const std::string& toolUseId) {
+    for (const auto& msg : messages) {
+      if (msg.role != agent::core::MessageRole::User) continue;
+      for (const auto& block : msg.content) {
+        if (block.type != agent::core::BlockType::ToolResult) continue;
+        if (block.asToolResult.toolUseId == toolUseId) return true;
+      }
+    }
+    return false;
+  }
+
+  int streamCallCount = 0;
+  bool sawToolResultOnFollowup = false;
+
+ private:
+  std::string outputPath_;
+};
+
 }  // namespace
 
 int main() {
@@ -294,6 +363,14 @@ int main() {
   toolRegistry.RegisterTool(
       {"Glob", "Find files", R"({"type":"object"})",
        agent::tools::ToolExecCategory::ReadOnly, true, false, 100000});
+  toolRegistry.RegisterTool(
+      {"FileWrite", "Write content to a file",
+       R"({"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]})",
+       agent::tools::ToolExecCategory::FileWrite, false, true, 100000});
+  toolRegistry.RegisterTool(
+      {"Bash", "Execute a shell command",
+       R"({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})",
+       agent::tools::ToolExecCategory::ShellCommand, false, true, 400000});
 
   // Test 1: allow rule matches
   permissionEngine.AddAlwaysAllowRule("FileRead");
@@ -396,6 +473,43 @@ int main() {
   Check(watchdog.IsHealthy(), "Watchdog should be healthy after turn");
   Check(sessionManager.messages().size() == msgs.size(),
         "SessionManager should stay in sync with QueryEngine messages");
+
+  // Test 8b: successful tool execution should continue into a final assistant turn
+  {
+    permissionEngine.AddAlwaysAllowRule("FileWrite");
+    const std::string queryLoopSuccessPath =
+        "G:\\downloads\\claude-code\\yuanma-poxi\\cpp-agent\\build\\test-session\\query-loop-success.html";
+    SuccessfulToolThenFinalModelClient successfulToolModel(
+        queryLoopSuccessPath);
+    agent::api::SideQueryClient successfulToolSideClient(successfulToolModel);
+    agent::core::QueryEngine successEngine(
+        toolOrchestrator, permissionEngine, successfulToolModel,
+        successfulToolSideClient, toolRegistry, sessionManager);
+    successEngine.SetConfig(config);
+    successEngine.SubmitUserPrompt("Create a file and then confirm completion.");
+    successEngine.RunTurn();
+
+    const auto& successMessages = successEngine.messages();
+    Check(successfulToolModel.streamCallCount >= 2,
+          "Successful tool path should call the model again after tool_result");
+    Check(successfulToolModel.sawToolResultOnFollowup,
+          "Follow-up model call should receive tool_result context");
+    Check(!successMessages.empty() &&
+              successMessages.back().role ==
+                  agent::core::MessageRole::Assistant &&
+              !successMessages.back().content.empty() &&
+              successMessages.back().content[0].type ==
+                  agent::core::BlockType::Text &&
+              successMessages.back().content[0].asText.text.find("File is ready.") !=
+                  std::string::npos,
+          "Successful tool path should end with final assistant text");
+
+    std::ifstream successFile(queryLoopSuccessPath.c_str(), std::ios::binary);
+    std::ostringstream successContent;
+    successContent << successFile.rdbuf();
+    Check(!successContent.str().empty(),
+          "Successful tool path should create the requested file");
+  }
 
   // Test 9: SessionManager persists and restores
   sessionManager.PersistSnapshot();
@@ -1202,6 +1316,218 @@ int main() {
     Check(recoveryWatchdog.metrics().runningSubTasks >= 1,
           "Recovery watchdog should report running subtask metrics after reschedule");
     recoveryWatchdog.Stop();
+  }
+
+  // Test 22: FileWrite end-to-end through ToolOrchestrator with permission engine
+  {
+    permissionEngine.ResetDenialState();
+    permissionEngine.AddAlwaysAllowRule("FileWrite");
+
+    std::string testDir = "build\\smoke-filewrite";
+    CreateDirectoryA(testDir.c_str(), nullptr);
+
+    std::string filePath = testDir + "\\hello.cpp";
+    std::string content =
+        "#include <iostream>\n"
+        "\n"
+        "int main() {\n"
+        "    std::cout << \"Hello from FileWrite smoke test!\" << std::endl;\n"
+        "    return 0;\n"
+        "}\n";
+
+    nlohmann::json fwJson;
+    fwJson["file_path"] = filePath;
+    fwJson["content"] = content;
+
+    agent::core::ContentBlock fwBlock =
+        agent::core::ContentBlock::MakeToolUse(
+            "fw-smoke-1", "FileWrite", fwJson.dump());
+    std::vector<agent::core::ContentBlock> fwBlocks = {fwBlock};
+
+    auto canUseTool = permissionEngine.BuildCanUseTool();
+    auto result = toolOrchestrator.Execute(
+        fwBlocks, canUseTool, {});
+
+    Check(result.errorCount == 0,
+          "FileWrite smoke: should not error");
+    Check(!result.userMessages.empty(),
+          "FileWrite smoke: should produce result messages");
+
+    bool foundCreateMsg = false;
+    for (const auto& msg : result.userMessages) {
+      for (const auto& block : msg.content) {
+        if (block.type == agent::core::BlockType::ToolResult &&
+            block.asToolResult.content.find("Created file") != std::string::npos) {
+          foundCreateMsg = true;
+        }
+      }
+    }
+    Check(foundCreateMsg,
+          "FileWrite smoke: result should contain 'Created file'");
+
+    DWORD attrs = GetFileAttributesA(filePath.c_str());
+    Check(attrs != INVALID_FILE_ATTRIBUTES,
+          "FileWrite smoke: output file should exist on disk");
+    Check(!(attrs & FILE_ATTRIBUTE_DIRECTORY),
+          "FileWrite smoke: output should be a file, not directory");
+
+    std::ifstream verify(filePath, std::ios::binary);
+    std::string actualContent((std::istreambuf_iterator<char>(verify)),
+                               std::istreambuf_iterator<char>());
+    verify.close();
+    Check(actualContent == content,
+          "FileWrite smoke: disk content should match written content");
+
+    DeleteFileA(filePath.c_str());
+    RemoveDirectoryA(testDir.c_str());
+  }
+
+  // Test 23: FileWrite permissions — deny rule blocks write (without polluting global rules)
+  {
+    permissionEngine.ResetDenialState();
+
+    agent::core::ContentBlock fwBlock =
+        agent::core::ContentBlock::MakeToolUse(
+            "fw-smoke-deny", "FileWrite",
+            R"({"file_path":"build\should-not-exist.txt","content":"blocked"})");
+    std::vector<agent::core::ContentBlock> fwBlocks = {fwBlock};
+
+    auto explicitDeny = [](const agent::core::ContentBlock&,
+                           const std::vector<agent::core::Message>&) {
+      agent::core::PermissionDecision d;
+      d.behavior = agent::core::PermissionBehavior::Deny;
+      d.reason = "test deny rule";
+      return d;
+    };
+
+    auto result = toolOrchestrator.Execute(
+        fwBlocks, explicitDeny, {});
+
+    Check(result.deniedCount > 0,
+          "FileWrite smoke deny: should be denied by custom canUseTool");
+    DWORD attrs = GetFileAttributesA("build\\should-not-exist.txt");
+    Check(attrs == INVALID_FILE_ATTRIBUTES,
+          "FileWrite smoke deny: file should NOT exist on disk");
+  }
+
+  // Test 24: FileWrite multi-file project through orchestrator (complex benchmark)
+  {
+    permissionEngine.ResetDenialState();
+    permissionEngine.AddAlwaysAllowRule("FileWrite");
+    permissionEngine.AddAlwaysAllowRule("FileRead");
+    permissionEngine.AddAlwaysAllowRule("Bash");
+
+    std::string projDir = "build\\smoke-fw-project";
+    CreateDirectoryA(projDir.c_str(), nullptr);
+
+    struct FileSpec {
+      std::string path;
+      std::string content;
+    };
+
+    std::vector<FileSpec> projectFiles = {
+      {projDir + "\\CMakeLists.txt",
+       "cmake_minimum_required(VERSION 3.20)\n"
+       "project(smoke_bench LANGUAGES CXX)\n"
+       "add_executable(smoke_bench main.cpp utils.cpp)\n"},
+      {projDir + "\\main.cpp",
+       "#include \"utils.h\"\n"
+       "#include <iostream>\n"
+       "int main() { std::cout << add(2, 3) << std::endl; return 0; }\n"},
+      {projDir + "\\utils.h",
+       "#pragma once\n"
+       "int add(int a, int b);\n"},
+      {projDir + "\\utils.cpp",
+       "#include \"utils.h\"\n"
+       "int add(int a, int b) { return a + b; }\n"},
+      {projDir + "\\README.md",
+       "# Smoke Bench\n"
+       "Auto-generated project via FileWrite tool.\n"
+       "Build: mkdir build && cd build && cmake .. && cmake --build .\n"},
+    };
+
+    auto canUseTool = permissionEngine.BuildCanUseTool();
+    int writtenCount = 0;
+
+    for (const auto& spec : projectFiles) {
+      nlohmann::json fwJson;
+      fwJson["file_path"] = spec.path;
+      fwJson["content"] = spec.content;
+
+      std::vector<agent::core::ContentBlock> blocks;
+      blocks.push_back(agent::core::ContentBlock::MakeToolUse(
+          "fw-proj-" + std::to_string(writtenCount),
+          "FileWrite", fwJson.dump()));
+
+      auto result = toolOrchestrator.Execute(blocks, canUseTool, {});
+      if (result.errorCount == 0) {
+        ++writtenCount;
+      }
+    }
+
+    Check(writtenCount == static_cast<int>(projectFiles.size()),
+          "FileWrite project: all files should be written without error");
+
+    for (const auto& spec : projectFiles) {
+      DWORD attrs = GetFileAttributesA(spec.path.c_str());
+      Check(attrs != INVALID_FILE_ATTRIBUTES,
+            ("FileWrite project: file should exist: " + spec.path).c_str());
+
+      std::ifstream verify(spec.path, std::ios::binary);
+      std::string actualContent((std::istreambuf_iterator<char>(verify)),
+                                 std::istreambuf_iterator<char>());
+      verify.close();
+      Check(actualContent == spec.content,
+            ("FileWrite project: content match: " + spec.path).c_str());
+    }
+
+    for (const auto& spec : projectFiles) {
+      DeleteFileA(spec.path.c_str());
+    }
+    RemoveDirectoryA(projDir.c_str());
+  }
+
+  // Test 25: FileWrite edge-case — relative path, deep directory creation via Bash+FileWrite
+  {
+    permissionEngine.ResetDenialState();
+    permissionEngine.AddAlwaysAllowRule("FileWrite");
+    permissionEngine.AddAlwaysAllowRule("Bash");
+
+    std::string deepDir = "build\\smoke-fw-deep\\sub\\nested";
+    std::string deepFilePath = deepDir + "\\deep_file.txt";
+    std::string deepContent = "Deep nested content.\n";
+
+    std::vector<agent::core::ContentBlock> bashBlocks;
+    bashBlocks.push_back(agent::core::ContentBlock::MakeToolUse(
+        "fw-deep-mkdir", "Bash",
+        R"({"command":"mkdir build\\smoke-fw-deep\\sub\\nested 2>nul"})"));
+    auto canUseTool = permissionEngine.BuildCanUseTool();
+    toolOrchestrator.Execute(bashBlocks, canUseTool, {});
+
+    CreateDirectoryA("build\\smoke-fw-deep", nullptr);
+    CreateDirectoryA("build\\smoke-fw-deep\\sub", nullptr);
+    CreateDirectoryA(deepDir.c_str(), nullptr);
+
+    nlohmann::json fwDeepJson;
+    fwDeepJson["file_path"] = deepFilePath;
+    fwDeepJson["content"] = deepContent;
+
+    std::vector<agent::core::ContentBlock> fwBlocks;
+    fwBlocks.push_back(agent::core::ContentBlock::MakeToolUse(
+        "fw-deep-1", "FileWrite", fwDeepJson.dump()));
+
+    auto fwResult = toolOrchestrator.Execute(fwBlocks, canUseTool, {});
+    Check(fwResult.errorCount == 0,
+          "FileWrite deep path: should write file in nested directory");
+
+    DWORD attrs = GetFileAttributesA(deepFilePath.c_str());
+    Check(attrs != INVALID_FILE_ATTRIBUTES,
+          "FileWrite deep path: file should exist in nested directory");
+
+    DeleteFileA(deepFilePath.c_str());
+    RemoveDirectoryA(deepDir.c_str());
+    RemoveDirectoryA("build\\smoke-fw-deep\\sub");
+    RemoveDirectoryA("build\\smoke-fw-deep");
   }
 
   watchdog.Stop();
