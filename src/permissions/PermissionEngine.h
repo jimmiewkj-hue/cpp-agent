@@ -37,6 +37,8 @@ class PermissionEngine {
  private:
   bool MatchesAny(const std::string& candidate,
                   const std::vector<std::string>& rules) const;
+  bool MatchesAny(const core::ContentBlock& toolUse,
+                  const std::vector<std::string>& rules) const;
 
   std::vector<std::string> allowRules_;
   std::vector<std::string> denyRules_;

@@ -6,17 +6,6 @@
 namespace agent {
 namespace tools {
 
-static std::string ToolCategoryToStr(ToolExecCategory cat) {
-  switch (cat) {
-    case ToolExecCategory::ReadOnly:     return "ReadOnly";
-    case ToolExecCategory::FileWrite:    return "FileWrite";
-    case ToolExecCategory::ShellCommand: return "ShellCommand";
-    case ToolExecCategory::SubAgent:     return "SubAgent";
-    case ToolExecCategory::McpTool:      return "McpTool";
-  }
-  return "Unknown";
-}
-
 std::vector<ToolSchema> ToolRegistry::GetAllBaseTools() {
   std::vector<ToolSchema> tools;
 
@@ -121,6 +110,61 @@ std::vector<ToolSchema> ToolRegistry::GetAllBaseTools() {
   }
   {
     ToolSchema t;
+    t.name = "TaskCreate";
+    t.description = "Create a structured task for the current session task list";
+    t.inputSchemaJson = R"({"type":"object","properties":{"subject":{"type":"string"},"description":{"type":"string"},"activeForm":{"type":"string"},"metadata":{"type":"object"}},"required":["subject","description"]})";
+    t.category = ToolExecCategory::FileWrite;
+    t.readOnlyHint = false;
+    t.destructiveHint = true;
+    t.maxResultSizeChars = 100000;
+    tools.push_back(t);
+  }
+  {
+    ToolSchema t;
+    t.name = "TaskGet";
+    t.description = "Get one task from the current session task list by id";
+    t.inputSchemaJson = R"({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})";
+    t.category = ToolExecCategory::ReadOnly;
+    t.readOnlyHint = true;
+    t.destructiveHint = false;
+    t.maxResultSizeChars = 100000;
+    tools.push_back(t);
+  }
+  {
+    ToolSchema t;
+    t.name = "TaskUpdate";
+    t.description = "Update one task in the current session task list";
+    t.inputSchemaJson = R"({"type":"object","properties":{"id":{"type":"string"},"subject":{"type":"string"},"description":{"type":"string"},"activeForm":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed","blocked","cancelled"]},"owner":{"type":"string"},"blockedBy":{"type":"array","items":{"type":"string"}},"metadata":{"type":"object"}},"required":["id"]})";
+    t.category = ToolExecCategory::FileWrite;
+    t.readOnlyHint = false;
+    t.destructiveHint = true;
+    t.maxResultSizeChars = 100000;
+    tools.push_back(t);
+  }
+  {
+    ToolSchema t;
+    t.name = "TaskList";
+    t.description = "List all tasks for the current session task list";
+    t.inputSchemaJson = R"({"type":"object","properties":{}})";
+    t.category = ToolExecCategory::ReadOnly;
+    t.readOnlyHint = true;
+    t.destructiveHint = false;
+    t.maxResultSizeChars = 100000;
+    tools.push_back(t);
+  }
+  {
+    ToolSchema t;
+    t.name = "TaskStop";
+    t.description = "Stop or cancel a task in the current session task list";
+    t.inputSchemaJson = R"({"type":"object","properties":{"id":{"type":"string"},"reason":{"type":"string"}},"required":["id"]})";
+    t.category = ToolExecCategory::FileWrite;
+    t.readOnlyHint = false;
+    t.destructiveHint = true;
+    t.maxResultSizeChars = 100000;
+    tools.push_back(t);
+  }
+  {
+    ToolSchema t;
     t.name = "AskUserQuestion";
     t.description = "Ask the user clarifying questions when more information is needed";
     t.inputSchemaJson = R"({"type":"object","properties":{"questions":{"type":"array","items":{"type":"object","properties":{"question":{"type":"string"},"header":{"type":"string"},"options":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}},"required":["label","description"]}},"multiSelect":{"type":"boolean"}},"required":["question","header","options","multiSelect"]}}},"required":["questions"]})";
@@ -138,6 +182,50 @@ std::vector<ToolSchema> ToolRegistry::GetAllBaseTools() {
     t.category = ToolExecCategory::FileWrite;
     t.readOnlyHint = false;
     t.destructiveHint = true;
+    t.maxResultSizeChars = 100000;
+    tools.push_back(t);
+  }
+  {
+    ToolSchema t;
+    t.name = "NotebookEdit";
+    t.description = "Edit a Jupyter notebook cell by replacing, inserting, or deleting a cell";
+    t.inputSchemaJson = R"({"type":"object","properties":{"notebook_path":{"type":"string"},"cell_id":{"type":"string"},"new_source":{"type":"string"},"cell_type":{"type":"string","enum":["code","markdown"]},"edit_mode":{"type":"string","enum":["replace","insert","delete"]}},"required":["notebook_path"]})";
+    t.category = ToolExecCategory::FileWrite;
+    t.readOnlyHint = false;
+    t.destructiveHint = true;
+    t.maxResultSizeChars = 100000;
+    tools.push_back(t);
+  }
+  {
+    ToolSchema t;
+    t.name = "Skill";
+    t.description = "Execute a built-in skill in a forked sub-agent context";
+    t.inputSchemaJson = R"({"type":"object","properties":{"command":{"type":"string"},"args":{"type":"string"}},"required":["command"]})";
+    t.category = ToolExecCategory::SubAgent;
+    t.readOnlyHint = false;
+    t.destructiveHint = true;
+    t.maxResultSizeChars = 400000;
+    tools.push_back(t);
+  }
+  {
+    ToolSchema t;
+    t.name = "ListMcpResources";
+    t.description = "List resources exposed by connected MCP servers";
+    t.inputSchemaJson = R"({"type":"object","properties":{"server":{"type":"string"}}})";
+    t.category = ToolExecCategory::ReadOnly;
+    t.readOnlyHint = true;
+    t.destructiveHint = false;
+    t.maxResultSizeChars = 100000;
+    tools.push_back(t);
+  }
+  {
+    ToolSchema t;
+    t.name = "ReadMcpResource";
+    t.description = "Read one MCP resource by server name and resource URI";
+    t.inputSchemaJson = R"({"type":"object","properties":{"server":{"type":"string"},"uri":{"type":"string"}},"required":["server","uri"]})";
+    t.category = ToolExecCategory::ReadOnly;
+    t.readOnlyHint = true;
+    t.destructiveHint = false;
     t.maxResultSizeChars = 100000;
     tools.push_back(t);
   }

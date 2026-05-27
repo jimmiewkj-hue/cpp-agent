@@ -1,0 +1,39 @@
+﻿*** Begin Patch
+*** Update File: G:\downloads\claude-code\yuanma-poxi\cpp-agent\src\tools\ToolOrchestrator.cpp
+@@ std::string NormalizeWindowsShellCommand(const std::string& command) {
+-  const std::string trimmed = Trim(command);
+-  if (trimmed.empty()) return trimmed;
+-  std::istringstream stream(trimmed);
+-  std::vector<std::string> tokens;
+-  std::string token;
+-  while (stream >> token) tokens.push_back(token);
+-  if (tokens.empty()) return trimmed;
+-  if (!StartsWithCaseInsensitive(tokens[0], "ls")) return trimmed;
+-  bool useForce = false;
+-  std::vector<std::string> paths;
+-  for (std::size_t i = 1; i < tokens.size(); ++i) {
+-    const std::string& current = tokens[i];
+-    if (!current.empty() && current[0] == '-') {
+-      for (std::size_t j = 1; j < current.size(); ++j) {
+-        const char flag = static_cast<char>(
+-            std::tolower(static_cast<unsigned char>(current[j])));
+-        if (flag == 'a') {
+-          useForce = true;
+-        } else if (flag == 'l' || flag == 'h') {
+-          continue;
+-        } else {
+-          return trimmed;
+-        }
+-      }
+-      continue;
+-    }
+-    paths.push_back(current);
+-  }
+-  std::ostringstream normalized;
+-  normalized << "Get-ChildItem";
+-  if (useForce) normalized << " -Force";
+-  for (const auto& path : paths) {
+-    normalized << " -Path '" << path << "'";
+-  }
+-  return normalized.str();
+*** End Patch

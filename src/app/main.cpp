@@ -1,10 +1,14 @@
+#include "app/TuiTaskPanel.h"
 #include "core/QueryEngine.h"
 #include "core/StateTypes.h"
 #include "api/ModelClient.h"
 #include "api/SideQueryClient.h"
 #include "agents/SubAgentManager.h"
+#include "hooks/HookConfig.h"
+#include "hooks/HookExecutor.h"
 #include "infra/SessionManager.h"
 #include "infra/StabilityWatchdog.h"
+#include "mcp/McpClientManager.h"
 #include "memory/MemoryIndex.h"
 #include "permissions/PermissionEngine.h"
 #include "tools/ToolOrchestrator.h"
@@ -21,6 +25,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -28,6 +33,9 @@
 #include <vector>
 
 namespace {
+
+std::wstring Utf8ToWide(const std::string& text);
+std::string WideToUtf8(const std::wstring& text);
 
 std::string GetEnvOrDefault(const char* name, const std::string& fallback) {
   char* value = nullptr;
@@ -39,6 +47,38 @@ std::string GetEnvOrDefault(const char* name, const std::string& fallback) {
   std::string result(value);
   std::free(value);
   return result;
+}
+
+std::string ReadUtf8File(const std::string& path) {
+  HANDLE handle = CreateFileW(Utf8ToWide(path).c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                  FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+  if (handle == INVALID_HANDLE_VALUE) return std::string();
+
+  LARGE_INTEGER size;
+  if (!GetFileSizeEx(handle, &size) || size.QuadPart < 0) {
+    CloseHandle(handle);
+    return std::string();
+  }
+
+  std::string content(static_cast<std::size_t>(size.QuadPart), '\0');
+  DWORD totalRead = 0;
+  while (totalRead < static_cast<DWORD>(content.size())) {
+    DWORD chunkRead = 0;
+    if (!ReadFile(handle, &content[totalRead],
+                  static_cast<DWORD>(content.size()) - totalRead, &chunkRead,
+                  nullptr)) {
+      CloseHandle(handle);
+      return std::string();
+    }
+    if (chunkRead == 0) break;
+    totalRead += chunkRead;
+  }
+  content.resize(totalRead);
+  CloseHandle(handle);
+  return content;
 }
 
 std::string ParentPath(const std::string& path) {
@@ -59,11 +99,11 @@ std::string JoinPath(const std::string& lhs, const std::string& rhs) {
 }
 
 bool FileExists(const std::string& path) {
-  return GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+  return GetFileAttributesW(Utf8ToWide(path).c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
 bool DirectoryExists(const std::string& path) {
-  DWORD attrs = GetFileAttributesA(path.c_str());
+  DWORD attrs = GetFileAttributesW(Utf8ToWide(path).c_str());
   return attrs != INVALID_FILE_ATTRIBUTES &&
          (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
@@ -75,15 +115,16 @@ bool EnsureDirectoryRecursive(const std::string& path) {
   if (!parent.empty() && parent != path && !DirectoryExists(parent)) {
     if (!EnsureDirectoryRecursive(parent)) return false;
   }
-  if (CreateDirectoryA(path.c_str(), nullptr)) return true;
+  if (CreateDirectoryW(Utf8ToWide(path).c_str(), nullptr)) return true;
   return GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
 std::string GetCurrentDirectoryString() {
-  char buffer[MAX_PATH] = {0};
-  DWORD length = GetCurrentDirectoryA(MAX_PATH, buffer);
-  if (length == 0 || length >= MAX_PATH) return ".";
-  return std::string(buffer, length);
+  std::vector<wchar_t> buffer(32768, L'\0');
+  DWORD length = GetCurrentDirectoryW(
+      static_cast<DWORD>(buffer.size()), &buffer[0]);
+  if (length == 0 || length >= buffer.size()) return ".";
+  return WideToUtf8(std::wstring(&buffer[0], length));
 }
 
 std::string NormalizeSeparators(std::string path) {
@@ -103,25 +144,40 @@ bool IsAbsolutePath(const std::string& path) {
 
 std::string GetFullPathString(const std::string& path) {
   if (path.empty()) return std::string();
-  char buffer[MAX_PATH] = {0};
-  DWORD length = GetFullPathNameA(path.c_str(), MAX_PATH, buffer, nullptr);
-  if (length == 0 || length >= MAX_PATH) return std::string();
-  return NormalizeSeparators(std::string(buffer, length));
+  std::vector<wchar_t> buffer(32768, L'\0');
+  DWORD length = GetFullPathNameW(
+      Utf8ToWide(path).c_str(), static_cast<DWORD>(buffer.size()),
+      &buffer[0], nullptr);
+  if (length == 0 || length >= buffer.size()) return std::string();
+  return NormalizeSeparators(WideToUtf8(std::wstring(&buffer[0], length)));
 }
 
 void TryMarkDirectoryHidden(const std::string& path) {
   if (path.empty()) return;
-  DWORD attrs = GetFileAttributesA(path.c_str());
+  const std::wstring widePath = Utf8ToWide(path);
+  DWORD attrs = GetFileAttributesW(widePath.c_str());
   if (attrs == INVALID_FILE_ATTRIBUTES) return;
   if ((attrs & FILE_ATTRIBUTE_HIDDEN) != 0) return;
-  SetFileAttributesA(path.c_str(), attrs | FILE_ATTRIBUTE_HIDDEN);
+  SetFileAttributesW(widePath.c_str(), attrs | FILE_ATTRIBUTE_HIDDEN);
 }
 
 std::string GetExecutableDirectory() {
-  char buffer[MAX_PATH] = {0};
-  DWORD length = GetModuleFileNameA(nullptr, buffer, MAX_PATH);
-  if (length == 0 || length >= MAX_PATH) return GetCurrentDirectoryString();
-  return ParentPath(std::string(buffer, length));
+  std::vector<wchar_t> buffer(32768, L'\0');
+  DWORD length = GetModuleFileNameW(nullptr, &buffer[0],
+                                    static_cast<DWORD>(buffer.size()));
+  if (length == 0 || length >= buffer.size()) return GetCurrentDirectoryString();
+  return ParentPath(WideToUtf8(std::wstring(&buffer[0], length)));
+}
+
+void TryLoadHookSettingsFile(const std::string& path,
+                             const std::shared_ptr<agent::hooks::HookConfig>& config,
+                             std::vector<std::string>* loadedFiles) {
+  if (config == nullptr || !FileExists(path)) return;
+  const std::string raw = ReadUtf8File(path);
+  if (raw.empty()) return;
+  if (config->LoadFromJson(raw) && loadedFiles != nullptr) {
+    loadedFiles->push_back(path);
+  }
 }
 
 std::string DiscoverProjectRoot() {
@@ -548,6 +604,42 @@ std::vector<std::string> BuildDisplayLines(
   return displayLines;
 }
 
+void AppendWrappedPreview(std::vector<std::string>* lines,
+                          const std::string& prefix,
+                          const std::string& value,
+                          int contentWidth) {
+  if (lines == nullptr || value.empty()) return;
+  const auto wrapped = WrapLineVisually(
+      prefix + value, std::max(1, contentWidth));
+  lines->insert(lines->end(), wrapped.begin(), wrapped.end());
+}
+
+const char* QueryStageLabel(agent::core::QueryStage stage) {
+  switch (stage) {
+    case agent::core::QueryStage::ToolResultBudget:
+      return "ToolBudget";
+    case agent::core::QueryStage::Snip:
+      return "Snip";
+    case agent::core::QueryStage::Microcompact:
+      return "Microcompact";
+    case agent::core::QueryStage::Collapse:
+      return "Collapse";
+    case agent::core::QueryStage::Autocompact:
+      return "Autocompact";
+    case agent::core::QueryStage::ModelCall:
+      return "ModelCall";
+    case agent::core::QueryStage::Validator:
+      return "Validator";
+    case agent::core::QueryStage::StopHooks:
+      return "StopHooks";
+    case agent::core::QueryStage::RunTools:
+      return "RunTools";
+    case agent::core::QueryStage::Completed:
+      return "Completed";
+  }
+  return "Unknown";
+}
+
 bool CopyUtf8ToClipboard(const std::string& text) {
   const std::wstring wide = Utf8ToWide(text);
   if (!OpenClipboard(nullptr)) return false;
@@ -584,6 +676,10 @@ bool CopyUtf8ToClipboard(const std::string& text) {
 struct TuiState {
   std::mutex mutex;
   std::deque<std::string> logLines;
+  std::string liveResponse;
+  std::string liveToolStatus;
+  std::string liveStage;
+  agent::app::TuiTaskPanelData taskPanel;
   std::string projectRoot;
   std::string modelName;
   std::string endpoint;
@@ -646,14 +742,28 @@ class AnsiTui {
     const auto sz = GetConsoleSize();
     const int w = sz.width;
     const int h = sz.height;
+    int taskHeight = 0;
+    {
+      std::lock_guard<std::mutex> lock(state_.mutex);
+      if (!state_.taskPanel.tasks.empty()) {
+        taskHeight = std::min(8, std::max(4, 2 + static_cast<int>(std::min<std::size_t>(
+                                                     state_.taskPanel.tasks.size(), 4))));
+      }
+    }
     welcomeLines_ = static_cast<int>(RenderWelcome().size());
     RenderWelcome(y);
     y += welcomeLines_;
     msgTop_ = y;
-    msgHeight_ = h - y - 4;
+    msgHeight_ = h - y - 4 - taskHeight;
     if (msgHeight_ < 3) msgHeight_ = 3;
     RenderMessageArea(y, msgHeight_, w);
     y += msgHeight_;
+    taskTop_ = y;
+    taskHeight_ = taskHeight;
+    if (taskHeight_ > 0) {
+      RenderTaskPanel(y, taskHeight_, w);
+      y += taskHeight_;
+    }
     RenderStatusBar(y, w);
     RenderInputLine(h - 1, w);
     SetCursorPosition(2, h - 1);
@@ -668,6 +778,53 @@ class AnsiTui {
     }
     scrollOffset_ = 999999;
     RefreshMessages();
+  }
+
+  void AppendLiveResponseChunk(const std::string& chunk) {
+    if (chunk.empty()) return;
+    {
+      std::lock_guard<std::mutex> lock(state_.mutex);
+      state_.liveResponse += chunk;
+    }
+    scrollOffset_ = 999999;
+    RefreshMessages();
+  }
+
+  void SetLiveToolStatus(const std::string& text) {
+    {
+      std::lock_guard<std::mutex> lock(state_.mutex);
+      state_.liveToolStatus = text;
+    }
+    RefreshMessages();
+  }
+
+  void SetLiveStage(const std::string& text) {
+    {
+      std::lock_guard<std::mutex> lock(state_.mutex);
+      state_.liveStage = text;
+      if (state_.running.load() && !text.empty()) {
+        state_.statusText = "Running [" + text + "]";
+      }
+    }
+    RefreshStatus();
+  }
+
+  void ClearLiveState() {
+    {
+      std::lock_guard<std::mutex> lock(state_.mutex);
+      state_.liveResponse.clear();
+      state_.liveToolStatus.clear();
+      state_.liveStage.clear();
+    }
+    RefreshMessages();
+  }
+
+  void SetTaskPanelData(const agent::app::TuiTaskPanelData& taskPanel) {
+    {
+      std::lock_guard<std::mutex> lock(state_.mutex);
+      state_.taskPanel = taskPanel;
+    }
+    RedrawAll();
   }
 
   bool CopyMessagesToClipboard() {
@@ -689,8 +846,13 @@ class AnsiTui {
     int totalLines = 0;
     {
       std::lock_guard<std::mutex> lock(state_.mutex);
-      totalLines = static_cast<int>(
-          BuildDisplayLines(state_.logLines, std::max(1, sz.width - 4)).size());
+      std::vector<std::string> displayLines =
+          BuildDisplayLines(state_.logLines, std::max(1, sz.width - 4));
+      AppendWrappedPreview(
+          &displayLines, "stream: ", state_.liveResponse, std::max(1, sz.width - 4));
+      AppendWrappedPreview(
+          &displayLines, "tool: ", state_.liveToolStatus, std::max(1, sz.width - 4));
+      totalLines = static_cast<int>(displayLines.size());
     }
     int maxVisible = msgHeight_ - 2;
     if (maxVisible < 1) maxVisible = 1;
@@ -928,12 +1090,20 @@ class AnsiTui {
     std::cout << "\xe2\x94\x90\x1b[0m";
 
     std::deque<std::string> logLines;
+    std::string liveResponse;
+    std::string liveToolStatus;
     {
       std::lock_guard<std::mutex> lock(state_.mutex);
       logLines = state_.logLines;
+      liveResponse = state_.liveResponse;
+      liveToolStatus = state_.liveToolStatus;
     }
     std::vector<std::string> displayLines =
         BuildDisplayLines(logLines, std::max(1, boxW - 2));
+    AppendWrappedPreview(
+        &displayLines, "stream: ", liveResponse, std::max(1, boxW - 2));
+    AppendWrappedPreview(
+        &displayLines, "tool: ", liveToolStatus, std::max(1, boxW - 2));
 
     int maxVisible = height - 2;
     if (maxVisible < 1) maxVisible = 1;
@@ -975,16 +1145,58 @@ class AnsiTui {
     std::cout << "\xe2\x94\x98\x1b[0m";
   }
 
+  void RenderTaskPanel(int startY, int height, int width) {
+    const int boxW = width - 2;
+    if (boxW < 10 || height < 3) return;
+
+    agent::app::TuiTaskPanelData taskPanel;
+    {
+      std::lock_guard<std::mutex> lock(state_.mutex);
+      taskPanel = state_.taskPanel;
+    }
+    std::vector<std::string> lines = agent::app::BuildTuiTaskPanelLines(
+        taskPanel, std::max(1, boxW - 2), std::max(0, height - 3));
+
+    SetCursorPosition(0, startY);
+    std::cout << "\x1b[35m\xe2\x94\x8c\xe2\x94\x80 Tasks ";
+    for (int i = 0; i < boxW - 9; ++i) std::cout << "\xe2\x94\x80";
+    std::cout << "\xe2\x94\x90\x1b[0m";
+
+    for (int row = 1; row < height - 1; ++row) {
+      SetCursorPosition(0, startY + row);
+      std::cout << "\x1b[35m\xe2\x94\x82\x1b[0m ";
+      const std::size_t idx = static_cast<std::size_t>(row - 1);
+      if (idx < lines.size()) {
+        const std::string line = TruncateVisually(lines[idx], boxW - 2);
+        std::cout << PadRightVisual(line, boxW - 2);
+      } else {
+        std::cout << PadRightVisual("", boxW - 2);
+      }
+      std::cout << "\x1b[35m\xe2\x94\x82\x1b[0m";
+    }
+
+    SetCursorPosition(0, startY + height - 1);
+    std::cout << "\x1b[35m\xe2\x94\x94";
+    for (int i = 0; i < boxW; ++i) std::cout << "\xe2\x94\x80";
+    std::cout << "\xe2\x94\x98\x1b[0m";
+  }
+
   void RenderStatusBar(int y, int width) {
     SetCursorPosition(0, y);
     std::string status;
     bool running;
+    std::string liveStage;
     {
       std::lock_guard<std::mutex> lock(state_.mutex);
       status = state_.statusText;
       running = state_.running.load();
+      liveStage = state_.liveStage;
     }
     if (status.empty()) status = "Ready";
+    if (running && !liveStage.empty() &&
+        status.find(liveStage) == std::string::npos) {
+      status += " [" + liveStage + "]";
+    }
 
     std::ostringstream ss;
     ss << "\x1b[7m"
@@ -1007,6 +1219,8 @@ class AnsiTui {
   TuiState& state_;
   int msgTop_ = 0;
   int msgHeight_ = 0;
+  int taskTop_ = 0;
+  int taskHeight_ = 0;
   int welcomeLines_ = 0;
   int scrollOffset_ = 0;
   HANDLE inputHandle_ = INVALID_HANDLE_VALUE;
@@ -1023,6 +1237,7 @@ int main() {
       workspace.trusted ? ".cpp-agent" : ".cpp-agent-untrusted");
   const std::string sessionDir = JoinPath(stateRoot, "session");
   const std::string memoryDir = JoinPath(stateRoot, "memory");
+  const std::string taskStorePath = JoinPath(stateRoot, "tasks.json");
   EnsureDirectoryRecursive(sessionDir);
   EnsureDirectoryRecursive(memoryDir);
   TryMarkDirectoryHidden(stateRoot);
@@ -1030,7 +1245,7 @@ int main() {
   TryMarkDirectoryHidden(memoryDir);
 
   if (workspace.trusted && !workspace.trustedRoot.empty()) {
-    SetCurrentDirectoryA(workspace.trustedRoot.c_str());
+    SetCurrentDirectoryW(Utf8ToWide(workspace.trustedRoot).c_str());
   }
 
   agent::core::LlmConfig llmCfg;
@@ -1048,6 +1263,23 @@ int main() {
   agent::api::HttpLlmClient httpClient(llmCfg);
   agent::api::SideQueryClient sideQueryClient(httpClient);
   agent::agents::SubAgentManager subAgentManager;
+  agent::mcp::McpClientManager mcpClientManager;
+  std::shared_ptr<agent::hooks::HookConfig> hookConfig =
+      std::make_shared<agent::hooks::HookConfig>();
+  hookConfig->SetWorkspaceTrusted(workspace.trusted);
+  std::vector<std::string> loadedHookFiles;
+  if (workspace.trusted && !workspace.trustedRoot.empty()) {
+    TryLoadHookSettingsFile(
+        JoinPath(JoinPath(workspace.trustedRoot, ".claude"), "settings.json"),
+        hookConfig, &loadedHookFiles);
+    TryLoadHookSettingsFile(
+        JoinPath(JoinPath(workspace.trustedRoot, ".claude"), "settings.local.json"),
+        hookConfig, &loadedHookFiles);
+  }
+  TryLoadHookSettingsFile(JoinPath(stateRoot, "hooks.json"),
+                          hookConfig, &loadedHookFiles);
+  agent::hooks::HookExecutor hookExecutor(hookConfig);
+  agent::infra::ProcessRunner hookProcessRunner;
   agent::memory::MemoryIndex memoryIndex(memoryDir);
   agent::tools::ToolOrchestrator toolOrchestrator;
   agent::tools::ToolRegistry toolRegistry;
@@ -1060,23 +1292,23 @@ int main() {
   for (const auto& tool : baseTools)
     toolRegistry.RegisterTool(tool);
 
-  permissionEngine.AddAlwaysAllowRule("FileRead");
-  permissionEngine.AddAlwaysAllowRule("Read");
-  permissionEngine.AddAlwaysAllowRule("FileWrite");
-  permissionEngine.AddAlwaysAllowRule("Write");
-  permissionEngine.AddAlwaysAllowRule("Grep");
-  permissionEngine.AddAlwaysAllowRule("Glob");
-  permissionEngine.AddAutoModeAllowlistedTool("FileRead");
-  permissionEngine.AddAutoModeAllowlistedTool("Read");
-  permissionEngine.AddAutoModeAllowlistedTool("FileWrite");
-  permissionEngine.AddAutoModeAllowlistedTool("Write");
-  permissionEngine.AddAutoModeAllowlistedTool("Grep");
-  permissionEngine.AddAutoModeAllowlistedTool("Glob");
+  const char* safeAutoTools[] = {
+      "FileRead", "Read", "FileWrite", "Write", "Grep", "Glob",
+      "TodoWrite", "TaskCreate", "TaskGet", "TaskUpdate", "TaskList",
+      "TaskStop", "ListMcpResources", "ReadMcpResource"};
+  for (const char* toolName : safeAutoTools) {
+    permissionEngine.AddAlwaysAllowRule(toolName);
+    permissionEngine.AddAutoModeAllowlistedTool(toolName);
+  }
 
   toolOrchestrator.SetToolRegistry(&toolRegistry);
   toolOrchestrator.SetSubAgentManager(&subAgentManager);
+  toolOrchestrator.SetMcpClientManager(&mcpClientManager);
   toolOrchestrator.SetWorkspaceRoot(workspace.trusted ? workspace.trustedRoot
                                                       : std::string());
+  hookExecutor.SetProcessRunner(&hookProcessRunner);
+  hookExecutor.SetWorkspaceRoot(workspace.trusted ? workspace.trustedRoot
+                                                  : workspace.launchDir);
   subAgentManager.SetMemoryIndex(&memoryIndex);
 
   agent::core::AgentConfig config = agent::core::AgentConfig::FromDefaults();
@@ -1091,6 +1323,10 @@ int main() {
         << "Create and modify project files inside this workspace, not inside "
         << "the session or memory directories unless the user explicitly asks "
         << "you to manage session memory. "
+        << "This runtime is on Windows and shell commands execute in "
+        << "PowerShell, not bash. Prefer explicit tools such as Read, Write, "
+        << "Grep, Glob, Task*, NotebookEdit, and MCP resource tools over raw "
+        << "shell commands whenever possible. "
         << "If the user references files outside the workspace, read them via "
         << "an explicit absolute local path or ask the user to copy them into "
         << "the workspace first.";
@@ -1098,7 +1334,9 @@ int main() {
     systemPrompt
         << "No workspace is currently trusted. Do not assume relative paths "
         << "refer to a project; use explicit absolute local paths when the "
-        << "user references files outside the current session state.";
+        << "user references files outside the current session state. "
+        << "This runtime is on Windows and shell commands execute in "
+        << "PowerShell.";
   }
   config.systemPrompt = systemPrompt.str();
   config.defaultModel = llmCfg.mainModel;
@@ -1115,6 +1353,7 @@ int main() {
   engine.SetMemoryIndex(&memoryIndex);
   engine.SetSubAgentManager(&subAgentManager);
   engine.SetSessionDir(sessionDir);
+  engine.SetHookExecutor(&hookExecutor);
 
   watchdog.Start();
   engine.SetStabilityWatchdog(&watchdog);
@@ -1130,9 +1369,41 @@ int main() {
           ? "Anthropic" : "OpenAI-compatible";
   tuiState.toolsList = JoinToolNames(toolRegistry.ListTools());
   tuiState.statusText = "Press /help for commands | Esc to quit";
+  tuiState.taskPanel = agent::app::LoadTuiTaskPanelData(taskStorePath);
 
   AnsiTui tui(tuiState);
   tui.Init();
+  engine.SetEventCallback([&](const agent::core::QueryLoopEvent& event) {
+    switch (event.type) {
+      case agent::core::QueryLoopEvent::Type::StageChanged:
+        tui.SetLiveStage(QueryStageLabel(event.stage));
+        break;
+      case agent::core::QueryLoopEvent::Type::AssistantMessage: {
+        const std::string text = ExtractText(event.message);
+        if (!text.empty()) tui.AppendLiveResponseChunk(text);
+        break;
+      }
+      case agent::core::QueryLoopEvent::Type::ToolProgress: {
+        if (!event.message.content.empty() &&
+            event.message.content.front().type ==
+                agent::core::BlockType::ToolUse) {
+          const auto& toolUse = event.message.content.front().asToolUse;
+          tui.SetLiveToolStatus(
+              toolUse.name + " " + Shorten(toolUse.inputJson, 80));
+        }
+        break;
+      }
+      case agent::core::QueryLoopEvent::Type::ToolResult:
+        tui.SetLiveToolStatus("tool result received");
+        tui.SetTaskPanelData(agent::app::LoadTuiTaskPanelData(taskStorePath));
+        break;
+      case agent::core::QueryLoopEvent::Type::LoopCompleted:
+        tui.SetTaskPanelData(agent::app::LoadTuiTaskPanelData(taskStorePath));
+        break;
+      default:
+        break;
+    }
+  });
 
   tui.AppendMessage("Ready. Type a prompt or command.");
   if (workspace.trusted && !workspace.trustedRoot.empty()) {
@@ -1140,6 +1411,10 @@ int main() {
   } else {
     tui.AppendMessage(
         "Workspace not trusted. Use absolute paths for external files.");
+  }
+  if (!loadedHookFiles.empty()) {
+    tui.AppendMessage("Loaded hook config files: " +
+                      std::to_string(loadedHookFiles.size()));
   }
 
   while (!tuiState.quitRequested.load()) {
@@ -1348,6 +1623,7 @@ int main() {
     }
 
     tui.AppendMessage("> " + line);
+    tui.ClearLiveState();
     tuiState.running.store(true);
     tuiState.statusText = "Running: " + Shorten(line, 50);
     tui.RefreshStatus();
@@ -1355,6 +1631,7 @@ int main() {
     const std::size_t prevCount = engine.messages().size();
     engine.SubmitUserPrompt(line);
     const bool ok = engine.RunTurnWithRecovery();
+    tui.ClearLiveState();
     sessionManager.PersistSnapshot();
 
     const auto& msgs = engine.messages();

@@ -3,6 +3,7 @@
 #include "api/ModelClient.h"
 #include "api/SideQueryClient.h"
 #include "core/StreamingToolExecutor.h"
+#include "hooks/HookExecutor.h"
 #include "infra/SessionManager.h"
 #include "permissions/PermissionEngine.h"
 #include "tools/ToolOrchestrator.h"
@@ -203,6 +204,22 @@ const char* QueryStageToString(QueryStage stage) {
   return "Unknown";
 }
 
+void EmitQueryLoopEvent(const QueryLoopContext& ctx,
+                        QueryLoopEvent::Type type,
+                        QueryStage stage,
+                        const Message* message = nullptr,
+                        const std::string& terminalReason = std::string()) {
+  if (!ctx.eventCallback) return;
+  QueryLoopEvent event;
+  event.type = type;
+  event.stage = stage;
+  if (message != nullptr) {
+    event.message = *message;
+  }
+  event.terminalReason = terminalReason;
+  ctx.eventCallback(event);
+}
+
 std::vector<ContentBlock> CollectToolUseBlocks(
     const std::vector<Message>& messages) {
   std::vector<ContentBlock> toolUses;
@@ -239,6 +256,65 @@ std::string CollectText(const std::vector<Message>& messages) {
   return out.str();
 }
 
+bool MessageHasTextOrToolContent(const Message& message) {
+  for (const auto& block : message.content) {
+    if (block.type == BlockType::Text && !block.asText.text.empty()) return true;
+    if (block.type == BlockType::ToolUse) return true;
+    if (block.type == BlockType::ToolResult &&
+        !block.asToolResult.content.empty()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+Message MakeHookMessage(const std::string& uuid,
+                        const std::string& text,
+                        bool isError) {
+  Message message;
+  message.role = MessageRole::System;
+  message.uuid = uuid;
+  message.isMeta = true;
+  message.content.push_back(ContentBlock::MakeText(text));
+  message.isApiErrorMessage = isError;
+  return message;
+}
+
+void AppendHookResultMessage(const hooks::HookResult& hookResult,
+                             const std::string& uuidPrefix,
+                             bool asError,
+                             std::vector<Message>* out) {
+  if (out == nullptr) return;
+  if (!hookResult.message.content.empty()) {
+    out->push_back(hookResult.message);
+    return;
+  }
+  std::string text = hookResult.reason;
+  if (text.empty()) text = hookResult.stdoutText;
+  if (text.empty()) text = hookResult.stderrText;
+  if (text.empty()) return;
+  out->push_back(MakeHookMessage(uuidPrefix, text, asError));
+}
+
+void MergeHookMessages(const hooks::HookBatchResult& batch,
+                       const std::string& uuidPrefix,
+                       std::vector<Message>* followups,
+                       std::vector<Message>* blocking) {
+  for (std::size_t i = 0; i < batch.results.size(); ++i) {
+    const hooks::HookResult& hookResult = batch.results[i];
+    const std::string id = uuidPrefix + "-" + std::to_string(i + 1);
+    if (hookResult.outcome == hooks::HookOutcome::Blocking) {
+      AppendHookResultMessage(hookResult, id, true, blocking);
+      continue;
+    }
+    if (hookResult.continueSession &&
+        (!hookResult.reason.empty() || !hookResult.stdoutText.empty() ||
+         !hookResult.message.content.empty())) {
+      AppendHookResultMessage(hookResult, id, false, followups);
+    }
+  }
+}
+
 bool AssistantIntendsWorkspaceWrite(const std::vector<Message>& assistantMessages) {
   const std::string original = CollectText(assistantMessages);
   const std::string lower = ToLowerAscii(original);
@@ -260,7 +336,38 @@ bool AssistantIntendsFurtherExecution(
   const std::string original = CollectText(assistantMessages);
   const std::string lower = ToLowerAscii(original);
 
-  return ContainsToken(lower, "let me ") ||
+  return ContainsToken(lower, "let me check") ||
+         ContainsToken(lower, "let me create") ||
+         ContainsToken(lower, "let me write") ||
+         ContainsToken(lower, "let me build") ||
+         ContainsToken(lower, "let me try") ||
+         ContainsToken(lower, "let me read") ||
+         ContainsToken(lower, "let me look") ||
+         ContainsToken(lower, "let me see") ||
+         ContainsToken(lower, "let me use") ||
+         ContainsToken(lower, "let me run") ||
+         ContainsToken(lower, "let me start") ||
+         ContainsToken(lower, "let me first") ||
+         ContainsToken(lower, "let me continue") ||
+         ContainsToken(lower, "let me explore") ||
+         ContainsToken(lower, "let me examine") ||
+         ContainsToken(lower, "let me proceed") ||
+         ContainsToken(lower, "let me execute") ||
+         ContainsToken(lower, "i need to") ||
+         ContainsToken(lower, "i will now") ||
+         ContainsToken(lower, "i am going to") ||
+         ContainsToken(lower, "i should create") ||
+         ContainsToken(lower, "i should write") ||
+         ContainsToken(lower, "i should build") ||
+         ContainsToken(lower, "i should check") ||
+         ContainsToken(lower, "i should read") ||
+         ContainsToken(lower, "i should try") ||
+         ContainsToken(lower, "i should look") ||
+         ContainsToken(lower, "going to create") ||
+         ContainsToken(lower, "going to write") ||
+         ContainsToken(lower, "going to build") ||
+         ContainsToken(lower, "next step") ||
+         ContainsToken(lower, "proceed to") ||
          ContainsToken(lower, "next, i will") ||
          ContainsToken(lower, "i will ") ||
          ContainsToken(lower, "i'll ") ||
@@ -640,10 +747,16 @@ void PersistOversizedResult(const std::string& sessionDir,
                             const std::string& content) {
   if (sessionDir.empty()) return;
   std::string dir = sessionDir + "\\.tool-results";
-  CreateDirectoryA(dir.c_str(), nullptr);
+  CreateDirectoryW(DebugToWide(dir).c_str(), nullptr);
   std::string path = dir + "\\" + toolUseId + ".txt";
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  if (out) out << content;
+  HANDLE handle = CreateFileW(DebugToWide(path).c_str(), GENERIC_WRITE, 0,
+                              nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+  if (handle == INVALID_HANDLE_VALUE) return;
+  DWORD written = 0;
+  WriteFile(handle, content.data(), static_cast<DWORD>(content.size()),
+            &written, nullptr);
+  CloseHandle(handle);
 }
 
 void PersistMessagesToTranscript(infra::SessionManager* sm,
@@ -737,7 +850,6 @@ bool QueryLoop::ContinueWithFollowup(QueryLoopContext& ctx,
   state.toolUseBlocks.clear();
   state.forceContinuation = false;
   state.forceContinuationReason.clear();
-  state.forcedContinuationCount = 0;
   state.stage = QueryStage::ToolResultBudget;
   state.transition = reason;
   if (resetTurnCount) state.turnCount = 0;
@@ -746,7 +858,7 @@ bool QueryLoop::ContinueWithFollowup(QueryLoopContext& ctx,
 
 bool QueryLoop::ShouldForceContinuation(const QueryLoopContext&,
                                         const QueryLoopInternalState& state) const {
-  if (state.forcedContinuationCount >= 3) return false;
+  if (state.forcedContinuationCount >= 8) return false;
   if (state.forceContinuation) return true;
   if (!state.toolResultMessages.empty()) return true;
   if (!state.toolUseBlocks.empty()) return false;
@@ -823,18 +935,39 @@ std::vector<Message> QueryLoop::DoReactiveCompact(
 
 std::vector<Message> QueryLoop::DoHistorySnip(
     const std::vector<Message>& input) {
+  if (input.size() <= 12) return input;
+
   std::vector<Message> result;
-  result.reserve(input.size() + 1);
+  result.reserve(12);
+
+  std::size_t firstUserIndex = input.size();
+  for (std::size_t i = 0; i < input.size(); ++i) {
+    if (input[i].role == MessageRole::User && !input[i].isMeta) {
+      firstUserIndex = i;
+      break;
+    }
+  }
+
+  const std::size_t tailCount = 10;
+  const std::size_t start = input.size() > tailCount ? input.size() - tailCount : 0;
+  const bool preservedFirstUser =
+      firstUserIndex < input.size() && firstUserIndex < start;
+
+  if (!preservedFirstUser && start == 0) return input;
 
   Message snipBoundary;
   snipBoundary.role = MessageRole::System;
   snipBoundary.uuid = "snip-boundary";
   snipBoundary.isMeta = true;
   snipBoundary.content.push_back(
-      ContentBlock::MakeText("<snip_boundary>Conversation trunked</snip_boundary>"));
+      ContentBlock::MakeText(
+          "<snip_boundary>Conversation truncated. Preserved the original "
+          "user request and recent execution context.</snip_boundary>"));
   result.push_back(snipBoundary);
 
-  std::size_t start = input.size() > 10 ? input.size() - 10 : 0;
+  if (preservedFirstUser) {
+    result.push_back(input[firstUserIndex]);
+  }
   result.insert(result.end(), input.begin() + start, input.end());
   return result;
 }
@@ -898,9 +1031,27 @@ void QueryLoop::ApplyStepBudget(QueryLoopContext& ctx,
 
 void QueryLoop::ApplyStepSnip(QueryLoopContext& ctx,
                               QueryLoopInternalState& state) {
-  (void)ctx;
-  if (state.messagesForTurn.size() > 20)
+  if (state.messagesForTurn.size() > 20) {
+    const int beforeCount = static_cast<int>(state.messagesForTurn.size());
+    if (ctx.hookExecutor != nullptr) {
+      ctx.hookExecutor->RunPreCompactHooks(
+          "snip", beforeCount, 10000);
+    }
     state.messagesForTurn = DoHistorySnip(state.messagesForTurn);
+    if (ctx.hookExecutor != nullptr) {
+      ctx.hookExecutor->RunPostCompactHooks(
+          beforeCount,
+          static_cast<int>(state.messagesForTurn.size()),
+          std::max(0, beforeCount - static_cast<int>(state.messagesForTurn.size())),
+          10000);
+    }
+    if (!state.messagesForTurn.empty() &&
+        state.messagesForTurn.front().uuid == "snip-boundary") {
+      EmitQueryLoopEvent(
+          ctx, QueryLoopEvent::Type::CompactionBoundary, QueryStage::Snip,
+          &state.messagesForTurn.front());
+    }
+  }
 }
 
 void QueryLoop::ApplyStepMicrocompact(QueryLoopContext& ctx,
@@ -936,17 +1087,28 @@ void QueryLoop::ApplyStepMicrocompact(QueryLoopContext& ctx,
 
 void QueryLoop::ApplyStepCollapse(QueryLoopContext& ctx,
                                   QueryLoopInternalState& state) {
-  (void)ctx;
   const int estimatedTokens = EstimateMessageTokens(state.messagesForTurn);
   const int threshold =
       kContextWindow - kMaxOutputTokensForSummary - kAutoCompactBufferTokens;
   if (estimatedTokens > threshold) {
+    const int beforeCount = static_cast<int>(state.messagesForTurn.size());
+    if (ctx.hookExecutor != nullptr) {
+      ctx.hookExecutor->RunPreCompactHooks(
+          "collapse", beforeCount, 10000);
+    }
     int keepRecent = 20;
     if (static_cast<int>(state.messagesForTurn.size()) <= keepRecent) {
       keepRecent =
           std::max(5, static_cast<int>(state.messagesForTurn.size()) / 2);
     }
     state.messagesForTurn = DoCollapseCompact(state.messagesForTurn, keepRecent);
+    if (ctx.hookExecutor != nullptr) {
+      ctx.hookExecutor->RunPostCompactHooks(
+          beforeCount,
+          static_cast<int>(state.messagesForTurn.size()),
+          std::max(0, beforeCount - static_cast<int>(state.messagesForTurn.size())),
+          10000);
+    }
   }
 }
 
@@ -958,6 +1120,11 @@ bool QueryLoop::ApplyStepAutocompact(QueryLoopContext& ctx,
   if (estimatedTokens <= threshold) return false;
   if (state.consecutiveAutoCompactFailures >= kAutoCompactMaxFailures)
     return false;
+  const int beforeCount = static_cast<int>(state.messagesForTurn.size());
+  if (ctx.hookExecutor != nullptr) {
+    ctx.hookExecutor->RunPreCompactHooks(
+        "autocompact", beforeCount, 15000);
+  }
 
   std::vector<Message> compactInput;
   compactInput.push_back(state.messagesForTurn.back());
@@ -994,6 +1161,13 @@ bool QueryLoop::ApplyStepAutocompact(QueryLoopContext& ctx,
     compacted.push_back(state.messagesForTurn[i]);
 
   state.messagesForTurn = compacted;
+  if (ctx.hookExecutor != nullptr) {
+    ctx.hookExecutor->RunPostCompactHooks(
+        beforeCount,
+        static_cast<int>(state.messagesForTurn.size()),
+        std::max(0, estimatedTokens - EstimateMessageTokens(state.messagesForTurn)),
+        15000);
+  }
   state.consecutiveAutoCompactFailures = 0;
   ctx.autoCompactTracking.compacted = true;
   ctx.autoCompactTracking.turnCounter = 0;
@@ -1029,6 +1203,13 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
       [&](const std::string& event, const std::string& data) {
     if (event == "text_delta") {
       textBuffer << data;
+      Message streamMessage;
+      streamMessage.role = MessageRole::Assistant;
+      streamMessage.uuid = "stream-delta";
+      streamMessage.content.push_back(ContentBlock::MakeText(data));
+      EmitQueryLoopEvent(
+          ctx, QueryLoopEvent::Type::AssistantMessage, QueryStage::ModelCall,
+          &streamMessage);
     } else if (event == "tool_use") {
       if (!textBuffer.str().empty()) {
         currentAssistant.content.push_back(
@@ -1052,6 +1233,13 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
         ContentBlock tb = ContentBlock::MakeToolUse(toolId, toolName, inputJson);
         currentAssistant.content.push_back(tb);
         state.toolUseBlocks.push_back(tb);
+        Message toolMessage;
+        toolMessage.role = MessageRole::Assistant;
+        toolMessage.uuid = "tool-progress-" + toolId;
+        toolMessage.content.push_back(tb);
+        EmitQueryLoopEvent(
+            ctx, QueryLoopEvent::Type::ToolProgress, QueryStage::ModelCall,
+            &toolMessage);
         if (useStreamingExecution) {
           streamingExecutor.AddTool(tb);
           streamingExecutor.ExecutePending();
@@ -1062,6 +1250,14 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
     } else if (event == "api_error") {
       currentAssistant.isApiErrorMessage = true;
       currentAssistant.content.push_back(ContentBlock::MakeText(data));
+      Message errorMessage;
+      errorMessage.role = MessageRole::Assistant;
+      errorMessage.uuid = "stream-api-error";
+      errorMessage.isApiErrorMessage = true;
+      errorMessage.content.push_back(ContentBlock::MakeText(data));
+      EmitQueryLoopEvent(
+          ctx, QueryLoopEvent::Type::AssistantMessage, QueryStage::ModelCall,
+          &errorMessage);
     }
   };
 
@@ -1324,7 +1520,6 @@ bool QueryLoop::HandleTokenBudget(QueryLoopContext& ctx,
 
 StopHookResult QueryLoop::ExecuteStopHooks(QueryLoopContext& ctx,
                                            QueryLoopInternalState& state) {
-  (void)ctx;
   StopHookResult result;
   if (state.assistantMessages.empty()) return result;
   const Message& lastMsg = state.assistantMessages.back();
@@ -1357,6 +1552,26 @@ StopHookResult QueryLoop::ExecuteStopHooks(QueryLoopContext& ctx,
       }
     }
   }
+
+  if (ctx.hookExecutor != nullptr) {
+    const std::string stopReason =
+        !lastMsg.stopReason.empty()
+            ? lastMsg.stopReason
+            : (hasUnresolvedTools ? "tool_use" : "end_turn");
+    const hooks::HookBatchResult batch =
+        ctx.hookExecutor->RunStopHooks(stopReason, 30000);
+    MergeHookMessages(batch, "stop-hook", &result.followupMessages,
+                      &result.blockingErrors);
+    for (const auto& hookResult : batch.results) {
+      if (hookResult.outcome == hooks::HookOutcome::Blocking) {
+        result.preventContinuation = false;
+      }
+      if (hookResult.shouldStop && result.followupMessages.empty() &&
+          result.blockingErrors.empty()) {
+        result.preventContinuation = true;
+      }
+    }
+  }
   return result;
 }
 
@@ -1382,7 +1597,13 @@ bool QueryLoop::ApplyStepRunTools(QueryLoopContext& ctx,
     }
 
     PersistMessagesToTranscript(ctx.sessionManager, simulatedResults);
+    for (const auto& toolMsg : simulatedResults) {
+      EmitQueryLoopEvent(
+          ctx, QueryLoopEvent::Type::ToolResult, QueryStage::RunTools,
+          &toolMsg);
+    }
     state.assistantMessages.clear();
+    state.forcedContinuationCount = 0;
     state.toolUseBlocks.clear();
     return !simulatedResults.empty();
   }
@@ -1424,7 +1645,12 @@ bool QueryLoop::ApplyStepRunTools(QueryLoopContext& ctx,
     ctx.messages.push_back(rm);
   PersistMessagesToTranscript(ctx.sessionManager, state.assistantMessages);
   PersistMessagesToTranscript(ctx.sessionManager, execResult.userMessages);
+  for (const auto& rm : execResult.userMessages) {
+    EmitQueryLoopEvent(
+        ctx, QueryLoopEvent::Type::ToolResult, QueryStage::RunTools, &rm);
+  }
   state.assistantMessages.clear();
+  state.forcedContinuationCount = 0;
   state.toolUseBlocks.clear();
   return !execResult.userMessages.empty();
 }
@@ -1544,6 +1770,8 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
   };
 
   while (!state.completed) {
+    EmitQueryLoopEvent(
+        ctx, QueryLoopEvent::Type::StageChanged, state.stage, nullptr);
     ReportQueryLoopDebugEvent(
         "1", "QueryLoop.cpp:stage:enter",
         "[DEBUG] Entering query loop stage",
@@ -1734,6 +1962,9 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
        {"turnCount", state.turnCount},
        {"messageCount", static_cast<int>(ctx.messages.size())}},
       MakeQueryLoopTraceId("complete"));
+  EmitQueryLoopEvent(
+      ctx, QueryLoopEvent::Type::LoopCompleted, QueryStage::Completed, nullptr,
+      state.terminalReason);
   ctx.maxOutputTokensRecoveryCount = state.maxOutputTokensRecoveryCount;
   ctx.hasAttemptedReactiveCompact = state.hasAttemptedReactiveCompact;
 }

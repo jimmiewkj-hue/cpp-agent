@@ -226,7 +226,8 @@ class RecordingModelClient : public agent::api::ModelClient {
       const std::string& systemPrompt,
       const std::string&,
       const std::string&,
-      const agent::api::SseEventCallback& onEvent) override {
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
     lastSystemPrompt = systemPrompt;
     if (onEvent) {
       onEvent("text_delta", streamResponseText);
@@ -280,7 +281,8 @@ class SuccessfulToolThenFinalModelClient : public agent::api::ModelClient {
       const std::string&,
       const std::string&,
       const std::string&,
-      const agent::api::SseEventCallback& onEvent) override {
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
     ++streamCallCount;
     if (streamCallCount == 2) {
       sawToolResultOnFollowup = HasToolResult(messages, "success-tool-1");

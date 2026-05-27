@@ -162,6 +162,7 @@ int main(int argc, char** argv) {
   agent::api::HttpLlmClient httpClient(llmCfg);
   agent::api::SideQueryClient sideQueryClient(httpClient);
   agent::agents::SubAgentManager subAgentManager;
+  agent::mcp::McpClientManager mcpClientManager;
   agent::memory::MemoryIndex memoryIndex(memoryDir);
   agent::tools::ToolOrchestrator toolOrchestrator;
   agent::tools::ToolRegistry toolRegistry;
@@ -177,6 +178,7 @@ int main(int argc, char** argv) {
 
   toolOrchestrator.SetToolRegistry(&toolRegistry);
   toolOrchestrator.SetSubAgentManager(&subAgentManager);
+  toolOrchestrator.SetMcpClientManager(&mcpClientManager);
   toolOrchestrator.SetWorkspaceRoot(workspaceRoot);
   subAgentManager.SetMemoryIndex(&memoryIndex);
 

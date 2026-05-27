@@ -110,6 +110,14 @@ void QueryEngine::SetSessionDir(const std::string& sessionDir) {
   sessionDir_ = sessionDir;
 }
 
+void QueryEngine::SetEventCallback(QueryLoopEventCallback callback) {
+  eventCallback_ = callback;
+}
+
+void QueryEngine::SetHookExecutor(hooks::HookExecutor* hookExecutor) {
+  hookExecutor_ = hookExecutor;
+}
+
 void QueryEngine::SubmitUserPrompt(const std::string& prompt) {
   Message userMessage;
   userMessage.role = MessageRole::User;
@@ -139,6 +147,8 @@ void QueryEngine::RunTurn() {
   loopCtx_.validatorModel = validatorModel_;
   loopCtx_.sessionDir = sessionDir_;
   loopCtx_.sessionManager = &sessionManager_;
+  loopCtx_.eventCallback = eventCallback_;
+  loopCtx_.hookExecutor = hookExecutor_;
 
   QueryLoop loop(toolOrchestrator_, permissionEngine_, modelClient_,
                  sideQueryClient_);

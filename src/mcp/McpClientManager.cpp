@@ -1,5 +1,7 @@
 #include "mcp/McpClientManager.h"
 
+#include "third_party/nlohmann_json.hpp"
+
 #include <windows.h>
 #include <winhttp.h>
 
@@ -13,6 +15,8 @@
 
 namespace agent {
 namespace mcp {
+
+using json = nlohmann::json;
 
 namespace {
 
@@ -2133,6 +2137,36 @@ std::vector<McpResourceSchema> McpClientManager::FetchResourcesForClient(
   if (conn && conn->state.type == McpServerConnection::Type::Connected)
     return conn->state.resources;
   return {};
+}
+
+bool McpClientManager::ReadResourceFromTransport(const std::string& serverName,
+                                                 const std::string& uri,
+                                                 std::string* bodyJson,
+                                                 std::string* error) {
+  ManagedConnection* connection = FindConnection(serverName);
+  if (!connection || !connection->transport) {
+    if (error) *error = "MCP server is not connected";
+    return false;
+  }
+  if (!connection->state.capabilities.resources) {
+    if (error) *error = "MCP server does not advertise resources capability";
+    return false;
+  }
+
+  json requestParams;
+  requestParams["uri"] = uri;
+  const McpTransportResponse response =
+      connection->transport->Send({"resources/read", requestParams.dump()});
+  connection->transport->PopulateConnectionState(&connection->state);
+  if (!response.ok) {
+    connection->state.error = response.error;
+    if (error) *error = response.error.empty() ? "resources/read failed"
+                                               : response.error;
+    return false;
+  }
+  if (bodyJson) *bodyJson = response.bodyJson;
+  connection->state.error.clear();
+  return true;
 }
 
 }  // namespace mcp

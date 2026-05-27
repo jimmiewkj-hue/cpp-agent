@@ -1,6 +1,7 @@
 #include "tools/ToolOrchestrator.h"
 
 #include "agents/SubAgentManager.h"
+#include "mcp/McpClientManager.h"
 #include "tools/ToolRegistry.h"
 #include "third_party/nlohmann_json.hpp"
 
@@ -22,6 +23,14 @@ namespace {
 static const int kDefaultMaxResultChars = 100000;
 static const int kMaxToolResultTruncation = 400000;
 static const wchar_t* kWebUserAgent = L"cpp-agent/1.0";
+
+std::string JoinPath(const std::string& lhs, const std::string& rhs);
+bool EnsureDirectoryRecursive(const std::string& path);
+std::string ReadFileContent(const std::string& path, std::string* error);
+bool WriteFileContent(const std::string& path,
+                      const std::string& content,
+                      std::string* error);
+std::string ToLowerAscii(std::string value);
 
 struct ParsedUrl {
   bool secure = false;
@@ -96,36 +105,102 @@ std::string NormalizeWindowsShellCommand(const std::string& command) {
   std::string token;
   while (stream >> token) tokens.push_back(token);
   if (tokens.empty()) return trimmed;
-  if (!StartsWithCaseInsensitive(tokens[0], "ls")) return trimmed;
+  const std::string commandName = ToLowerAscii(tokens[0]);
 
-  bool useForce = false;
-  std::vector<std::string> paths;
-  for (std::size_t i = 1; i < tokens.size(); ++i) {
-    const std::string& current = tokens[i];
-    if (!current.empty() && current[0] == '-') {
-      for (std::size_t j = 1; j < current.size(); ++j) {
-        const char flag = static_cast<char>(
-            std::tolower(static_cast<unsigned char>(current[j])));
-        if (flag == 'a') {
-          useForce = true;
-        } else if (flag == 'l' || flag == 'h') {
-          continue;
-        } else {
-          return trimmed;
+  if (commandName == "ls") {
+    bool useForce = false;
+    std::vector<std::string> paths;
+    for (std::size_t i = 1; i < tokens.size(); ++i) {
+      const std::string& current = tokens[i];
+      if (!current.empty() && current[0] == '-') {
+        for (std::size_t j = 1; j < current.size(); ++j) {
+          const char flag = static_cast<char>(
+              std::tolower(static_cast<unsigned char>(current[j])));
+          if (flag == 'a') {
+            useForce = true;
+          } else if (flag == 'l' || flag == 'h') {
+            continue;
+          } else {
+            return trimmed;
+          }
         }
+        continue;
       }
-      continue;
+      paths.push_back(current);
     }
-    paths.push_back(current);
+
+    std::ostringstream normalized;
+    normalized << "Get-ChildItem";
+    if (useForce) normalized << " -Force";
+    for (const auto& path : paths) {
+      normalized << " -Path '" << path << "'";
+    }
+    return normalized.str();
   }
 
-  std::ostringstream normalized;
-  normalized << "Get-ChildItem";
-  if (useForce) normalized << " -Force";
-  for (const auto& path : paths) {
-    normalized << " -Path '" << path << "'";
+  if (commandName == "cat") {
+    std::ostringstream normalized;
+    normalized << "Get-Content";
+    for (std::size_t i = 1; i < tokens.size(); ++i) {
+      normalized << " '" << tokens[i] << "'";
+    }
+    return normalized.str();
   }
-  return normalized.str();
+
+  if (commandName == "head" && tokens.size() >= 2) {
+    std::string count = "10";
+    std::string target;
+    for (std::size_t i = 1; i < tokens.size(); ++i) {
+      if ((tokens[i] == "-n" || tokens[i] == "--lines") &&
+          i + 1 < tokens.size()) {
+        count = tokens[i + 1];
+        ++i;
+      } else {
+        target = tokens[i];
+      }
+    }
+    if (!target.empty()) {
+      return "Get-Content '" + target + "' -TotalCount " + count;
+    }
+  }
+
+  if (commandName == "tail" && tokens.size() >= 2) {
+    std::string count = "10";
+    std::string target;
+    for (std::size_t i = 1; i < tokens.size(); ++i) {
+      if ((tokens[i] == "-n" || tokens[i] == "--lines") &&
+          i + 1 < tokens.size()) {
+        count = tokens[i + 1];
+        ++i;
+      } else {
+        target = tokens[i];
+      }
+    }
+    if (!target.empty()) {
+      return "Get-Content '" + target + "' -Tail " + count;
+    }
+  }
+
+  if (commandName == "wc" && tokens.size() >= 2) {
+    if (tokens[1] == "-l" && tokens.size() >= 3) {
+      return "(Get-Content '" + tokens[2] + "' | Measure-Object -Line).Lines";
+    }
+  }
+
+  if (commandName == "touch" && tokens.size() >= 2) {
+    return "New-Item -ItemType File -Force -Path '" + tokens[1] +
+           "' | Out-Null";
+  }
+
+  if (commandName == "find" && tokens.size() >= 2) {
+    return "Get-ChildItem -Recurse -Name '" + tokens[1] + "'";
+  }
+
+  if (commandName == "grep" && tokens.size() >= 3) {
+    return "Select-String -Pattern '" + tokens[1] + "' -Path '" + tokens[2] + "'";
+  }
+
+  return trimmed;
 }
 
 std::string ParentPath(const std::string& path) {
@@ -181,9 +256,10 @@ bool EnsureDirectoryRecursive(const std::string& path) {
     const std::string current =
         next == std::string::npos ? normalized : normalized.substr(0, next);
     if (!current.empty()) {
-      const DWORD attrs = GetFileAttributesA(current.c_str());
+      const std::wstring wideCurrent = ToWide(current);
+      const DWORD attrs = GetFileAttributesW(wideCurrent.c_str());
       if (attrs == INVALID_FILE_ATTRIBUTES) {
-        if (!CreateDirectoryA(current.c_str(), nullptr) &&
+        if (!CreateDirectoryW(wideCurrent.c_str(), nullptr) &&
             GetLastError() != ERROR_ALREADY_EXISTS) {
           return false;
         }
@@ -200,10 +276,13 @@ bool EnsureDirectoryRecursive(const std::string& path) {
 
 std::string GetFullPathString(const std::string& path) {
   if (path.empty()) return std::string();
-  char buffer[MAX_PATH] = {0};
-  DWORD length = GetFullPathNameA(path.c_str(), MAX_PATH, buffer, nullptr);
-  if (length == 0 || length >= MAX_PATH) return std::string();
-  return NormalizeSeparators(std::string(buffer, length));
+  std::vector<wchar_t> buffer(32768, L'\0');
+  const std::wstring widePath = ToWide(path);
+  DWORD length = GetFullPathNameW(widePath.c_str(),
+                                  static_cast<DWORD>(buffer.size()),
+                                  &buffer[0], nullptr);
+  if (length == 0 || length >= buffer.size()) return std::string();
+  return NormalizeSeparators(ToUtf8(std::wstring(&buffer[0], length)));
 }
 
 std::string EnsureTrailingSeparator(std::string path) {
@@ -715,6 +794,82 @@ bool JsonGetBool(const std::string& jsonStr,
   return fallback;
 }
 
+std::string GetStateRootForTools(const std::string& workspaceRoot) {
+  if (!workspaceRoot.empty()) {
+    return JoinPath(workspaceRoot, ".cpp-agent");
+  }
+  std::vector<wchar_t> cwd(32768, L'\0');
+  DWORD length = GetCurrentDirectoryW(static_cast<DWORD>(cwd.size()), &cwd[0]);
+  if (length == 0 || length >= cwd.size()) {
+    return ".cpp-agent";
+  }
+  return JoinPath(ToUtf8(std::wstring(&cwd[0], length)), ".cpp-agent");
+}
+
+std::string GetTaskStorePath(const std::string& workspaceRoot) {
+  const std::string stateRoot = GetStateRootForTools(workspaceRoot);
+  EnsureDirectoryRecursive(stateRoot);
+  return JoinPath(stateRoot, "tasks.json");
+}
+
+json LoadTaskStore(const std::string& workspaceRoot) {
+  const std::string path = GetTaskStorePath(workspaceRoot);
+  std::string error;
+  const std::string raw = ReadFileContent(path, &error);
+  if (raw.empty()) return json::array();
+  try {
+    json parsed = json::parse(raw);
+    if (parsed.is_array()) return parsed;
+  } catch (...) {
+  }
+  return json::array();
+}
+
+bool SaveTaskStore(const std::string& workspaceRoot,
+                   const json& tasks,
+                   std::string* error) {
+  return WriteFileContent(GetTaskStorePath(workspaceRoot), tasks.dump(2), error);
+}
+
+int FindTaskIndex(const json& tasks, const std::string& taskId) {
+  for (std::size_t i = 0; i < tasks.size(); ++i) {
+    if (tasks[i].is_object() && tasks[i].value("id", std::string()) == taskId) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+std::string NextTaskId(const json& tasks) {
+  int maxId = 0;
+  for (const auto& task : tasks) {
+    if (!task.is_object()) continue;
+    const std::string id = task.value("id", std::string());
+    if (id.empty()) continue;
+    maxId = std::max(maxId, std::atoi(id.c_str()));
+  }
+  return std::to_string(maxId + 1);
+}
+
+std::string RenderTaskSummary(const json& tasks) {
+  if (!tasks.is_array() || tasks.empty()) {
+    return "No tasks found";
+  }
+  std::ostringstream out;
+  for (std::size_t i = 0; i < tasks.size(); ++i) {
+    const json& task = tasks[i];
+    out << "#" << task.value("id", std::string("?")) << " ["
+        << task.value("status", std::string("pending")) << "] "
+        << task.value("subject", task.value("content", std::string("(untitled)")));
+    if (task.contains("owner") && task["owner"].is_string() &&
+        !task["owner"].get<std::string>().empty()) {
+      out << " (" << task["owner"].get<std::string>() << ")";
+    }
+    if (i + 1 < tasks.size()) out << "\n";
+  }
+  return out.str();
+}
+
 bool CaseInsensitiveCompare(const std::string& a, const std::string& b) {
   if (a.size() != b.size()) return false;
   for (std::size_t i = 0; i < a.size(); ++i) {
@@ -726,14 +881,39 @@ bool CaseInsensitiveCompare(const std::string& a, const std::string& b) {
 }
 
 std::string ReadFileContent(const std::string& path, std::string* error) {
-  std::ifstream input(path, std::ios::binary);
-  if (!input) {
+  HANDLE handle = CreateFileW(ToWide(path).c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                  FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
     if (error) *error = "failed to open file: " + path;
     return std::string();
   }
-  std::ostringstream buffer;
-  buffer << input.rdbuf();
-  return buffer.str();
+
+  LARGE_INTEGER size;
+  if (!GetFileSizeEx(handle, &size) || size.QuadPart < 0) {
+    if (error) *error = "failed to get file size: " + path;
+    CloseHandle(handle);
+    return std::string();
+  }
+
+  std::string content(static_cast<std::size_t>(size.QuadPart), '\0');
+  DWORD totalRead = 0;
+  while (totalRead < static_cast<DWORD>(content.size())) {
+    DWORD chunkRead = 0;
+    const DWORD remaining = static_cast<DWORD>(content.size()) - totalRead;
+    if (!ReadFile(handle, &content[totalRead], remaining, &chunkRead, nullptr)) {
+      if (error) *error = "failed to read file: " + path;
+      CloseHandle(handle);
+      return std::string();
+    }
+    if (chunkRead == 0) break;
+    totalRead += chunkRead;
+  }
+  content.resize(totalRead);
+  CloseHandle(handle);
+  return content;
 }
 
 bool WriteFileContent(const std::string& path,
@@ -744,13 +924,28 @@ bool WriteFileContent(const std::string& path,
     if (error) *error = "failed to create parent directory: " + parent;
     return false;
   }
-  std::ofstream output(path, std::ios::binary | std::ios::trunc);
-  if (!output) {
+  HANDLE handle = CreateFileW(ToWide(path).c_str(), GENERIC_WRITE, 0, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
     if (error) *error = "failed to write file: " + path;
     return false;
   }
-  output.write(content.data(), static_cast<std::streamsize>(content.size()));
-  if (!output.good()) {
+
+  DWORD totalWritten = 0;
+  while (totalWritten < static_cast<DWORD>(content.size())) {
+    DWORD chunkWritten = 0;
+    const DWORD remaining = static_cast<DWORD>(content.size()) - totalWritten;
+    if (!WriteFile(handle, content.data() + totalWritten, remaining,
+                   &chunkWritten, nullptr)) {
+      if (error) *error = "failed to flush file: " + path;
+      CloseHandle(handle);
+      return false;
+    }
+    if (chunkWritten == 0) break;
+    totalWritten += chunkWritten;
+  }
+  CloseHandle(handle);
+  if (totalWritten != content.size()) {
     if (error) *error = "failed to flush file: " + path;
     return false;
   }
@@ -790,26 +985,26 @@ std::vector<FileEntry> GlobFiles(const std::string& directory,
   }
   searchPath += pattern;
 
-  WIN32_FIND_DATAA findData;
-  HANDLE findHandle = FindFirstFileA(searchPath.c_str(), &findData);
+  WIN32_FIND_DATAW findData;
+  HANDLE findHandle = FindFirstFileW(ToWide(searchPath).c_str(), &findData);
   if (findHandle == INVALID_HANDLE_VALUE) {
     return entries;
   }
 
   do {
-    if (std::strcmp(findData.cFileName, ".") == 0 ||
-        std::strcmp(findData.cFileName, "..") == 0) {
+    const std::string name = ToUtf8(findData.cFileName);
+    if (name == "." || name == "..") {
       continue;
     }
     FileEntry entry;
-    entry.name = findData.cFileName;
+    entry.name = name;
     entry.isDirectory = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     LARGE_INTEGER size;
     size.LowPart = findData.nFileSizeLow;
     size.HighPart = findData.nFileSizeHigh;
     entry.size = size.QuadPart;
     entries.push_back(entry);
-  } while (FindNextFileA(findHandle, &findData));
+  } while (FindNextFileW(findHandle, &findData));
 
   FindClose(findHandle);
   return entries;
@@ -818,11 +1013,12 @@ std::vector<FileEntry> GlobFiles(const std::string& directory,
 std::string GrepFile(const std::string& filePath,
                      const std::string& pattern,
                      int maxMatches) {
-  std::ifstream input(filePath);
-  if (!input) return std::string();
+  std::string readError;
+  const std::string content = NormalizeLineEndings(
+      ReadFileContent(filePath, &readError));
+  if (!readError.empty()) return std::string();
 
   std::ostringstream result;
-  std::string line;
   int lineNumber = 0;
   int matches = 0;
   const bool caseInsensitive = true;
@@ -840,6 +1036,8 @@ std::string GrepFile(const std::string& filePath,
     return haystack.find(needle) != std::string::npos;
   };
 
+  std::istringstream input(content);
+  std::string line;
   while (std::getline(input, line) && matches < maxMatches) {
     ++lineNumber;
     if (matchLine(line, pattern)) {
@@ -892,19 +1090,19 @@ void GrepDirectory(const std::string& dirPath,
   }
   searchPath += "*";
 
-  WIN32_FIND_DATAA findData;
-  HANDLE findHandle = FindFirstFileA(searchPath.c_str(), &findData);
+  WIN32_FIND_DATAW findData;
+  HANDLE findHandle = FindFirstFileW(ToWide(searchPath).c_str(), &findData);
   if (findHandle == INVALID_HANDLE_VALUE) return;
 
   do {
     if (*matchCount >= maxMatches) break;
-    if (std::strcmp(findData.cFileName, ".") == 0 ||
-        std::strcmp(findData.cFileName, "..") == 0) {
+    const std::string fileName = ToUtf8(findData.cFileName);
+    if (fileName == "." || fileName == "..") {
       continue;
     }
     std::string fullPath = dirPath;
     if (!fullPath.empty() && fullPath.back() != '\\') fullPath.push_back('\\');
-    fullPath += findData.cFileName;
+    fullPath += fileName;
 
     if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
       GrepDirectory(fullPath, pattern, maxMatches, matchCount, output);
@@ -917,7 +1115,7 @@ void GrepDirectory(const std::string& dirPath,
         }
       }
     }
-  } while (FindNextFileA(findHandle, &findData));
+  } while (FindNextFileW(findHandle, &findData));
 
   FindClose(findHandle);
 }
@@ -933,6 +1131,11 @@ void ToolOrchestrator::SetToolRegistry(const ToolRegistry* registry) {
 void ToolOrchestrator::SetSubAgentManager(
     agents::SubAgentManager* subAgentManager) {
   subAgentManager_ = subAgentManager;
+}
+
+void ToolOrchestrator::SetMcpClientManager(
+    mcp::McpClientManager* mcpClientManager) {
+  mcpClientManager_ = mcpClientManager;
 }
 
 void ToolOrchestrator::SetWorkspaceRoot(const std::string& workspaceRoot) {
@@ -1013,11 +1216,38 @@ std::string ToolOrchestrator::ExecuteToolBlock(
   if (CaseInsensitiveCompare(name, "TodoWrite")) {
     return ExecuteTodoWrite(inputJson, maxResultSize, error);
   }
+  if (CaseInsensitiveCompare(name, "TaskCreate")) {
+    return ExecuteTaskCreate(inputJson, maxResultSize, error);
+  }
+  if (CaseInsensitiveCompare(name, "TaskGet")) {
+    return ExecuteTaskGet(inputJson, maxResultSize, error);
+  }
+  if (CaseInsensitiveCompare(name, "TaskUpdate")) {
+    return ExecuteTaskUpdate(inputJson, maxResultSize, error);
+  }
+  if (CaseInsensitiveCompare(name, "TaskList")) {
+    return ExecuteTaskList(inputJson, maxResultSize, error);
+  }
+  if (CaseInsensitiveCompare(name, "TaskStop")) {
+    return ExecuteTaskStop(inputJson, maxResultSize, error);
+  }
   if (CaseInsensitiveCompare(name, "AskUserQuestion")) {
     return ExecuteAskUserQuestion(inputJson, maxResultSize, error);
   }
   if (CaseInsensitiveCompare(name, "FileEdit")) {
     return ExecuteFileEdit(inputJson, maxResultSize, error);
+  }
+  if (CaseInsensitiveCompare(name, "NotebookEdit")) {
+    return ExecuteNotebookEdit(inputJson, maxResultSize, error);
+  }
+  if (CaseInsensitiveCompare(name, "Skill")) {
+    return ExecuteSkill(inputJson, maxResultSize, error);
+  }
+  if (CaseInsensitiveCompare(name, "ListMcpResources")) {
+    return ExecuteListMcpResources(inputJson, maxResultSize, error);
+  }
+  if (CaseInsensitiveCompare(name, "ReadMcpResource")) {
+    return ExecuteReadMcpResource(inputJson, maxResultSize, error);
   }
   if (CaseInsensitiveCompare(name, "WebFetch")) {
     return ExecuteWebFetch(inputJson, maxResultSize, error);
@@ -1103,7 +1333,7 @@ std::string ToolOrchestrator::ExecuteFileRead(const std::string& inputJson,
     return "Error: " + resolveError;
   }
 
-  DWORD attrs = GetFileAttributesA(filePath.c_str());
+  DWORD attrs = GetFileAttributesW(ToWide(filePath).c_str());
   if (attrs == INVALID_FILE_ATTRIBUTES) {
     if (error) *error = "file not found: " + filePath;
     return "Error: file not found: " + filePath;
@@ -1172,7 +1402,7 @@ std::string ToolOrchestrator::ExecuteFileWrite(const std::string& inputJson,
     return "Error: " + resolveError;
   }
 
-  DWORD attrs = GetFileAttributesA(filePath.c_str());
+  DWORD attrs = GetFileAttributesW(ToWide(filePath).c_str());
   bool existed = (attrs != INVALID_FILE_ATTRIBUTES);
 
   std::string writeErr;
@@ -1214,7 +1444,7 @@ std::string ToolOrchestrator::ExecuteGrep(const std::string& inputJson,
   std::ostringstream output;
   int matchCount = 0;
 
-  DWORD attrs = GetFileAttributesA(searchPath.c_str());
+  DWORD attrs = GetFileAttributesW(ToWide(searchPath).c_str());
   if (attrs == INVALID_FILE_ATTRIBUTES) {
     if (error) *error = "path not found: " + searchPath;
     return "Error: path not found: " + searchPath;
@@ -1379,13 +1609,193 @@ ToolOrchestrator::ExecuteResult ToolOrchestrator::Execute(
 }
 
 std::string ToolOrchestrator::ExecuteTodoWrite(
-    const std::string&,
+    const std::string& inputJson,
     int maxResultSize,
     std::string* error) const {
   if (error) *error = "";
-  return TruncateResult(
-      "Todo list updated. Use the todo list to track your progress.",
-      maxResultSize);
+  json payload;
+  try {
+    payload = json::parse(inputJson.empty() ? "{}" : inputJson);
+  } catch (...) {
+    if (error) *error = "TodoWrite input must be valid JSON";
+    return "Error: TodoWrite input must be valid JSON";
+  }
+
+  json incoming = payload.value("todos", json::array());
+  if (!incoming.is_array()) incoming = json::array();
+
+  json tasks = LoadTaskStore(workspaceRoot_);
+  if (!payload.value("merge", false)) {
+    tasks = incoming;
+  } else {
+    for (const auto& item : incoming) {
+      const std::string id = item.value("id", std::string());
+      if (id.empty()) continue;
+      const int index = FindTaskIndex(tasks, id);
+      if (index >= 0) {
+        tasks[static_cast<std::size_t>(index)] = item;
+      } else {
+        tasks.push_back(item);
+      }
+    }
+  }
+
+  std::string writeError;
+  if (!SaveTaskStore(workspaceRoot_, tasks, &writeError)) {
+    if (error) *error = writeError;
+    return "Error: " + writeError;
+  }
+
+  const std::string summary = payload.value("summary", std::string());
+  std::string result = summary.empty()
+      ? "Todo list updated.\n" + RenderTaskSummary(tasks)
+      : summary + "\n" + RenderTaskSummary(tasks);
+  return TruncateResult(result, maxResultSize);
+}
+
+std::string ToolOrchestrator::ExecuteTaskCreate(const std::string& inputJson,
+                                                int maxResultSize,
+                                                std::string* error) const {
+  json payload;
+  try {
+    payload = json::parse(inputJson.empty() ? "{}" : inputJson);
+  } catch (...) {
+    if (error) *error = "TaskCreate input must be valid JSON";
+    return "Error: TaskCreate input must be valid JSON";
+  }
+  const std::string subject = payload.value("subject", std::string());
+  const std::string description = payload.value("description", std::string());
+  if (subject.empty() || description.empty()) {
+    if (error) *error = "TaskCreate requires subject and description";
+    return "Error: missing subject or description";
+  }
+
+  json tasks = LoadTaskStore(workspaceRoot_);
+  json task = json::object();
+  task["id"] = NextTaskId(tasks);
+  task["subject"] = subject;
+  task["description"] = description;
+  task["activeForm"] = payload.value("activeForm", std::string());
+  task["status"] = "pending";
+  task["blockedBy"] = json::array();
+  task["owner"] = "";
+  task["metadata"] = payload.value("metadata", json::object());
+  tasks.push_back(task);
+
+  std::string writeError;
+  if (!SaveTaskStore(workspaceRoot_, tasks, &writeError)) {
+    if (error) *error = writeError;
+    return "Error: " + writeError;
+  }
+  return TruncateResult("Task #" + task["id"].get<std::string>() +
+                            " created successfully: " + subject,
+                        maxResultSize);
+}
+
+std::string ToolOrchestrator::ExecuteTaskGet(const std::string& inputJson,
+                                             int maxResultSize,
+                                             std::string* error) const {
+  const std::string taskId = JsonGetString(inputJson, "id");
+  if (taskId.empty()) {
+    if (error) *error = "TaskGet requires id";
+    return "Error: missing id";
+  }
+  const json tasks = LoadTaskStore(workspaceRoot_);
+  const int index = FindTaskIndex(tasks, taskId);
+  if (index < 0) {
+    if (error) *error = "task not found";
+    return "Error: task not found";
+  }
+  return TruncateResult(tasks[static_cast<std::size_t>(index)].dump(2),
+                        maxResultSize);
+}
+
+std::string ToolOrchestrator::ExecuteTaskUpdate(const std::string& inputJson,
+                                                int maxResultSize,
+                                                std::string* error) const {
+  json payload;
+  try {
+    payload = json::parse(inputJson.empty() ? "{}" : inputJson);
+  } catch (...) {
+    if (error) *error = "TaskUpdate input must be valid JSON";
+    return "Error: TaskUpdate input must be valid JSON";
+  }
+  const std::string taskId = payload.value("id", std::string());
+  if (taskId.empty()) {
+    if (error) *error = "TaskUpdate requires id";
+    return "Error: missing id";
+  }
+
+  json tasks = LoadTaskStore(workspaceRoot_);
+  const int index = FindTaskIndex(tasks, taskId);
+  if (index < 0) {
+    if (error) *error = "task not found";
+    return "Error: task not found";
+  }
+
+  json& task = tasks[static_cast<std::size_t>(index)];
+  const char* keys[] = {"subject", "description", "activeForm", "status",
+                        "owner"};
+  for (const char* key : keys) {
+    if (payload.contains(key) && payload[key].is_string()) task[key] = payload[key];
+  }
+  if (payload.contains("blockedBy") && payload["blockedBy"].is_array()) {
+    task["blockedBy"] = payload["blockedBy"];
+  }
+  if (payload.contains("metadata") && payload["metadata"].is_object()) {
+    task["metadata"] = payload["metadata"];
+  }
+
+  std::string writeError;
+  if (!SaveTaskStore(workspaceRoot_, tasks, &writeError)) {
+    if (error) *error = writeError;
+    return "Error: " + writeError;
+  }
+  return TruncateResult("Task #" + taskId + " updated: " +
+                            task.value("subject", std::string()),
+                        maxResultSize);
+}
+
+std::string ToolOrchestrator::ExecuteTaskList(const std::string&,
+                                              int maxResultSize,
+                                              std::string* error) const {
+  if (error) *error = "";
+  const json tasks = LoadTaskStore(workspaceRoot_);
+  return TruncateResult(RenderTaskSummary(tasks), maxResultSize);
+}
+
+std::string ToolOrchestrator::ExecuteTaskStop(const std::string& inputJson,
+                                              int maxResultSize,
+                                              std::string* error) const {
+  json payload;
+  try {
+    payload = json::parse(inputJson.empty() ? "{}" : inputJson);
+  } catch (...) {
+    if (error) *error = "TaskStop input must be valid JSON";
+    return "Error: TaskStop input must be valid JSON";
+  }
+  const std::string taskId = payload.value("id", std::string());
+  if (taskId.empty()) {
+    if (error) *error = "TaskStop requires id";
+    return "Error: missing id";
+  }
+
+  json tasks = LoadTaskStore(workspaceRoot_);
+  const int index = FindTaskIndex(tasks, taskId);
+  if (index < 0) {
+    if (error) *error = "task not found";
+    return "Error: task not found";
+  }
+  tasks[static_cast<std::size_t>(index)]["status"] = "cancelled";
+  tasks[static_cast<std::size_t>(index)]["stopReason"] =
+      payload.value("reason", std::string("stopped by user"));
+
+  std::string writeError;
+  if (!SaveTaskStore(workspaceRoot_, tasks, &writeError)) {
+    if (error) *error = writeError;
+    return "Error: " + writeError;
+  }
+  return TruncateResult("Task #" + taskId + " stopped", maxResultSize);
 }
 
 std::string ToolOrchestrator::ExecuteAskUserQuestion(
@@ -1469,6 +1879,190 @@ std::string ToolOrchestrator::ExecuteFileEdit(
   return TruncateResult(
       "File edited: " + filePath + " (1 occurrence replaced)",
       maxResultSize);
+}
+
+std::string ToolOrchestrator::ExecuteNotebookEdit(const std::string& inputJson,
+                                                  int maxResultSize,
+                                                  std::string* error) const {
+  json payload;
+  try {
+    payload = json::parse(inputJson.empty() ? "{}" : inputJson);
+  } catch (...) {
+    if (error) *error = "NotebookEdit input must be valid JSON";
+    return "Error: NotebookEdit input must be valid JSON";
+  }
+
+  const std::string rawPath = payload.value("notebook_path", std::string());
+  if (rawPath.empty()) {
+    if (error) *error = "NotebookEdit requires notebook_path";
+    return "Error: missing notebook_path";
+  }
+  std::string resolveError;
+  const std::string filePath =
+      ResolveToolPath(rawPath, workspaceRoot_, true, &resolveError);
+  if (filePath.empty()) {
+    if (error) *error = resolveError;
+    return "Error: " + resolveError;
+  }
+
+  std::string readError;
+  const std::string raw = ReadFileContent(filePath, &readError);
+  if (raw.empty() && !readError.empty()) {
+    if (error) *error = readError;
+    return "Error: " + readError;
+  }
+
+  json notebook;
+  try {
+    notebook = json::parse(raw);
+  } catch (...) {
+    if (error) *error = "Notebook is not valid JSON";
+    return "Error: notebook is not valid JSON";
+  }
+  if (!notebook.contains("cells") || !notebook["cells"].is_array()) {
+    if (error) *error = "Notebook does not contain a cells array";
+    return "Error: notebook does not contain a cells array";
+  }
+
+  const std::string editMode = payload.value("edit_mode", std::string("replace"));
+  const std::string cellId = payload.value("cell_id", std::string());
+  const std::string newSource = payload.value("new_source", std::string());
+  const std::string cellType = payload.value("cell_type", std::string("code"));
+
+  json& cells = notebook["cells"];
+  int cellIndex = -1;
+  if (!cellId.empty()) {
+    for (std::size_t i = 0; i < cells.size(); ++i) {
+      if (cells[i].is_object() && cells[i].value("id", std::string()) == cellId) {
+        cellIndex = static_cast<int>(i);
+        break;
+      }
+    }
+  }
+
+  if (editMode == "replace") {
+    if (cellIndex < 0) {
+      if (error) *error = "replace requires an existing cell_id";
+      return "Error: replace requires an existing cell_id";
+    }
+    cells[static_cast<std::size_t>(cellIndex)]["source"] = json::array({newSource});
+    if (!cellType.empty()) {
+      cells[static_cast<std::size_t>(cellIndex)]["cell_type"] = cellType;
+    }
+  } else if (editMode == "insert") {
+    json newCell = json::object();
+    newCell["id"] = cellId.empty()
+        ? ("cell-" + std::to_string(cells.size() + 1))
+        : ("cell-" + cellId + "-new");
+    newCell["cell_type"] = cellType;
+    newCell["metadata"] = json::object();
+    newCell["source"] = json::array({newSource});
+    if (cellType == "code") {
+      newCell["execution_count"] = nullptr;
+      newCell["outputs"] = json::array();
+    }
+    if (cellIndex < 0) {
+      cells.insert(cells.begin(), newCell);
+    } else {
+      cells.insert(cells.begin() + cellIndex + 1, newCell);
+    }
+  } else if (editMode == "delete") {
+    if (cellIndex < 0) {
+      if (error) *error = "delete requires an existing cell_id";
+      return "Error: delete requires an existing cell_id";
+    }
+    cells.erase(cells.begin() + cellIndex);
+  } else {
+    if (error) *error = "Unsupported notebook edit mode";
+    return "Error: unsupported notebook edit mode";
+  }
+
+  std::string writeError;
+  if (!WriteFileContent(filePath, notebook.dump(2), &writeError)) {
+    if (error) *error = writeError;
+    return "Error: " + writeError;
+  }
+  return TruncateResult("Notebook edited successfully: " + filePath,
+                        maxResultSize);
+}
+
+std::string ToolOrchestrator::ExecuteSkill(const std::string& inputJson,
+                                           int maxResultSize,
+                                           std::string* error) const {
+  const std::string command = JsonGetString(inputJson, "command");
+  const std::string args = JsonGetString(inputJson, "args");
+  if (command.empty()) {
+    if (error) *error = "Skill requires command";
+    return "Error: missing command";
+  }
+  json agentInput = json::object();
+  agentInput["prompt"] = args.empty()
+      ? ("Execute the skill `" + command + "` and complete the requested work.")
+      : args;
+  agentInput["description"] = "skill:" + command;
+  const std::string lower = ToLowerAscii(command);
+  if (lower == "plan" || lower == "explore" || lower == "verification" ||
+      lower == "general-purpose" || lower == "claude-code-guide") {
+    agentInput["subagent_type"] = lower;
+  } else {
+    agentInput["subagent_type"] = "general-purpose";
+  }
+  return ExecuteAgent(agentInput.dump(), maxResultSize, error);
+}
+
+std::string ToolOrchestrator::ExecuteListMcpResources(
+    const std::string& inputJson,
+    int maxResultSize,
+    std::string* error) const {
+  if (!mcpClientManager_) {
+    if (error) *error = "McpClientManager not configured";
+    return "Error: MCP resource tools require McpClientManager configuration";
+  }
+  const std::string targetServer = JsonGetString(inputJson, "server");
+  std::vector<mcp::McpResourceSchema> resources;
+  const std::vector<mcp::McpServerConnection> connections =
+      mcpClientManager_->connections();
+  for (const auto& connection : connections) {
+    if (!targetServer.empty() && connection.name != targetServer) continue;
+    mcpClientManager_->RefreshResourcesFromTransport(connection.name);
+    std::vector<mcp::McpResourceSchema> current =
+        mcpClientManager_->FetchResourcesForClient(connection.name);
+    resources.insert(resources.end(), current.begin(), current.end());
+  }
+  if (resources.empty()) return "No resources found";
+  std::ostringstream out;
+  for (std::size_t i = 0; i < resources.size(); ++i) {
+    const auto& resource = resources[i];
+    out << resource.serverName << ": " << resource.name
+        << " <" << resource.uri << ">";
+    if (!resource.mimeType.empty()) out << " [" << resource.mimeType << "]";
+    if (i + 1 < resources.size()) out << "\n";
+  }
+  return TruncateResult(out.str(), maxResultSize);
+}
+
+std::string ToolOrchestrator::ExecuteReadMcpResource(
+    const std::string& inputJson,
+    int maxResultSize,
+    std::string* error) const {
+  if (!mcpClientManager_) {
+    if (error) *error = "McpClientManager not configured";
+    return "Error: MCP resource tools require McpClientManager configuration";
+  }
+  const std::string server = JsonGetString(inputJson, "server");
+  const std::string uri = JsonGetString(inputJson, "uri");
+  if (server.empty() || uri.empty()) {
+    if (error) *error = "ReadMcpResource requires server and uri";
+    return "Error: missing server or uri";
+  }
+  std::string bodyJson;
+  std::string readError;
+  if (!mcpClientManager_->ReadResourceFromTransport(
+          server, uri, &bodyJson, &readError)) {
+    if (error) *error = readError;
+    return "Error: " + readError;
+  }
+  return TruncateResult(bodyJson, maxResultSize);
 }
 
 std::string ToolOrchestrator::ExecuteWebFetch(

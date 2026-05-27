@@ -1,0 +1,19 @@
+=== SESSION SNAPSHOT ===
+session_id=
+timestamp=20260520T131842
+turn_count=0
+message_count=1
+subtask_count=0
+message.0.role=user
+message.0.uuid=user-0
+message.0.is_meta=0
+message.0.stop_reason=
+message.0.is_api_error=0
+message.0.usage.input_tokens=0
+message.0.usage.output_tokens=0
+message.0.usage.cache_read=0
+message.0.usage.cache_create=0
+message.0.block_count=1
+message.0.block.0.type=text
+message.0.block.0.text=﻿请在当前真实工作区先列出根目录，再读取一个你认为最关键的源码文件，并基于真实读取结果用一两句话说明它的作用。必须使用真实工具，不要只给计划。\r\n
+=== END ===

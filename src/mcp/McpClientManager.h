@@ -139,6 +139,10 @@ class McpClientManager {
   bool RefreshResourcesFromTransport(const std::string& serverName);
   std::vector<McpResourceSchema> FetchResourcesForClient(
       const std::string& serverName) const;
+  bool ReadResourceFromTransport(const std::string& serverName,
+                                 const std::string& uri,
+                                 std::string* bodyJson,
+                                 std::string* error);
 
   static std::string BuildMcpToolName(
       const std::string& serverName,

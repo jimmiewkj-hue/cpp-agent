@@ -8,6 +8,7 @@
 
 namespace agent {
 namespace agents { class SubAgentManager; }
+namespace mcp { class McpClientManager; }
 namespace tools {
 
 class ToolRegistry;
@@ -24,6 +25,7 @@ class ToolOrchestrator {
   void SetToolRegistry(const ToolRegistry* registry);
   const ToolRegistry* GetToolRegistry() const { return toolRegistry_; }
   void SetSubAgentManager(agents::SubAgentManager* subAgentManager);
+  void SetMcpClientManager(mcp::McpClientManager* mcpClientManager);
   void SetWorkspaceRoot(const std::string& workspaceRoot);
   const std::string& workspaceRoot() const { return workspaceRoot_; }
 
@@ -67,12 +69,39 @@ class ToolOrchestrator {
   std::string ExecuteTodoWrite(const std::string& inputJson,
                                int maxResultSize,
                                std::string* error) const;
+  std::string ExecuteTaskCreate(const std::string& inputJson,
+                                int maxResultSize,
+                                std::string* error) const;
+  std::string ExecuteTaskGet(const std::string& inputJson,
+                             int maxResultSize,
+                             std::string* error) const;
+  std::string ExecuteTaskUpdate(const std::string& inputJson,
+                                int maxResultSize,
+                                std::string* error) const;
+  std::string ExecuteTaskList(const std::string& inputJson,
+                              int maxResultSize,
+                              std::string* error) const;
+  std::string ExecuteTaskStop(const std::string& inputJson,
+                              int maxResultSize,
+                              std::string* error) const;
   std::string ExecuteAskUserQuestion(const std::string& inputJson,
                                      int maxResultSize,
                                      std::string* error) const;
   std::string ExecuteFileEdit(const std::string& inputJson,
                               int maxResultSize,
                               std::string* error) const;
+  std::string ExecuteNotebookEdit(const std::string& inputJson,
+                                  int maxResultSize,
+                                  std::string* error) const;
+  std::string ExecuteSkill(const std::string& inputJson,
+                           int maxResultSize,
+                           std::string* error) const;
+  std::string ExecuteListMcpResources(const std::string& inputJson,
+                                      int maxResultSize,
+                                      std::string* error) const;
+  std::string ExecuteReadMcpResource(const std::string& inputJson,
+                                     int maxResultSize,
+                                     std::string* error) const;
   std::string ExecuteWebFetch(const std::string& inputJson,
                               int maxResultSize,
                               std::string* error) const;
@@ -85,6 +114,7 @@ class ToolOrchestrator {
 
   const ToolRegistry* toolRegistry_ = nullptr;
   agents::SubAgentManager* subAgentManager_ = nullptr;
+  mcp::McpClientManager* mcpClientManager_ = nullptr;
   infra::ProcessRunner processRunner_;
   std::string workspaceRoot_;
 };

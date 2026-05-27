@@ -1,8 +1,11 @@
 #include "core/QueryEngine.h"
 #include "core/QueryLoop.h"
 #include "core/StateTypes.h"
+#include "hooks/HookConfig.h"
+#include "hooks/HookExecutor.h"
 #include "api/ModelClient.h"
 #include "api/SideQueryClient.h"
+#include "infra/SessionManager.h"
 #include "permissions/PermissionEngine.h"
 #include "tools/ToolOrchestrator.h"
 #include "tools/ToolRegistry.h"
@@ -278,6 +281,180 @@ class ValidatorCorrectionModelClient : public agent::api::ModelClient {
   }
 
   int streamCalls = 0;
+};
+
+class EventStreamingModelClient : public agent::api::ModelClient {
+ public:
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  void StreamResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&,
+      const std::string&,
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
+    ++streamCalls;
+    if (!onEvent) return;
+    if (streamCalls == 1) {
+      onEvent("text_delta", "先读取 README。");
+      onEvent(
+          "tool_use",
+          R"({"id":"event-tu-001","name":"FileRead","input":{"path":"README.md"}})");
+      onEvent("stop_reason", "tool_use");
+      return;
+    }
+    onEvent("text_delta", "README 已读取，正在汇总。");
+    onEvent("stop_reason", "end_turn");
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  int streamCalls = 0;
+};
+
+class PlanningOnlyModelClient : public agent::api::ModelClient {
+ public:
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  void StreamResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&,
+      const std::string&,
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
+    ++streamCalls;
+    if (!onEvent) return;
+    onEvent("text_delta", "我先规划一下，然后继续。");
+    onEvent("stop_reason", "end_turn");
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  int streamCalls = 0;
+};
+
+class SnipCaptureModelClient : public agent::api::ModelClient {
+ public:
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  void StreamResponse(
+      const std::vector<agent::core::Message>& messages,
+      const std::string&,
+      const std::string&,
+      const std::string&,
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
+    capturedMessages = messages;
+    if (!onEvent) return;
+    onEvent("text_delta", "snip complete");
+    onEvent("stop_reason", "end_turn");
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  std::vector<agent::core::Message> capturedMessages;
+};
+
+class StopHookContinuationModelClient : public agent::api::ModelClient {
+ public:
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  void StreamResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&,
+      const std::string&,
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
+    ++streamCalls;
+    if (!onEvent) return;
+    if (streamCalls == 1) {
+      onEvent("text_delta", "我已经完成计划。");
+      onEvent("stop_reason", "end_turn");
+      return;
+    }
+    onEvent("text_delta", "根据 stop hook 提示，我继续执行测试。");
+    onEvent("stop_reason", "end_turn");
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  int streamCalls = 0;
+};
+
+class CompactHookModelClient : public agent::api::ModelClient {
+ public:
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    agent::core::Message msg;
+    msg.role = agent::core::MessageRole::Assistant;
+    msg.content.push_back(agent::core::ContentBlock::MakeText(
+        "auto compact summary"));
+    return {msg};
+  }
+
+  void StreamResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&,
+      const std::string&,
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
+    if (!onEvent) return;
+    onEvent("text_delta", "compact path finished");
+    onEvent("stop_reason", "end_turn");
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
 };
 
 void TestLlmConfig() {
@@ -653,6 +830,272 @@ void TestHttpLlmClientConstruction() {
   Check(true, "HttpLlmClient constructed");
 }
 
+void TestQueryEngineEmitsStreamingEvents() {
+  agent::tools::ToolRegistry toolRegistry;
+  agent::tools::ToolSchema fileRead;
+  fileRead.name = "FileRead";
+  fileRead.description = "read file";
+  fileRead.category = agent::tools::ToolExecCategory::ReadOnly;
+  fileRead.readOnlyHint = true;
+  toolRegistry.RegisterTool(fileRead);
+
+  agent::tools::ToolOrchestrator orchestrator;
+  orchestrator.SetToolRegistry(&toolRegistry);
+  orchestrator.SetWorkspaceRoot(
+      "g:\\downloads\\claude-code\\yuanma-poxi\\cpp-agent");
+
+  agent::permissions::PermissionEngine permissionEngine;
+  permissionEngine.AddAlwaysAllowRule("FileRead");
+
+  EventStreamingModelClient modelClient;
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::infra::SessionManager sessionManager(
+      "build\\query-engine-event-session");
+  agent::core::QueryEngine engine(
+      orchestrator, permissionEngine, modelClient, sideQueryClient,
+      toolRegistry, sessionManager);
+  engine.SetSessionDir("build\\query-engine-event-session");
+
+  std::vector<agent::core::QueryLoopEvent> events;
+  engine.SetEventCallback(
+      [&](const agent::core::QueryLoopEvent& event) { events.push_back(event); });
+
+  engine.SubmitUserPrompt("请读取 README 并总结。");
+  engine.RunTurn();
+
+  bool sawStageChange = false;
+  bool sawAssistantStream = false;
+  bool sawToolProgress = false;
+  bool sawToolResult = false;
+  bool sawLoopCompleted = false;
+  for (const auto& event : events) {
+    std::string eventText;
+    for (const auto& block : event.message.content) {
+      if (block.type == agent::core::BlockType::Text) {
+        if (!eventText.empty()) eventText += "\n";
+        eventText += block.asText.text;
+      }
+    }
+    if (event.type == agent::core::QueryLoopEvent::Type::StageChanged &&
+        event.stage == agent::core::QueryStage::ModelCall) {
+      sawStageChange = true;
+    }
+    if (event.type == agent::core::QueryLoopEvent::Type::AssistantMessage &&
+        eventText.find("README 已读取") != std::string::npos) {
+      sawAssistantStream = true;
+    }
+    if (event.type == agent::core::QueryLoopEvent::Type::ToolProgress &&
+        !event.message.content.empty() &&
+        event.message.content.front().type == agent::core::BlockType::ToolUse &&
+        event.message.content.front().asToolUse.name == "FileRead") {
+      sawToolProgress = true;
+    }
+    if (event.type == agent::core::QueryLoopEvent::Type::ToolResult) {
+      sawToolResult = true;
+    }
+    if (event.type == agent::core::QueryLoopEvent::Type::LoopCompleted &&
+        event.terminalReason == "completed") {
+      sawLoopCompleted = true;
+    }
+  }
+
+  Check(sawStageChange, "QueryEngine should emit stage change events");
+  Check(sawAssistantStream, "QueryEngine should emit assistant streaming events");
+  Check(sawToolProgress, "QueryEngine should emit tool progress events");
+  Check(sawToolResult, "QueryEngine should emit tool result events");
+  Check(sawLoopCompleted, "QueryEngine should emit loop completed event");
+}
+
+void TestForcedContinuationLimitPersistsAcrossFollowups() {
+  agent::tools::ToolOrchestrator orchestrator;
+  agent::permissions::PermissionEngine permissionEngine;
+  PlanningOnlyModelClient modelClient;
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::core::QueryLoop loop(
+      orchestrator, permissionEngine, modelClient, sideQueryClient);
+  loop.SetMaxTurns(20);
+
+  agent::core::QueryLoopContext ctx;
+  ctx.systemPrompt = "system";
+  ctx.model = "main-model";
+
+  agent::core::Message user;
+  user.role = agent::core::MessageRole::User;
+  user.uuid = "user-plan-only";
+  user.content.push_back(agent::core::ContentBlock::MakeText(
+      "继续执行，不要只停留在计划。"));
+  ctx.messages.push_back(user);
+
+  loop.RunFull(ctx);
+
+  Check(modelClient.streamCalls == 9,
+        "Forced continuation count should stop repeated plan-only turns");
+}
+
+void TestHistorySnipPreservesOriginalUserTask() {
+  agent::tools::ToolOrchestrator orchestrator;
+  agent::permissions::PermissionEngine permissionEngine;
+  SnipCaptureModelClient modelClient;
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::core::QueryLoop loop(
+      orchestrator, permissionEngine, modelClient, sideQueryClient);
+
+  agent::core::QueryLoopContext ctx;
+  ctx.systemPrompt = "system";
+  ctx.model = "main-model";
+
+  agent::core::Message rootUser;
+  rootUser.role = agent::core::MessageRole::User;
+  rootUser.uuid = "user-root";
+  rootUser.content.push_back(agent::core::ContentBlock::MakeText(
+      "这是最初的用户任务，请保留下来。"));
+  ctx.messages.push_back(rootUser);
+
+  for (int i = 0; i < 24; ++i) {
+    agent::core::Message msg;
+    msg.role = (i % 2 == 0) ? agent::core::MessageRole::Assistant
+                            : agent::core::MessageRole::User;
+    msg.uuid = "msg-" + std::to_string(i);
+    msg.content.push_back(agent::core::ContentBlock::MakeText(
+        "filler message " + std::to_string(i)));
+    ctx.messages.push_back(msg);
+  }
+
+  loop.RunFull(ctx);
+
+  bool sawBoundary = false;
+  bool sawOriginalTask = false;
+  for (const auto& msg : modelClient.capturedMessages) {
+    for (const auto& block : msg.content) {
+      if (block.type != agent::core::BlockType::Text) continue;
+      if (block.asText.text.find("Conversation truncated. Preserved the original user request") !=
+          std::string::npos) {
+        sawBoundary = true;
+      }
+      if (block.asText.text.find("这是最初的用户任务，请保留下来。") !=
+          std::string::npos) {
+        sawOriginalTask = true;
+      }
+    }
+  }
+
+  Check(sawBoundary, "History snip should emit the new boundary message");
+  Check(sawOriginalTask, "History snip should preserve the original user task");
+}
+
+void TestStopHookCanForceContinuation() {
+  agent::tools::ToolOrchestrator orchestrator;
+  agent::permissions::PermissionEngine permissionEngine;
+  StopHookContinuationModelClient modelClient;
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::core::QueryLoop loop(
+      orchestrator, permissionEngine, modelClient, sideQueryClient);
+
+  auto hookConfig = std::make_shared<agent::hooks::HookConfig>();
+  hookConfig->SetWorkspaceTrusted(true);
+  hookConfig->RegisterSessionHook(
+      agent::hooks::HookEventType::Stop,
+      [](const agent::hooks::HookInput&, const std::string&) {
+        agent::hooks::HookResult result;
+        result.outcome = agent::hooks::HookOutcome::Success;
+        result.continueSession = true;
+        result.message.role = agent::core::MessageRole::System;
+        result.message.uuid = "stop-hook-continue";
+        result.message.isMeta = true;
+        result.message.content.push_back(agent::core::ContentBlock::MakeText(
+            "Stop hook requests another concrete action before finishing."));
+        return result;
+      });
+  agent::hooks::HookExecutor hookExecutor(hookConfig);
+
+  agent::core::QueryLoopContext ctx;
+  ctx.systemPrompt = "system";
+  ctx.model = "main-model";
+  ctx.hookExecutor = &hookExecutor;
+
+  agent::core::Message user;
+  user.role = agent::core::MessageRole::User;
+  user.uuid = "stop-hook-user";
+  user.content.push_back(agent::core::ContentBlock::MakeText(
+      "请先规划然后继续执行。"));
+  ctx.messages.push_back(user);
+
+  loop.RunFull(ctx);
+
+  Check(modelClient.streamCalls == 2,
+        "Stop hook should trigger one extra continuation turn");
+
+  bool sawContinuedText = false;
+  for (const auto& message : ctx.messages) {
+    for (const auto& block : message.content) {
+      if (block.type == agent::core::BlockType::Text &&
+          block.asText.text.find("继续执行测试") != std::string::npos) {
+        sawContinuedText = true;
+      }
+    }
+  }
+  Check(sawContinuedText,
+        "Stop hook continuation should reach the second assistant response");
+}
+
+void TestCompactHooksFireDuringSnip() {
+  agent::tools::ToolOrchestrator orchestrator;
+  agent::permissions::PermissionEngine permissionEngine;
+  CompactHookModelClient modelClient;
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::core::QueryLoop loop(
+      orchestrator, permissionEngine, modelClient, sideQueryClient);
+
+  int preCompactCalls = 0;
+  int postCompactCalls = 0;
+  auto hookConfig = std::make_shared<agent::hooks::HookConfig>();
+  hookConfig->SetWorkspaceTrusted(true);
+  hookConfig->RegisterSessionHook(
+      agent::hooks::HookEventType::PreCompact,
+      [&preCompactCalls](const agent::hooks::HookInput& input, const std::string&) {
+        ++preCompactCalls;
+        Check(input.preCompact.trigger == "snip" ||
+                  input.preCompact.trigger == "collapse",
+              "Compact hook should receive a known trigger");
+        agent::hooks::HookResult result;
+        result.outcome = agent::hooks::HookOutcome::Success;
+        return result;
+      });
+  hookConfig->RegisterSessionHook(
+      agent::hooks::HookEventType::PostCompact,
+      [&postCompactCalls](const agent::hooks::HookInput& input, const std::string&) {
+        ++postCompactCalls;
+        Check(input.postCompact.message_count_before >=
+                  input.postCompact.message_count_after,
+              "PostCompact should report reduced or equal message count");
+        agent::hooks::HookResult result;
+        result.outcome = agent::hooks::HookOutcome::Success;
+        return result;
+      });
+  agent::hooks::HookExecutor hookExecutor(hookConfig);
+
+  agent::core::QueryLoopContext ctx;
+  ctx.systemPrompt = "system";
+  ctx.model = "main-model";
+  ctx.hookExecutor = &hookExecutor;
+
+  for (int i = 0; i < 25; ++i) {
+    agent::core::Message msg;
+    msg.role = (i % 2 == 0) ? agent::core::MessageRole::User
+                            : agent::core::MessageRole::Assistant;
+    msg.uuid = "compact-msg-" + std::to_string(i);
+    msg.content.push_back(agent::core::ContentBlock::MakeText(
+        "history message " + std::to_string(i)));
+    ctx.messages.push_back(msg);
+  }
+
+  loop.RunFull(ctx);
+
+  Check(preCompactCalls >= 1, "PreCompact hook should run during snip/collapse");
+  Check(postCompactCalls >= 1,
+        "PostCompact hook should run during snip/collapse");
+}
+
 }  // namespace
 
 int main() {
@@ -670,6 +1113,11 @@ int main() {
   TestQueryLoopValidatorRetryBeforeToolExecution();
   TestQueryLoopValidatorTextCorrection();
   TestHttpLlmClientConstruction();
+  TestQueryEngineEmitsStreamingEvents();
+  TestForcedContinuationLimitPersistsAcrossFollowups();
+  TestHistorySnipPreservesOriginalUserTask();
+  TestStopHookCanForceContinuation();
+  TestCompactHooksFireDuringSnip();
 
   std::cout << "[test_core] Failures: " << failures << std::endl;
   return failures > 0 ? 1 : 0;

@@ -56,6 +56,7 @@ if(AGENT_ENABLE_WEB_TOOLS)
 endif()
 
 add_library(agent_core
+  src/app/TuiTaskPanel.cpp
   src/agents/SubAgentManager.cpp
   src/agents/SubAgentWorkerProtocol.cpp
   src/api/CostTracker.cpp
@@ -65,6 +66,8 @@ add_library(agent_core
   src/core/QueryLoop.cpp
   src/core/StateTypes.cpp
   src/core/StreamingToolExecutor.cpp
+  src/hooks/HookConfig.cpp
+  src/hooks/HookExecutor.cpp
   src/infra/ProcessRunner.cpp
   src/infra/ProtoLite.cpp
   src/infra/SessionManager.cpp
@@ -146,6 +149,24 @@ if(AGENT_BUILD_TESTS)
   )
   target_link_libraries(agent_test_infra PRIVATE agent_core)
   add_test(NAME agent_test_infra COMMAND agent_test_infra)
+
+  add_executable(agent_test_hooks
+    tests/unit/test_hooks.cpp
+  )
+  target_link_libraries(agent_test_hooks PRIVATE agent_core)
+  add_test(NAME agent_test_hooks COMMAND agent_test_hooks)
+
+  add_executable(agent_test_classifier
+    tests/unit/test_classifier.cpp
+  )
+  target_link_libraries(agent_test_classifier PRIVATE agent_core)
+  add_test(NAME agent_test_classifier COMMAND agent_test_classifier)
+
+  add_executable(agent_test_comprehensive
+    tests/unit/test_comprehensive.cpp
+  )
+  target_link_libraries(agent_test_comprehensive PRIVATE agent_core)
+  add_test(NAME agent_test_comprehensive COMMAND agent_test_comprehensive)
 
   add_executable(agent_test_e2e
     tests/integration/test_e2e.cpp

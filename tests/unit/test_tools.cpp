@@ -1,5 +1,7 @@
+#include "app/TuiTaskPanel.h"
 #include "tools/ToolOrchestrator.h"
 #include "tools/ToolRegistry.h"
+#include "agents/SubAgentManager.h"
 #include "permissions/PermissionEngine.h"
 #include "third_party/nlohmann_json.hpp"
 
@@ -11,6 +13,16 @@
 static int failures = 0;
 static void Check(bool condition, const char* label) {
   if (!condition) { std::cerr << "FAIL: " << label << std::endl; ++failures; }
+}
+
+std::wstring Utf8ToWide(const std::string& text) {
+  if (text.empty()) return std::wstring();
+  const int size = MultiByteToWideChar(
+      CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
+  std::wstring wide(static_cast<std::size_t>(size), L'\0');
+  MultiByteToWideChar(
+      CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), &wide[0], size);
+  return wide;
 }
 
 std::string FullPathOf(const std::string& path) {
@@ -542,6 +554,246 @@ void TestWorkspaceRejectsEscapingWrite() {
         "Workspace escaping write should not create file outside workspace");
 }
 
+void TestUnicodeWorkspaceReadWrite() {
+  const std::string workspaceRoot = "build\\unicode-tool-root";
+  const std::string relativePath = "中文目录\\结果.txt";
+  const std::string expectedPath = workspaceRoot + "\\中文目录\\结果.txt";
+  const std::string content = "unicode payload\n第二行\n";
+
+  CreateDirectoryA(workspaceRoot.c_str(), nullptr);
+
+  agent::tools::ToolOrchestrator orchestrator;
+  orchestrator.SetWorkspaceRoot(workspaceRoot);
+
+  auto canUse = [](const agent::core::ContentBlock&,
+                   const std::vector<agent::core::Message>&) {
+    agent::core::PermissionDecision d;
+    d.behavior = agent::core::PermissionBehavior::Allow;
+    return d;
+  };
+
+  nlohmann::json writeJson;
+  writeJson["file_path"] = relativePath;
+  writeJson["content"] = content;
+  auto writeResult = orchestrator.Execute(
+      {agent::core::ContentBlock::MakeToolUse(
+          "unicode-write-1", "FileWrite", writeJson.dump())},
+      canUse, {});
+  Check(writeResult.errorCount == 0,
+        "Unicode workspace write should succeed");
+
+  DWORD attrs = GetFileAttributesW(Utf8ToWide(expectedPath).c_str());
+  Check(attrs != INVALID_FILE_ATTRIBUTES,
+        "Unicode workspace write should create the target file");
+
+  nlohmann::json readJson;
+  readJson["file_path"] = relativePath;
+  auto readResult = orchestrator.Execute(
+      {agent::core::ContentBlock::MakeToolUse(
+          "unicode-read-1", "FileRead", readJson.dump())},
+      canUse, {});
+  Check(readResult.errorCount == 0,
+        "Unicode workspace read should succeed");
+
+  bool foundContent = false;
+  for (const auto& msg : readResult.userMessages) {
+    for (const auto& block : msg.content) {
+      if (block.type == agent::core::BlockType::ToolResult &&
+          block.asToolResult.content.find(content) != std::string::npos) {
+        foundContent = true;
+      }
+    }
+  }
+  Check(foundContent,
+        "Unicode workspace read should return the written content");
+
+  DeleteFileW(Utf8ToWide(expectedPath).c_str());
+}
+
+void TestTuiTaskPanelLoadsAndPrioritizesTasks() {
+  const std::string taskStorePath = "build\\tui-task-panel.json";
+  {
+    std::ofstream out(taskStorePath, std::ios::binary | std::ios::trunc);
+    out << R"([
+      {"id":"3","subject":"done task","status":"completed","owner":"bot"},
+      {"id":"2","subject":"blocked task","status":"pending","blockedBy":["1"]},
+      {"id":"1","subject":"active task","status":"in_progress","owner":"coder"},
+      {"id":"4","subject":"open task","status":"pending","blockedBy":[]}
+    ])";
+  }
+
+  const agent::app::TuiTaskPanelData data =
+      agent::app::LoadTuiTaskPanelData(taskStorePath);
+  Check(data.tasks.size() == 4, "Task panel should load all tasks");
+  Check(data.inProgressCount == 1, "Task panel should count in-progress tasks");
+  Check(data.pendingCount == 2, "Task panel should count pending tasks");
+  Check(data.completedCount == 1, "Task panel should count completed tasks");
+  Check(!data.tasks.empty() && data.tasks.front().id == "1",
+        "Task panel should prioritize in-progress tasks first");
+
+  const auto lines = agent::app::BuildTuiTaskPanelLines(data, 80, 3);
+  Check(!lines.empty(), "Task panel should render summary lines");
+  Check(lines.size() >= 2, "Task panel should render task rows");
+}
+
+void TestTaskToolsLifecycle() {
+  const std::string workspaceRoot = "build\\task-tool-root";
+  CreateDirectoryA(workspaceRoot.c_str(), nullptr);
+
+  agent::tools::ToolOrchestrator orchestrator;
+  orchestrator.SetWorkspaceRoot(workspaceRoot);
+
+  auto canUse = [](const agent::core::ContentBlock&,
+                   const std::vector<agent::core::Message>&) {
+    agent::core::PermissionDecision d;
+    d.behavior = agent::core::PermissionBehavior::Allow;
+    return d;
+  };
+
+  nlohmann::json createJson;
+  createJson["subject"] = "Implement tests";
+  createJson["description"] = "Write targeted unit tests";
+  auto createResult = orchestrator.Execute(
+      {agent::core::ContentBlock::MakeToolUse(
+          "task-create-1", "TaskCreate", createJson.dump())},
+      canUse, {});
+  Check(createResult.errorCount == 0, "TaskCreate should not error");
+
+  auto listResult = orchestrator.Execute(
+      {agent::core::ContentBlock::MakeToolUse(
+          "task-list-1", "TaskList", "{}")},
+      canUse, {});
+  Check(listResult.errorCount == 0, "TaskList should not error");
+  bool sawCreatedTask = false;
+  for (const auto& msg : listResult.userMessages) {
+    for (const auto& block : msg.content) {
+      if (block.type == agent::core::BlockType::ToolResult &&
+          block.asToolResult.content.find("Implement tests") != std::string::npos) {
+        sawCreatedTask = true;
+      }
+    }
+  }
+  Check(sawCreatedTask, "TaskList should include created task");
+
+  nlohmann::json updateJson;
+  updateJson["id"] = "1";
+  updateJson["status"] = "completed";
+  auto updateResult = orchestrator.Execute(
+      {agent::core::ContentBlock::MakeToolUse(
+          "task-update-1", "TaskUpdate", updateJson.dump())},
+      canUse, {});
+  Check(updateResult.errorCount == 0, "TaskUpdate should not error");
+
+  nlohmann::json getJson;
+  getJson["id"] = "1";
+  auto getResult = orchestrator.Execute(
+      {agent::core::ContentBlock::MakeToolUse(
+          "task-get-1", "TaskGet", getJson.dump())},
+      canUse, {});
+  bool sawCompleted = false;
+  for (const auto& msg : getResult.userMessages) {
+    for (const auto& block : msg.content) {
+      if (block.type == agent::core::BlockType::ToolResult &&
+          block.asToolResult.content.find("\"completed\"") != std::string::npos) {
+        sawCompleted = true;
+      }
+    }
+  }
+  Check(sawCompleted, "TaskGet should show updated status");
+
+  nlohmann::json stopJson;
+  stopJson["id"] = "1";
+  auto stopResult = orchestrator.Execute(
+      {agent::core::ContentBlock::MakeToolUse(
+          "task-stop-1", "TaskStop", stopJson.dump())},
+      canUse, {});
+  Check(stopResult.errorCount == 0, "TaskStop should not error");
+}
+
+void TestNotebookEditLifecycle() {
+  const std::string workspaceRoot = "build\\notebook-tool-root";
+  const std::string notebookPath = workspaceRoot + "\\test.ipynb";
+  CreateDirectoryA(workspaceRoot.c_str(), nullptr);
+
+  nlohmann::json notebook;
+  notebook["cells"] = nlohmann::json::array({
+      {{"id", "cell-1"}, {"cell_type", "markdown"},
+       {"metadata", nlohmann::json::object()},
+       {"source", nlohmann::json::array({"hello"})}}
+  });
+  notebook["metadata"] = nlohmann::json::object();
+  notebook["nbformat"] = 4;
+  notebook["nbformat_minor"] = 5;
+  {
+    std::ofstream out(notebookPath, std::ios::binary | std::ios::trunc);
+    out << notebook.dump(2);
+  }
+
+  agent::tools::ToolOrchestrator orchestrator;
+  orchestrator.SetWorkspaceRoot(workspaceRoot);
+  auto canUse = [](const agent::core::ContentBlock&,
+                   const std::vector<agent::core::Message>&) {
+    agent::core::PermissionDecision d;
+    d.behavior = agent::core::PermissionBehavior::Allow;
+    return d;
+  };
+
+  nlohmann::json replaceJson;
+  replaceJson["notebook_path"] = "test.ipynb";
+  replaceJson["cell_id"] = "cell-1";
+  replaceJson["new_source"] = "updated";
+  replaceJson["edit_mode"] = "replace";
+  auto replaceResult = orchestrator.Execute(
+      {agent::core::ContentBlock::MakeToolUse(
+          "nb-replace-1", "NotebookEdit", replaceJson.dump())},
+      canUse, {});
+  Check(replaceResult.errorCount == 0, "NotebookEdit replace should not error");
+
+  nlohmann::json insertJson;
+  insertJson["notebook_path"] = "test.ipynb";
+  insertJson["cell_id"] = "cell-1";
+  insertJson["new_source"] = "print('ok')";
+  insertJson["cell_type"] = "code";
+  insertJson["edit_mode"] = "insert";
+  auto insertResult = orchestrator.Execute(
+      {agent::core::ContentBlock::MakeToolUse(
+          "nb-insert-1", "NotebookEdit", insertJson.dump())},
+      canUse, {});
+  Check(insertResult.errorCount == 0, "NotebookEdit insert should not error");
+
+  std::ifstream verify(notebookPath, std::ios::binary);
+  nlohmann::json updated = nlohmann::json::parse(
+      std::string((std::istreambuf_iterator<char>(verify)),
+                  std::istreambuf_iterator<char>()));
+  verify.close();
+  Check(updated["cells"].size() == 2, "NotebookEdit insert should add a cell");
+  Check(updated["cells"][0]["source"][0] == "updated",
+        "NotebookEdit replace should update source");
+}
+
+void TestSkillToolDispatchesAgent() {
+  agent::tools::ToolOrchestrator orchestrator;
+  agent::agents::SubAgentManager subAgentManager;
+  orchestrator.SetSubAgentManager(&subAgentManager);
+
+  auto canUse = [](const agent::core::ContentBlock&,
+                   const std::vector<agent::core::Message>&) {
+    agent::core::PermissionDecision d;
+    d.behavior = agent::core::PermissionBehavior::Allow;
+    return d;
+  };
+
+  nlohmann::json skillJson;
+  skillJson["command"] = "plan";
+  skillJson["args"] = "Plan the implementation work";
+  auto result = orchestrator.Execute(
+      {agent::core::ContentBlock::MakeToolUse(
+          "skill-1", "Skill", skillJson.dump())},
+      canUse, {});
+  Check(result.errorCount == 0, "Skill should dispatch via Agent tool");
+  Check(!result.userMessages.empty(), "Skill should produce a tool result");
+}
+
 }  // namespace
 
 int main() {
@@ -559,6 +811,11 @@ int main() {
   TestWorkspaceRelativeWriteUsesTrustedRoot();
   TestWorkspaceAllowsAbsoluteExternalRead();
   TestWorkspaceRejectsEscapingWrite();
+  TestUnicodeWorkspaceReadWrite();
+  TestTuiTaskPanelLoadsAndPrioritizesTasks();
+  TestTaskToolsLifecycle();
+  TestNotebookEditLifecycle();
+  TestSkillToolDispatchesAgent();
   std::cout << "[test_tools] Failures: " << failures << std::endl;
   return failures > 0 ? 1 : 0;
 }

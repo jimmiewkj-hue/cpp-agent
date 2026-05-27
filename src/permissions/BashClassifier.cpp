@@ -50,7 +50,17 @@ void BashClassifier::SetApiKey(const std::string& key) {
 bool BashClassifier::MatchesReadOnlyPattern(const std::string& command) const {
   std::string lower = command;
   std::transform(lower.begin(), lower.end(), lower.begin(),
-                 [](unsigned char c) { return std::tolower(c); });
+                 [](unsigned char c) {
+                   return static_cast<char>(std::tolower(c));
+                 });
+  lower.erase(lower.begin(),
+              std::find_if(lower.begin(), lower.end(),
+                           [](unsigned char ch) { return !std::isspace(ch); }));
+  lower.erase(std::find_if(lower.rbegin(), lower.rend(),
+                           [](unsigned char ch) { return !std::isspace(ch); })
+                  .base(),
+              lower.end());
+  if (lower.empty()) return false;
 
   for (const auto& prefix : kReadOnlyPrefixes) {
     if (lower.find(prefix) == 0) return true;
@@ -66,13 +76,11 @@ bool BashClassifier::MatchesReadOnlyPattern(const std::string& command) const {
 
   for (const auto& safe : kReadOnlyCommands) {
     if (firstWord == safe) return true;
+    if (lower == safe) return true;
     if (lower.find(safe + " ") == 0) return true;
   }
 
-  return std::find(kDestructiveCommands.begin(),
-                   kDestructiveCommands.end(), lower) ==
-             kDestructiveCommands.end() &&
-         lower.find("rm ") != 0 && lower.find("rmdir") != 0;
+  return false;
 }
 
 bool BashClassifier::IsReadOnlyCommand(const std::string& command) const {
@@ -122,7 +130,9 @@ BashSafetyDecision BashClassifier::Classify(
   for (const auto& destructive : kDestructiveCommands) {
     std::string lower = command;
     std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
+                   [](unsigned char c) {
+                     return static_cast<char>(std::tolower(c));
+                   });
     if (lower.find(destructive) == 0) {
       decision.allow = false;
       decision.reason = "matches destructive pattern: " + destructive;

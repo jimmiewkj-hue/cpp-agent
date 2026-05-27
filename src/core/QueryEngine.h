@@ -3,6 +3,7 @@
 #include "core/AgentTypes.h"
 #include "core/StateTypes.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -28,7 +29,12 @@ namespace infra {
 class SessionManager;
 class StabilityWatchdog;
 }
+namespace hooks {
+class HookExecutor;
+}
 namespace core {
+
+using QueryLoopEventCallback = std::function<void(const QueryLoopEvent&)>;
 
 struct ContentReplacementState {
   std::vector<std::string> seenIds;
@@ -60,6 +66,8 @@ struct QueryLoopContext {
   bool hasAttemptedReactiveCompact = false;
   std::string sessionDir;
   infra::SessionManager* sessionManager = nullptr;
+  QueryLoopEventCallback eventCallback;
+  hooks::HookExecutor* hookExecutor = nullptr;
 };
 
 struct ValidationToolIntervention {
@@ -96,6 +104,8 @@ class QueryEngine {
   void SetStabilityWatchdog(infra::StabilityWatchdog* watchdog);
   void SetMaxTurns(int maxTurns);
   void SetSessionDir(const std::string& sessionDir);
+  void SetEventCallback(QueryLoopEventCallback callback);
+  void SetHookExecutor(hooks::HookExecutor* hookExecutor);
 
   void SubmitUserPrompt(const std::string& prompt);
   void RunTurn();
@@ -125,6 +135,8 @@ class QueryEngine {
   QueryLoopContext loopCtx_;
   int maxTurns_ = 500;
   std::string sessionDir_;
+  QueryLoopEventCallback eventCallback_;
+  hooks::HookExecutor* hookExecutor_ = nullptr;
 
   std::string BuildEffectiveSystemPrompt() const;
   std::string BuildLatestUserQuery() const;
