@@ -1,0 +1,1 @@
+﻿Reply with exactly STREAM_SMOKE_OK.

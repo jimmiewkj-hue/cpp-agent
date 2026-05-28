@@ -73,6 +73,7 @@ class SessionManager {
 
  private:
   SessionSnapshot BuildSnapshot() const;
+  std::vector<std::string> DrainTranscriptBufferLocked();
 
   mutable std::mutex mutex_;
   mutable std::mutex transcriptMutex_;

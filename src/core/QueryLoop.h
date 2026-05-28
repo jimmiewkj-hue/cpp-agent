@@ -37,11 +37,13 @@ struct QueryLoopInternalState {
   bool completed = false;
   bool validatorRequestedRetry = false;
   bool hasPromptedForMissingToolUse = false;
+  bool hasPromptedForWorkspaceExploration = false;
   bool forceContinuation = false;
   bool stopHookActive = false;
   std::string terminalReason;
   std::string forceContinuationReason;
   std::string activeModel;
+  int modelCallCount = 0;
   int forcedContinuationCount = 0;
   int turnCount = 0;
   int nextTurnCount = 0;
@@ -51,6 +53,11 @@ struct QueryLoopInternalState {
   bool hasAttemptedCollapseDrain = false;
   int maxOutputTokensOverride = 0;
   TransitionReason transition = TransitionReason::None;
+  // P0-02: Wall-clock budget (ms), 0 = unlimited
+  long long wallClockBudgetMs = 0;
+  // P0-02: Duplicate tool call detection
+  std::vector<std::string> recentToolFingerprints;
+  int consecutiveDuplicateToolCalls = 0;
 };
 
 struct StopHookResult {
@@ -67,6 +74,7 @@ class QueryLoop {
             api::SideQueryClient& sideQueryClient);
 
   void SetMaxTurns(int maxTurns);
+  void SetWallClockBudget(long long budgetMs);
 
   void RunFull(QueryLoopContext& ctx);
 
@@ -127,12 +135,21 @@ class QueryLoop {
       const std::vector<Message>& input);
   static int CountToolResultBytes(const Message& msg);
   static bool IsPromptTooLong(const Message& msg);
+  // P0-02: Duplicate tool call fingerprinting
+  std::string MakeToolFingerprint(const ContentBlock& block) const;
+  bool ShouldTerminateOnDuplicates(
+      QueryLoopContext& ctx,
+      QueryLoopInternalState& state) const;
+  // P0-02: Wall-clock budget check
+  bool IsWallClockExpired(QueryLoopContext& ctx) const;
 
   tools::ToolOrchestrator& toolOrchestrator_;
   permissions::PermissionEngine& permissionEngine_;
   api::ModelClient& modelClient_;
   api::SideQueryClient& sideQueryClient_;
   int maxTurns_ = 500;
+  long long wallClockBudgetMs_ = 0;
+  long long loopStartTimeMs_ = 0;
 };
 
 }  // namespace core

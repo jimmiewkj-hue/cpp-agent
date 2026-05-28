@@ -56,6 +56,7 @@ if(AGENT_ENABLE_WEB_TOOLS)
 endif()
 
 add_library(agent_core
+  src/app/RuntimePolicy.cpp
   src/app/TuiTaskPanel.cpp
   src/agents/SubAgentManager.cpp
   src/agents/SubAgentWorkerProtocol.cpp

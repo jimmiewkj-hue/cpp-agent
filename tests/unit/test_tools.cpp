@@ -121,7 +121,8 @@ void TestWindowsLsCompatibility() {
   for (const auto& msg : result.userMessages) {
     for (const auto& block : msg.content) {
       if (block.type != agent::core::BlockType::ToolResult) continue;
-      if (block.asToolResult.content.find("[normalized command] Get-ChildItem -Force") !=
+      if (block.asToolResult.content.find(
+              "[normalized command] Get-ChildItem -Force | Select-Object Mode,LastWriteTime,Length,Name") !=
           std::string::npos) {
         sawNormalized = true;
       }
@@ -134,6 +135,44 @@ void TestWindowsLsCompatibility() {
         "Windows ls compatibility should normalize ls -la");
   Check(!sawExitFailure,
         "Windows ls compatibility should avoid shell failure");
+}
+
+void TestWindowsDirCompatibility() {
+  agent::tools::ToolOrchestrator orchestrator;
+  std::vector<agent::core::ContentBlock> blocks;
+  blocks.push_back(agent::core::ContentBlock::MakeToolUse(
+      "bash-dir-1", "Bash", R"({"command":"dir /b /a-d ."})"));
+
+  std::vector<agent::core::Message> messages;
+  agent::core::CanUseTool canUse = [](const agent::core::ContentBlock&,
+                                      const std::vector<agent::core::Message>&) {
+    agent::core::PermissionDecision d;
+    d.behavior = agent::core::PermissionBehavior::Allow;
+    return d;
+  };
+  auto result = orchestrator.Execute(blocks, canUse, messages);
+  Check(!result.userMessages.empty(),
+        "Windows dir compatibility should produce result");
+
+  bool sawNormalized = false;
+  bool sawExitFailure = false;
+  for (const auto& msg : result.userMessages) {
+    for (const auto& block : msg.content) {
+      if (block.type != agent::core::BlockType::ToolResult) continue;
+      if (block.asToolResult.content.find(
+              "[normalized command] Get-ChildItem -File -Path '.' | ForEach-Object { $_.Name }") !=
+          std::string::npos) {
+        sawNormalized = true;
+      }
+      if (block.asToolResult.content.find("[exit code:") != std::string::npos) {
+        sawExitFailure = true;
+      }
+    }
+  }
+  Check(sawNormalized,
+        "Windows dir compatibility should normalize dir /b /a-d");
+  Check(!sawExitFailure,
+        "Windows dir compatibility should avoid shell failure");
 }
 
 void TestRealFileRead() {
@@ -156,6 +195,115 @@ void TestRealFileRead() {
   Check(!result.userMessages.empty(), "FileRead should produce result");
 }
 
+void TestFileReadSupportsOffsetLimit() {
+  const std::string tmpPath = "build\\p3_read_range_test.txt";
+  {
+    std::ofstream out(tmpPath, std::ios::binary);
+    out << "line-1\nline-2\nline-3\nline-4\n";
+  }
+
+  agent::tools::ToolOrchestrator orchestrator;
+  std::vector<agent::core::ContentBlock> blocks;
+  nlohmann::json readInput;
+  readInput["file_path"] = tmpPath;
+  readInput["offset"] = 2;
+  readInput["limit"] = 2;
+  blocks.push_back(agent::core::ContentBlock::MakeToolUse(
+      "fr-range-1", "Read", readInput.dump()));
+
+  std::vector<agent::core::Message> messages;
+  agent::core::CanUseTool canUse = [](const agent::core::ContentBlock&,
+                                      const std::vector<agent::core::Message>&) {
+    agent::core::PermissionDecision d;
+    d.behavior = agent::core::PermissionBehavior::Allow;
+    return d;
+  };
+
+  auto result = orchestrator.Execute(blocks, canUse, messages);
+  Check(!result.userMessages.empty(), "Ranged FileRead should produce result");
+
+  bool sawStartLine = false;
+  bool sawLine2 = false;
+  bool sawLine3 = false;
+  bool sawLine1 = false;
+  for (const auto& msg : result.userMessages) {
+    for (const auto& block : msg.content) {
+      if (block.type != agent::core::BlockType::ToolResult) continue;
+      const std::string& content = block.asToolResult.content;
+      if (content.find("start_line=\"2\"") != std::string::npos) {
+        sawStartLine = true;
+      }
+      if (content.find("2->line-2") != std::string::npos) {
+        sawLine2 = true;
+      }
+      if (content.find("3->line-3") != std::string::npos) {
+        sawLine3 = true;
+      }
+      if (content.find("1->line-1") != std::string::npos) {
+        sawLine1 = true;
+      }
+    }
+  }
+
+  Check(sawStartLine, "Ranged FileRead should record the requested start line");
+  Check(sawLine2, "Ranged FileRead should include the first requested line");
+  Check(sawLine3, "Ranged FileRead should include the second requested line");
+  Check(!sawLine1, "Ranged FileRead should not include lines before offset");
+
+  DeleteFileA(tmpPath.c_str());
+}
+
+void TestLargeFileReadRequiresTargetedRange() {
+  const std::string tmpPath = "build\\p3_large_read_test.txt";
+  {
+    std::ofstream out(tmpPath, std::ios::binary);
+    for (int i = 0; i < 40000; ++i) {
+      out << "line-" << i << " abcdefghijklmnopqrstuvwxyz\n";
+    }
+  }
+
+  agent::tools::ToolOrchestrator orchestrator;
+  std::vector<agent::core::ContentBlock> blocks;
+  nlohmann::json readInput;
+  readInput["file_path"] = tmpPath;
+  blocks.push_back(agent::core::ContentBlock::MakeToolUse(
+      "fr-large-1", "Read", readInput.dump()));
+
+  std::vector<agent::core::Message> messages;
+  agent::core::CanUseTool canUse = [](const agent::core::ContentBlock&,
+                                      const std::vector<agent::core::Message>&) {
+    agent::core::PermissionDecision d;
+    d.behavior = agent::core::PermissionBehavior::Allow;
+    return d;
+  };
+
+  auto result = orchestrator.Execute(blocks, canUse, messages);
+  Check(!result.userMessages.empty(),
+        "Large FileRead should still produce a tool result");
+
+  bool sawGuidance = false;
+  bool sawError = false;
+  for (const auto& msg : result.userMessages) {
+    for (const auto& block : msg.content) {
+      if (block.type != agent::core::BlockType::ToolResult) continue;
+      if (block.asToolResult.content.find(
+              "Use Read with offset/limit to inspect a targeted line range") !=
+          std::string::npos) {
+        sawGuidance = true;
+      }
+      if (block.asToolResult.isError) {
+        sawError = true;
+      }
+    }
+  }
+
+  Check(sawGuidance,
+        "Large FileRead should instruct the model to use offset/limit");
+  Check(sawError, "Large FileRead guidance should be surfaced as an error");
+
+  DeleteFileA(tmpPath.c_str());
+}
+
 void TestDeniedExecution() {
   agent::tools::ToolOrchestrator orchestrator;
   std::vector<agent::core::ContentBlock> blocks;
@@ -171,6 +319,41 @@ void TestDeniedExecution() {
   };
   auto result = orchestrator.Execute(blocks, canUse, messages);
   Check(result.deniedCount > 0, "Denied tool increments deniedCount");
+}
+
+void TestAskExecutionBehavesAsDeniedInNonInteractiveMode() {
+  agent::tools::ToolOrchestrator orchestrator;
+  std::vector<agent::core::ContentBlock> blocks;
+  blocks.push_back(agent::core::ContentBlock::MakeToolUse(
+      "ask-1", "Bash", R"({"command":"python --version"})"));
+  std::vector<agent::core::Message> messages;
+  agent::core::CanUseTool canUse = [](const agent::core::ContentBlock&,
+                                      const std::vector<agent::core::Message>&) {
+    agent::core::PermissionDecision d;
+    d.behavior = agent::core::PermissionBehavior::Ask;
+    d.reason = "no rule matched; requires confirmation";
+    return d;
+  };
+
+  auto result = orchestrator.Execute(blocks, canUse, messages);
+  Check(result.deniedCount == 1,
+        "Ask tool result should count as denied in non-interactive mode");
+  Check(result.errorCount == 1,
+        "Ask tool result should count as error in non-interactive mode");
+
+  bool sawErrorToolResult = false;
+  for (const auto& msg : result.userMessages) {
+    for (const auto& block : msg.content) {
+      if (block.type == agent::core::BlockType::ToolResult &&
+          block.asToolResult.isError &&
+          block.asToolResult.content.find("requires confirmation") !=
+              std::string::npos) {
+        sawErrorToolResult = true;
+      }
+    }
+  }
+  Check(sawErrorToolResult,
+        "Ask tool result should be surfaced as an error result");
 }
 
 void TestRealFileWrite() {
@@ -796,13 +979,241 @@ void TestSkillToolDispatchesAgent() {
 
 }  // namespace
 
+
+// ===== P1-02 Tests: Bash mkdir normalization =====
+
+void TestMkdirNormalization() {
+  agent::tools::ToolOrchestrator orchestrator;
+  auto canUse = [](const agent::core::ContentBlock&,
+                   const std::vector<agent::core::Message>&) {
+    agent::core::PermissionDecision d;
+    d.behavior = agent::core::PermissionBehavior::Allow;
+    return d;
+  };
+
+  {
+    nlohmann::json bashJson;
+    bashJson["command"] = "mkdir test-dir";
+    auto result = orchestrator.Execute(
+        {agent::core::ContentBlock::MakeToolUse(
+            "mkdir-1", "Bash", bashJson.dump())},
+        canUse, {});
+    Check(!result.userMessages.empty(), "mkdir should produce result");
+    bool sawNormalized = false;
+    for (const auto& msg : result.userMessages) {
+      for (const auto& block : msg.content) {
+        if (block.type != agent::core::BlockType::ToolResult) continue;
+        if (block.asToolResult.content.find("[normalized command] New-Item -ItemType Directory") !=
+            std::string::npos) {
+          sawNormalized = true;
+        }
+      }
+    }
+    Check(sawNormalized, "mkdir should normalize to New-Item -ItemType Directory");
+  }
+
+  {
+    nlohmann::json bashJson;
+    bashJson["command"] = "mkdir -p nested/test-dir";
+    auto result = orchestrator.Execute(
+        {agent::core::ContentBlock::MakeToolUse(
+            "mkdir-p-1", "Bash", bashJson.dump())},
+        canUse, {});
+    bool sawForce = false;
+    for (const auto& msg : result.userMessages) {
+      for (const auto& block : msg.content) {
+        if (block.type != agent::core::BlockType::ToolResult) continue;
+        if (block.asToolResult.content.find("New-Item -ItemType Directory -Force") !=
+            std::string::npos) {
+          sawForce = true;
+        }
+      }
+    }
+    Check(sawForce, "mkdir -p should normalize to New-Item with -Force");
+  }
+
+  {
+    nlohmann::json bashJson;
+    bashJson["command"] = "mkdir \"space dir\"";
+    auto result = orchestrator.Execute(
+        {agent::core::ContentBlock::MakeToolUse(
+            "mkdir-space-1", "Bash", bashJson.dump())},
+        canUse, {});
+    bool sawQuotedPath = false;
+    for (const auto& msg : result.userMessages) {
+      for (const auto& block : msg.content) {
+        if (block.type != agent::core::BlockType::ToolResult) continue;
+        if (block.asToolResult.content.find("-Path 'space dir'") !=
+            std::string::npos) {
+          sawQuotedPath = true;
+        }
+      }
+    }
+    Check(sawQuotedPath,
+          "mkdir should preserve quoted paths with spaces as one argument");
+  }
+
+  {
+    nlohmann::json bashJson;
+    bashJson["command"] = "mkdir data/{a,b}";
+    auto result = orchestrator.Execute(
+        {agent::core::ContentBlock::MakeToolUse(
+            "mkdir-brace-1", "Bash", bashJson.dump())},
+        canUse, {});
+    bool sawExpandedA = false;
+    bool sawExpandedB = false;
+    for (const auto& msg : result.userMessages) {
+      for (const auto& block : msg.content) {
+        if (block.type != agent::core::BlockType::ToolResult) continue;
+        if (block.asToolResult.content.find("-Path 'data/a'") !=
+            std::string::npos) {
+          sawExpandedA = true;
+        }
+        if (block.asToolResult.content.find("-Path 'data/b'") !=
+            std::string::npos) {
+          sawExpandedB = true;
+        }
+      }
+    }
+    Check(sawExpandedA && sawExpandedB,
+          "mkdir should keep brace expansion for unquoted paths");
+  }
+
+  {
+    nlohmann::json bashJson;
+    bashJson["command"] = "mkdir \"literal {a,b}\"";
+    auto result = orchestrator.Execute(
+        {agent::core::ContentBlock::MakeToolUse(
+            "mkdir-literal-brace-1", "Bash", bashJson.dump())},
+        canUse, {});
+    bool sawLiteralBracePath = false;
+    bool sawExpandedBracePath = false;
+    for (const auto& msg : result.userMessages) {
+      for (const auto& block : msg.content) {
+        if (block.type != agent::core::BlockType::ToolResult) continue;
+        if (block.asToolResult.content.find("-Path 'literal {a,b}'") !=
+            std::string::npos) {
+          sawLiteralBracePath = true;
+        }
+        if (block.asToolResult.content.find("-Path 'literal a'") !=
+                std::string::npos ||
+            block.asToolResult.content.find("-Path 'literal b'") !=
+                std::string::npos) {
+          sawExpandedBracePath = true;
+        }
+      }
+    }
+    Check(sawLiteralBracePath && !sawExpandedBracePath,
+          "mkdir should not expand braces inside quoted literal paths");
+  }
+
+  RemoveDirectoryA("test-dir");
+  RemoveDirectoryA("nested\test-dir");
+  RemoveDirectoryA("nested");
+  RemoveDirectoryA("space dir");
+  RemoveDirectoryA("data\\a");
+  RemoveDirectoryA("data\\b");
+  RemoveDirectoryA("data");
+  RemoveDirectoryA("literal {a,b}");
+}
+
+void TestGlobSupportsRecursivePatterns() {
+  const std::string workspaceRoot = FullPathOf("build\\glob_recursive_test");
+  CreateDirectoryA("build\\glob_recursive_test", nullptr);
+  CreateDirectoryA("build\\glob_recursive_test\\src", nullptr);
+  CreateDirectoryA("build\\glob_recursive_test\\src\\app", nullptr);
+  CreateDirectoryA("build\\glob_recursive_test\\src\\core", nullptr);
+  {
+    std::ofstream out("build\\glob_recursive_test\\src\\app\\main.cpp",
+                      std::ios::binary);
+    out << "int main() { return 0; }\n";
+  }
+  {
+    std::ofstream out("build\\glob_recursive_test\\src\\core\\QueryLoop.cpp",
+                      std::ios::binary);
+    out << "void QueryLoop() {}\n";
+  }
+  {
+    std::ofstream out("build\\glob_recursive_test\\src\\README.md",
+                      std::ios::binary);
+    out << "# sample\n";
+  }
+
+  agent::tools::ToolOrchestrator orchestrator;
+  orchestrator.SetWorkspaceRoot(workspaceRoot);
+  agent::core::CanUseTool canUse = [](const agent::core::ContentBlock&,
+                                      const std::vector<agent::core::Message>&) {
+    agent::core::PermissionDecision d;
+    d.behavior = agent::core::PermissionBehavior::Allow;
+    return d;
+  };
+
+  nlohmann::json recursiveGlob;
+  recursiveGlob["pattern"] = "src/**/*.cpp";
+  auto recursiveResult = orchestrator.Execute(
+      {agent::core::ContentBlock::MakeToolUse(
+          "glob-recursive-1", "Glob", recursiveGlob.dump())},
+      canUse, {});
+  bool sawAppCpp = false;
+  bool sawCoreCpp = false;
+  for (const auto& msg : recursiveResult.userMessages) {
+    for (const auto& block : msg.content) {
+      if (block.type != agent::core::BlockType::ToolResult) continue;
+      if (block.asToolResult.content.find("app/main.cpp") != std::string::npos) {
+        sawAppCpp = true;
+      }
+      if (block.asToolResult.content.find("core/QueryLoop.cpp") !=
+          std::string::npos) {
+        sawCoreCpp = true;
+      }
+    }
+  }
+  Check(sawAppCpp, "Glob should match recursive cpp file under app");
+  Check(sawCoreCpp, "Glob should match recursive cpp file under core");
+
+  nlohmann::json directChildrenGlob;
+  directChildrenGlob["pattern"] = "src/*";
+  auto directChildrenResult = orchestrator.Execute(
+      {agent::core::ContentBlock::MakeToolUse(
+          "glob-recursive-2", "Glob", directChildrenGlob.dump())},
+      canUse, {});
+  bool sawAppDir = false;
+  bool sawNestedCppAsDirectChild = false;
+  for (const auto& msg : directChildrenResult.userMessages) {
+    for (const auto& block : msg.content) {
+      if (block.type != agent::core::BlockType::ToolResult) continue;
+      if (block.asToolResult.content.find("[DIR]  app") != std::string::npos) {
+        sawAppDir = true;
+      }
+      if (block.asToolResult.content.find("app/main.cpp") != std::string::npos) {
+        sawNestedCppAsDirectChild = true;
+      }
+    }
+  }
+  Check(sawAppDir, "Glob should still return direct child directories");
+  Check(!sawNestedCppAsDirectChild,
+        "Glob direct child pattern should not include nested recursive files");
+
+  DeleteFileA("build\\glob_recursive_test\\src\\app\\main.cpp");
+  DeleteFileA("build\\glob_recursive_test\\src\\core\\QueryLoop.cpp");
+  DeleteFileA("build\\glob_recursive_test\\src\\README.md");
+  RemoveDirectoryA("build\\glob_recursive_test\\src\\app");
+  RemoveDirectoryA("build\\glob_recursive_test\\src\\core");
+  RemoveDirectoryA("build\\glob_recursive_test\\src");
+  RemoveDirectoryA("build\\glob_recursive_test");
+}
+
 int main() {
   TestToolRegistry();
   TestToolPartition();
   TestRealBash();
   TestWindowsLsCompatibility();
+  TestWindowsDirCompatibility();
   TestRealFileRead();
+  TestFileReadSupportsOffsetLimit();
+  TestLargeFileReadRequiresTargetedRange();
   TestDeniedExecution();
+  TestAskExecutionBehavesAsDeniedInNonInteractiveMode();
   TestRealFileWrite();
   TestRealFileWriteOverwrite();
   TestRealFileWriteEdgeCases();
@@ -816,6 +1227,8 @@ int main() {
   TestTaskToolsLifecycle();
   TestNotebookEditLifecycle();
   TestSkillToolDispatchesAgent();
+  TestMkdirNormalization();
+  TestGlobSupportsRecursivePatterns();
   std::cout << "[test_tools] Failures: " << failures << std::endl;
   return failures > 0 ? 1 : 0;
 }

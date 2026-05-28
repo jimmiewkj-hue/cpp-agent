@@ -1,3 +1,4 @@
+#include "app/RuntimePolicy.h"
 #include "core/QueryEngine.h"
 #include "core/QueryLoop.h"
 #include "core/StateTypes.h"
@@ -6,12 +7,18 @@
 #include "api/ModelClient.h"
 #include "api/SideQueryClient.h"
 #include "infra/SessionManager.h"
+#include "memory/MemoryIndex.h"
 #include "permissions/PermissionEngine.h"
 #include "tools/ToolOrchestrator.h"
 #include "tools/ToolRegistry.h"
 
+#include <windows.h>
+
 #include <cassert>
+#include <chrono>
+#include <fstream>
 #include <iostream>
+#include <thread>
 
 static int failures = 0;
 
@@ -71,6 +78,72 @@ class PlanThenToolModelClient : public agent::api::ModelClient {
   }
 
   int streamCalls = 0;
+};
+
+class WorkspaceFirstModelClient : public agent::api::ModelClient {
+ public:
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  void StreamResponse(
+      const std::vector<agent::core::Message>& messages,
+      const std::string&,
+      const std::string&,
+      const std::string&,
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
+    ++streamCalls;
+    if (streamCalls == 2) {
+      secondCallSawGuidance = ContainsText(
+          messages, "Do not call Write/FileWrite yet.");
+    }
+    if (!onEvent) return;
+    if (streamCalls == 1) {
+      onEvent("text_delta", "我先直接写一个修复文件。");
+      onEvent(
+          "tool_use",
+          R"({"id":"wf-write-001","name":"Write","input":{"file_path":"build/workspace-first-note.txt","content":"created too early"}})");
+      onEvent("stop_reason", "tool_use");
+      return;
+    }
+    if (streamCalls == 2) {
+      onEvent("text_delta", "我先读取 README，再决定怎么改。");
+      onEvent(
+          "tool_use",
+          R"({"id":"wf-read-001","name":"FileRead","input":{"path":"README.md"}})");
+      onEvent("stop_reason", "tool_use");
+      return;
+    }
+    onEvent("text_delta", "已经先完成 workspace 探查。");
+    onEvent("stop_reason", "end_turn");
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  static bool ContainsText(const std::vector<agent::core::Message>& messages,
+                           const std::string& needle) {
+    for (const auto& msg : messages) {
+      for (const auto& block : msg.content) {
+        if (block.type == agent::core::BlockType::Text &&
+            block.asText.text.find(needle) != std::string::npos) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  int streamCalls = 0;
+  bool secondCallSawGuidance = false;
 };
 
 class MaxTokensRecoveryModelClient : public agent::api::ModelClient {
@@ -457,6 +530,147 @@ class CompactHookModelClient : public agent::api::ModelClient {
   }
 };
 
+class WallClockBudgetModelClient : public agent::api::ModelClient {
+ public:
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  void StreamResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&,
+      const std::string&,
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
+    ++streamCalls;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    if (!onEvent) return;
+    onEvent("text_delta", "我先查看项目目录。");
+    onEvent("stop_reason", "end_turn");
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  int streamCalls = 0;
+};
+
+class ResumeAfterWallClockModelClient : public agent::api::ModelClient {
+ public:
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  void StreamResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&,
+      const std::string&,
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
+    ++streamCalls;
+    if (streamCalls == 1) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      if (onEvent) {
+        onEvent("text_delta", "我先继续当前任务。");
+        onEvent("stop_reason", "end_turn");
+      }
+      return;
+    }
+    if (onEvent) {
+      onEvent("text_delta", "已恢复并完成后续步骤。");
+      onEvent("stop_reason", "end_turn");
+    }
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  int streamCalls = 0;
+};
+
+class MicrocompactCaptureModelClient : public agent::api::ModelClient {
+ public:
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  void StreamResponse(
+      const std::vector<agent::core::Message>& messages,
+      const std::string&,
+      const std::string&,
+      const std::string&,
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
+    capturedMessages = messages;
+    if (onEvent) {
+      onEvent("text_delta", "microcompact checked");
+      onEvent("stop_reason", "end_turn");
+    }
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  std::vector<agent::core::Message> capturedMessages;
+};
+
+class PromptCaptureModelClient : public agent::api::ModelClient {
+ public:
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  void StreamResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string& systemPrompt,
+      const std::string&,
+      const std::string&,
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
+    ++streamCalls;
+    lastSystemPrompt = systemPrompt;
+    if (!onEvent) return;
+    onEvent("text_delta", "已完成。");
+    onEvent("stop_reason", "end_turn");
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  int streamCalls = 0;
+  std::string lastSystemPrompt;
+};
+
 void TestLlmConfig() {
   agent::core::LlmConfig cfg;
   cfg.apiEndpoint = "http://127.0.0.1:8080/v1/chat/completions";
@@ -593,6 +807,83 @@ void TestQueryLoopPlanForcesContinuation() {
   Check(sawForcedFollowup, "Forced continuation follow-up should be injected");
   Check(sawToolResult, "Tool result should be present after continuation");
   Check(sawFinalAssistant, "Final assistant response should be present");
+}
+
+void TestWorkspaceFirstBlocksInitialWriteTool() {
+  const std::string workspaceRoot =
+      "g:\\downloads\\claude-code\\yuanma-poxi\\cpp-agent";
+  const std::string accidentalWritePath =
+      workspaceRoot + "\\build\\workspace-first-note.txt";
+  DeleteFileA(accidentalWritePath.c_str());
+
+  agent::tools::ToolRegistry toolRegistry;
+  for (const auto& tool : agent::tools::ToolRegistry::GetAllBaseTools()) {
+    if (tool.name == "Write" || tool.name == "FileWrite" ||
+        tool.name == "FileRead" || tool.name == "Read" ||
+        tool.name == "Grep" || tool.name == "Glob") {
+      toolRegistry.RegisterTool(tool);
+    }
+  }
+
+  agent::tools::ToolOrchestrator orchestrator;
+  orchestrator.SetToolRegistry(&toolRegistry);
+  orchestrator.SetWorkspaceRoot(workspaceRoot);
+
+  agent::permissions::PermissionEngine permissionEngine;
+  permissionEngine.AddAlwaysAllowRule("Write");
+  permissionEngine.AddAlwaysAllowRule("FileRead");
+  permissionEngine.AddAlwaysAllowRule("Read");
+  permissionEngine.AddAlwaysAllowRule("Grep");
+  permissionEngine.AddAlwaysAllowRule("Glob");
+
+  WorkspaceFirstModelClient modelClient;
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::core::QueryLoop loop(
+      orchestrator, permissionEngine, modelClient, sideQueryClient);
+  loop.SetMaxTurns(10);
+
+  agent::core::QueryLoopContext ctx;
+  ctx.systemPrompt = agent::app::BuildWorkspaceSystemPrompt(workspaceRoot, true);
+  ctx.model = "test-model";
+
+  agent::core::Message user;
+  user.role = agent::core::MessageRole::User;
+  user.uuid = "workspace-first-user";
+  user.content.push_back(agent::core::ContentBlock::MakeText(
+      "请先分析现有工程，再进行必要修改。"));
+  ctx.messages.push_back(user);
+
+  loop.RunFull(ctx);
+
+  Check(modelClient.streamCalls >= 3,
+        "Workspace-first guard should force another model turn before writing");
+  Check(modelClient.secondCallSawGuidance,
+        "Second model turn should receive workspace exploration guidance");
+
+  const DWORD accidentalAttrs = GetFileAttributesA(accidentalWritePath.c_str());
+  Check(accidentalAttrs == INVALID_FILE_ATTRIBUTES,
+        "Initial Write tool should be blocked before workspace exploration");
+
+  bool sawExplorationNudge = false;
+  bool sawReadToolUse = false;
+  for (const auto& msg : ctx.messages) {
+    for (const auto& block : msg.content) {
+      if (block.type == agent::core::BlockType::Text &&
+          block.asText.text.find("Do not call Write/FileWrite yet.") !=
+              std::string::npos) {
+        sawExplorationNudge = true;
+      }
+      if (block.type == agent::core::BlockType::ToolUse &&
+          block.asToolUse.name == "FileRead") {
+        sawReadToolUse = true;
+      }
+    }
+  }
+
+  Check(sawExplorationNudge,
+        "Workspace-first guard should append an exploration nudge");
+  Check(sawReadToolUse,
+        "Follow-up turn should use an exploration tool after the nudge");
 }
 
 void TestSkeletonModelClientStream() {
@@ -1096,6 +1387,311 @@ void TestCompactHooksFireDuringSnip() {
         "PostCompact hook should run during snip/collapse");
 }
 
+void TestRuntimePolicySharedRules() {
+  const auto interactiveTools = agent::app::GetSessionBaseTools(true);
+  const auto nonInteractiveTools = agent::app::GetSessionBaseTools(false);
+
+  bool interactiveHasAsk = false;
+  bool nonInteractiveHasAsk = false;
+  for (const auto& tool : interactiveTools) {
+    if (tool.name == "AskUserQuestion") interactiveHasAsk = true;
+  }
+  for (const auto& tool : nonInteractiveTools) {
+    if (tool.name == "AskUserQuestion") nonInteractiveHasAsk = true;
+  }
+
+  Check(interactiveHasAsk,
+        "Interactive runtime policy should keep AskUserQuestion");
+  Check(!nonInteractiveHasAsk,
+        "Non-interactive runtime policy should drop AskUserQuestion");
+
+  const std::string prompt = agent::app::BuildWorkspaceSystemPrompt(
+      "C:\\workspace", true);
+  Check(prompt.find("MUST first explore the workspace with Glob, Grep, or Read tools") !=
+            std::string::npos,
+        "Shared prompt should enforce workspace-first exploration");
+  Check(prompt.find("PowerShell, not bash") != std::string::npos,
+        "Shared prompt should include Windows PowerShell guidance");
+  Check(prompt.find("do not use Bash or PowerShell listing commands like ls, dir, or Get-ChildItem") !=
+            std::string::npos,
+        "Shared prompt should prefer Glob/Read/Grep over shell listing commands");
+  Check(prompt.find("Read with offset/limit for a targeted line range") !=
+            std::string::npos,
+        "Shared prompt should prefer targeted range reads for large files");
+
+  const auto silentStartup =
+      agent::app::BuildStartupMessages(false, true, "C:\\workspace", 2);
+  const auto interactiveStartup =
+      agent::app::BuildStartupMessages(true, true, "C:\\workspace", 2);
+  Check(silentStartup.empty(),
+        "Non-interactive startup should not emit TUI banner messages");
+  Check(interactiveStartup.size() == 3,
+        "Interactive startup should include ready, workspace, and hook messages");
+}
+
+void TestQueryEngineWallClockBudgetTerminatesLoop() {
+  agent::tools::ToolRegistry toolRegistry;
+  agent::tools::ToolOrchestrator orchestrator;
+  agent::permissions::PermissionEngine permissionEngine;
+  WallClockBudgetModelClient modelClient;
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::infra::SessionManager sessionManager(
+      "build\\query-engine-wallclock-session");
+  agent::core::QueryEngine engine(
+      orchestrator, permissionEngine, modelClient, sideQueryClient,
+      toolRegistry, sessionManager);
+  engine.SetSessionDir("build\\query-engine-wallclock-session");
+  engine.SetWallClockBudgetMs(1);
+
+  engine.SubmitUserPrompt("继续执行，不要停留在计划。");
+  engine.RunTurn();
+
+  Check(modelClient.streamCalls == 1,
+        "Wall-clock timeout should stop the loop before a second model turn");
+
+  bool sawWallClockTermination = false;
+  for (const auto& msg : engine.messages()) {
+    for (const auto& block : msg.content) {
+      if (block.type == agent::core::BlockType::Text &&
+          block.asText.text.find("wall-clock budget exceeded") !=
+              std::string::npos) {
+        sawWallClockTermination = true;
+      }
+    }
+  }
+  Check(sawWallClockTermination,
+        "Wall-clock timeout should append a termination message");
+}
+
+void TestQueryEngineCanContinueAfterWallClockTimeout() {
+  agent::tools::ToolRegistry toolRegistry;
+  agent::tools::ToolOrchestrator orchestrator;
+  agent::permissions::PermissionEngine permissionEngine;
+  ResumeAfterWallClockModelClient modelClient;
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::infra::SessionManager sessionManager(
+      "build\\query-engine-wallclock-continue-session");
+  agent::core::QueryEngine engine(
+      orchestrator, permissionEngine, modelClient, sideQueryClient,
+      toolRegistry, sessionManager);
+  engine.SetSessionDir("build\\query-engine-wallclock-continue-session");
+  engine.SetWallClockBudgetMs(1);
+
+  engine.SubmitUserPrompt("继续执行，不要停留在计划。");
+  engine.RunTurn();
+
+  Check(modelClient.streamCalls == 1,
+        "First run should stop after wall-clock timeout");
+  Check(engine.PrepareForContinuationAfterWallClockTimeout(),
+        "QueryEngine should trim the trailing wall-clock timeout message");
+  bool sawWallClockTermination = false;
+  for (const auto& msg : engine.messages()) {
+    for (const auto& block : msg.content) {
+      if (block.type == agent::core::BlockType::Text &&
+          block.asText.text.find("wall-clock budget exceeded") !=
+              std::string::npos) {
+        sawWallClockTermination = true;
+      }
+    }
+  }
+  Check(!sawWallClockTermination,
+        "Continuation prep should remove the wall-clock timeout marker");
+
+  engine.SetWallClockBudgetMs(1000);
+  engine.RunTurn();
+  Check(modelClient.streamCalls == 2,
+        "Second run should resume execution with a fresh wall-clock budget");
+}
+
+void TestQueryEngineSetConfigOverridesPromptAndModel() {
+  agent::tools::ToolRegistry toolRegistry;
+  agent::tools::ToolOrchestrator orchestrator;
+  agent::permissions::PermissionEngine permissionEngine;
+  PlanThenToolModelClient modelClient;
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::infra::SessionManager sessionManager(
+      "build\\query-engine-config-override-session");
+  agent::core::QueryEngine engine(
+      orchestrator, permissionEngine, modelClient, sideQueryClient,
+      toolRegistry, sessionManager);
+
+  agent::core::AgentConfig config = agent::core::AgentConfig::FromDefaults();
+  config.systemPrompt = "CUSTOM_SYSTEM_PROMPT_OVERRIDE";
+  config.defaultModel = "custom-model-override";
+  engine.SetConfig(config);
+
+  engine.SubmitUserPrompt("只回复一次。");
+  engine.RunTurn();
+
+  bool sawCustomPrompt = false;
+  for (const auto& msg : engine.loopContext().messages) {
+    for (const auto& block : msg.content) {
+      if (block.type == agent::core::BlockType::Text &&
+          block.asText.text.find("CUSTOM_SYSTEM_PROMPT_OVERRIDE") !=
+              std::string::npos) {
+        sawCustomPrompt = true;
+      }
+    }
+  }
+
+  Check(engine.loopContext().systemPrompt == "CUSTOM_SYSTEM_PROMPT_OVERRIDE",
+        "SetConfig should override the effective system prompt");
+  Check(engine.loopContext().model == "custom-model-override",
+        "SetConfig should override the effective default model");
+  Check(!sawCustomPrompt,
+        "System prompt should remain in loop context, not leak into chat messages");
+}
+
+void TestQueryEngineBuildEffectivePromptAppendsMemoryInjection() {
+  CreateDirectoryA("build", nullptr);
+  const std::string memoryDir = "build\\query-engine-memory-prompt";
+
+  agent::tools::ToolRegistry toolRegistry;
+  agent::tools::ToolOrchestrator orchestrator;
+  agent::permissions::PermissionEngine permissionEngine;
+  PromptCaptureModelClient modelClient;
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::infra::SessionManager sessionManager(
+      "build\\query-engine-memory-session");
+  agent::memory::MemoryIndex memoryIndex(memoryDir);
+  agent::core::QueryEngine engine(
+      orchestrator, permissionEngine, modelClient, sideQueryClient,
+      toolRegistry, sessionManager);
+
+  Check(memoryIndex.WriteEntrypoint("- [User role](user_role.md) - prompt test"),
+        "MemoryIndex should write entrypoint for effective prompt test");
+  Check(memoryIndex.WriteTopicFile(
+            "user_role.md", "# User role\nRemember concise runner summaries."),
+        "MemoryIndex should write topic file for effective prompt test");
+
+  agent::core::AgentConfig config = agent::core::AgentConfig::FromDefaults();
+  config.systemPrompt = "BASE_PROMPT_FOR_MEMORY_TEST";
+  config.memoryRoot = memoryDir;
+  engine.SetConfig(config);
+  engine.SetMemoryIndex(&memoryIndex);
+
+  engine.SubmitUserPrompt("验证 system prompt 运行链路。");
+  engine.RunTurn();
+
+  Check(modelClient.lastSystemPrompt.find("BASE_PROMPT_FOR_MEMORY_TEST") == 0,
+        "Effective prompt should start with configured system prompt");
+  Check(modelClient.lastSystemPrompt.find("# memory") != std::string::npos,
+        "Effective prompt should append memory injection");
+  Check(modelClient.lastSystemPrompt.find("Remember concise runner summaries.") !=
+            std::string::npos,
+        "Effective prompt should include topic memory content");
+}
+
+void TestQueryEngineRunTurnUpdatesMetadataWithoutWatchdog() {
+  CreateDirectoryA("build", nullptr);
+  const std::string sessionDir = "build\\query-engine-turncount-session";
+
+  agent::tools::ToolRegistry toolRegistry;
+  agent::tools::ToolOrchestrator orchestrator;
+  agent::permissions::PermissionEngine permissionEngine;
+  PromptCaptureModelClient modelClient;
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::infra::SessionManager sessionManager(sessionDir);
+  agent::core::QueryEngine engine(
+      orchestrator, permissionEngine, modelClient, sideQueryClient,
+      toolRegistry, sessionManager);
+
+  engine.SetSessionDir(sessionDir);
+  engine.SubmitUserPrompt("只做一次回答。");
+  engine.RunTurn();
+  sessionManager.PersistSnapshot();
+
+  const agent::core::SessionMetadata metadata = sessionManager.metadata();
+  Check(metadata.turnCount == 1,
+        "RunTurn should increment metadata turn count without watchdog");
+  Check(metadata.id == sessionDir,
+        "RunTurn should preserve the session id for non-watchdog sessions");
+
+  std::ifstream snapshot(sessionManager.LegacySnapshotPath(), std::ios::binary);
+  std::string snapshotText((std::istreambuf_iterator<char>(snapshot)),
+                           std::istreambuf_iterator<char>());
+  Check(snapshotText.find("turn_count=1") != std::string::npos,
+        "Persisted snapshot should store the incremented turn count");
+  Check(snapshotText.find("session_id=" + sessionDir) != std::string::npos,
+        "Persisted snapshot should store the session id");
+}
+
+void TestMicrocompactPreservesLatestToolResult() {
+  agent::tools::ToolOrchestrator orchestrator;
+  agent::permissions::PermissionEngine permissionEngine;
+  MicrocompactCaptureModelClient modelClient;
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::core::QueryLoop loop(
+      orchestrator, permissionEngine, modelClient, sideQueryClient);
+
+  agent::core::QueryLoopContext ctx;
+  ctx.systemPrompt = "system";
+  ctx.model = "main-model";
+
+  agent::core::Message user;
+  user.role = agent::core::MessageRole::User;
+  user.uuid = "mc-user";
+  user.content.push_back(agent::core::ContentBlock::MakeText(
+      "继续基于最近一次目录结果执行。"));
+  ctx.messages.push_back(user);
+
+  agent::core::Message assistantOld;
+  assistantOld.role = agent::core::MessageRole::Assistant;
+  assistantOld.uuid = "mc-asst-old";
+  assistantOld.content.push_back(agent::core::ContentBlock::MakeToolUse(
+      "tool-old", "Glob", R"({"pattern":"*"})"));
+  ctx.messages.push_back(assistantOld);
+
+  agent::core::Message oldResult;
+  oldResult.role = agent::core::MessageRole::User;
+  oldResult.uuid = "mc-result-old";
+  oldResult.content.push_back(agent::core::ContentBlock::MakeToolResult(
+      "tool-old",
+      std::string(120, 'A') + "\nold tool result should compact",
+      false));
+  ctx.messages.push_back(oldResult);
+
+  agent::core::Message assistantLatest;
+  assistantLatest.role = agent::core::MessageRole::Assistant;
+  assistantLatest.uuid = "mc-asst-latest";
+  assistantLatest.content.push_back(agent::core::ContentBlock::MakeToolUse(
+      "tool-latest", "Bash", R"({"command":"ls -la"})"));
+  ctx.messages.push_back(assistantLatest);
+
+  agent::core::Message latestResult;
+  latestResult.role = agent::core::MessageRole::User;
+  latestResult.uuid = "mc-result-latest";
+  const std::string latestContent =
+      std::string(120, 'B') + "\nlatest tool result should stay intact";
+  latestResult.content.push_back(agent::core::ContentBlock::MakeToolResult(
+      "tool-latest", latestContent, false));
+  ctx.messages.push_back(latestResult);
+
+  loop.RunFull(ctx);
+
+  bool oldWasCompacted = false;
+  bool latestStayedFull = false;
+  for (const auto& msg : modelClient.capturedMessages) {
+    for (const auto& block : msg.content) {
+      if (block.type != agent::core::BlockType::ToolResult) continue;
+      if (block.asToolResult.toolUseId == "tool-old" &&
+          block.asToolResult.content.find("[Tool: Glob]") !=
+              std::string::npos) {
+        oldWasCompacted = true;
+      }
+      if (block.asToolResult.toolUseId == "tool-latest" &&
+          block.asToolResult.content == latestContent) {
+        latestStayedFull = true;
+      }
+    }
+  }
+
+  Check(oldWasCompacted,
+        "Microcompact should still compact older oversized tool results");
+  Check(latestStayedFull,
+        "Microcompact should preserve the latest oversized tool result for the next turn");
+}
+
 }  // namespace
 
 int main() {
@@ -1107,6 +1703,7 @@ int main() {
   TestStopHookResult();
   TestAgentConfig();
   TestQueryLoopPlanForcesContinuation();
+  TestWorkspaceFirstBlocksInitialWriteTool();
   TestSkeletonModelClientStream();
   TestQueryLoopMaxTokensEscalation();
   TestQueryLoopFallbackModelRetry();
@@ -1118,6 +1715,13 @@ int main() {
   TestHistorySnipPreservesOriginalUserTask();
   TestStopHookCanForceContinuation();
   TestCompactHooksFireDuringSnip();
+  TestRuntimePolicySharedRules();
+  TestQueryEngineWallClockBudgetTerminatesLoop();
+  TestQueryEngineCanContinueAfterWallClockTimeout();
+  TestQueryEngineSetConfigOverridesPromptAndModel();
+  TestQueryEngineBuildEffectivePromptAppendsMemoryInjection();
+  TestQueryEngineRunTurnUpdatesMetadataWithoutWatchdog();
+  TestMicrocompactPreservesLatestToolResult();
 
   std::cout << "[test_core] Failures: " << failures << std::endl;
   return failures > 0 ? 1 : 0;

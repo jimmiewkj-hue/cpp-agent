@@ -13,7 +13,28 @@
 
 namespace {
 
+std::wstring Utf8ToWide(const std::string& text) {
+  if (text.empty()) return std::wstring();
+  const int len = MultiByteToWideChar(
+      CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
+  std::wstring wide(static_cast<std::size_t>(len), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                      &wide[0], len);
+  return wide;
+}
+
 void LoadDebugEnvIntoProcess() {
+  char enabled[16] = {0};
+  DWORD enabledLen = GetEnvironmentVariableA(
+      "CPP_AGENT_ENABLE_DEBUG_SERVER", enabled, sizeof(enabled));
+  const std::string enabledValue =
+      enabledLen > 0 && enabledLen < sizeof(enabled)
+          ? std::string(enabled, enabledLen)
+          : std::string();
+  if (enabledValue != "1" && enabledValue != "true" &&
+      enabledValue != "TRUE") {
+    return;
+  }
   std::ifstream in(".dbg\\stream-response-stall.env", std::ios::binary);
   if (!in) return;
   std::string line;
@@ -30,10 +51,32 @@ void LoadDebugEnvIntoProcess() {
 }
 
 std::string ReadAllText(const std::string& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) return std::string();
-  return std::string((std::istreambuf_iterator<char>(in)),
-                     std::istreambuf_iterator<char>());
+  const std::wstring widePath = Utf8ToWide(path);
+  HANDLE h = CreateFileW(widePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                         nullptr);
+  if (h == INVALID_HANDLE_VALUE) return std::string();
+  LARGE_INTEGER size;
+  if (!GetFileSizeEx(h, &size) || size.QuadPart < 0) {
+    CloseHandle(h);
+    return std::string();
+  }
+  std::string content(static_cast<std::size_t>(size.QuadPart), '\0');
+  DWORD totalRead = 0;
+  while (totalRead < content.size()) {
+    DWORD chunk = 0;
+    if (!ReadFile(h, &content[totalRead],
+                  static_cast<DWORD>(content.size() - totalRead),
+                  &chunk, nullptr)) {
+      CloseHandle(h);
+      return std::string();
+    }
+    if (chunk == 0) break;
+    totalRead += chunk;
+  }
+  CloseHandle(h);
+  content.resize(totalRead);
+  return content;
 }
 
 std::string GetEnvOrDefault(const char* name, const std::string& fallback) {
@@ -69,6 +112,8 @@ int main(int argc, char** argv) {
       "CPP_AGENT_FALLBACK_MODEL", "gemma-4-31B-it-Q8_0");
   llmCfg.connectTimeoutMs = 30000;
   llmCfg.requestTimeoutMs = 180000;
+  std::cout << "smoke_endpoint=" << llmCfg.apiEndpoint << std::endl;
+  std::cout << "smoke_model=" << llmCfg.mainModel << std::endl;
 
   agent::api::HttpLlmClient client(llmCfg);
   std::vector<agent::core::Message> messages;

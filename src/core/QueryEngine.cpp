@@ -56,14 +56,14 @@ QueryEngine::QueryEngine(tools::ToolOrchestrator& toolOrchestrator,
   config_ = AgentConfig::FromDefaults();
   systemPrompt_ = config_.systemPrompt;
   model_ = config_.defaultModel;
+  metadata_ = sessionManager_.metadata();
+  sessionManager_.SetMetadata(metadata_);
 }
 
 void QueryEngine::SetConfig(const AgentConfig& config) {
   config_ = config;
-  if (systemPrompt_.empty()) {
-    systemPrompt_ = config_.systemPrompt;
-  }
-  if (model_.empty()) {
+  systemPrompt_ = config_.systemPrompt;
+  if (!config_.defaultModel.empty()) {
     model_ = config_.defaultModel;
   }
 }
@@ -106,8 +106,16 @@ void QueryEngine::SetMaxTurns(int maxTurns) {
   maxTurns_ = maxTurns;
 }
 
+void QueryEngine::SetWallClockBudgetMs(long long budgetMs) {
+  wallClockBudgetMs_ = budgetMs;
+}
+
 void QueryEngine::SetSessionDir(const std::string& sessionDir) {
   sessionDir_ = sessionDir;
+  if (metadata_.id.empty() && !sessionDir.empty()) {
+    metadata_.id = sessionDir;
+    sessionManager_.SetMetadata(metadata_);
+  }
 }
 
 void QueryEngine::SetEventCallback(QueryLoopEventCallback callback) {
@@ -153,6 +161,7 @@ void QueryEngine::RunTurn() {
   QueryLoop loop(toolOrchestrator_, permissionEngine_, modelClient_,
                  sideQueryClient_);
   loop.SetMaxTurns(maxTurns_);
+  loop.SetWallClockBudget(wallClockBudgetMs_);
   loop.RunFull(loopCtx_);
 
   messages_ = loopCtx_.messages;
@@ -160,9 +169,9 @@ void QueryEngine::RunTurn() {
 
   sessionManager_.FlushTranscriptBuffer();
 
+  ++metadata_.turnCount;
+  sessionManager_.SetMetadata(metadata_);
   if (stabilityWatchdog_) {
-    ++metadata_.turnCount;
-    sessionManager_.SetMetadata(metadata_);
     stabilityWatchdog_->SignalTurnComplete(true);
   }
 }
@@ -179,6 +188,18 @@ bool QueryEngine::RunTurnWithRecovery() {
     sessionManager_.PersistSnapshot();
     return false;
   }
+}
+
+bool QueryEngine::PrepareForContinuationAfterWallClockTimeout() {
+  if (messages_.empty()) return false;
+  const Message& last = messages_.back();
+  if (last.role != MessageRole::System || !last.isMeta ||
+      last.uuid != "wall-clock-timeout") {
+    return false;
+  }
+  messages_.pop_back();
+  SyncSessionState();
+  return true;
 }
 
 bool QueryEngine::HandleFallback() {
@@ -228,7 +249,9 @@ std::string QueryEngine::BuildEffectiveSystemPrompt() const {
     memoryPrompt = memoryIndex_->BuildSystemPromptInjection(relevantTopics);
   } else if (!config_.memoryRoot.empty()) {
     memory::MemoryIndex tempIndex(config_.memoryRoot);
-    memoryPrompt = tempIndex.BuildSystemPromptInjection();
+    if (!tempIndex.ReadEntrypoint().empty()) {
+      memoryPrompt = tempIndex.BuildSystemPromptInjection();
+    }
   }
 
   if (memoryPrompt.empty()) return effectivePrompt;

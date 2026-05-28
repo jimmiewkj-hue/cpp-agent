@@ -136,52 +136,114 @@ std::string TimestampNow() {
   return stream.str();
 }
 
+// ===== P1-04 Fix: Unicode path support =====
+static std::wstring ToWide(const std::string& utf8) {
+  if (utf8.empty()) return {};
+  int len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
+                                static_cast<int>(utf8.size()), nullptr, 0);
+  std::wstring w(static_cast<size_t>(len), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
+                      static_cast<int>(utf8.size()), &w[0], len);
+  return w;
+}
+
 bool EnsureDirectoryRecursive(const std::string& path) {
   if (path.empty()) return false;
-  std::string normalized = path;
-  std::replace(normalized.begin(), normalized.end(), '/', '\\');
+  std::wstring wpath = ToWide(path);
+  std::replace(wpath.begin(), wpath.end(), L'/', L'\\');
   std::size_t cursor = 0;
-  if (normalized.size() >= 2 && normalized[1] == ':') cursor = 3;
-  while (cursor <= normalized.size()) {
-    const std::size_t next = normalized.find('\\', cursor);
-    const std::string current =
-        next == std::string::npos ? normalized : normalized.substr(0, next);
+  if (wpath.size() >= 2 && wpath[1] == L':') cursor = 3;
+  while (cursor <= wpath.size()) {
+    const std::size_t next = wpath.find(L'\\', cursor);
+    const std::wstring current =
+        next == std::wstring::npos ? wpath : wpath.substr(0, next);
     if (!current.empty()) {
-      const DWORD attrs = GetFileAttributesA(current.c_str());
+      const DWORD attrs = GetFileAttributesW(current.c_str());
       if (attrs == INVALID_FILE_ATTRIBUTES) {
-        if (!CreateDirectoryA(current.c_str(), nullptr)) {
+        if (!CreateDirectoryW(current.c_str(), nullptr)) {
           if (GetLastError() != ERROR_ALREADY_EXISTS) return false;
         }
       }
     }
-    if (next == std::string::npos) break;
+    if (next == std::wstring::npos) break;
     cursor = next + 1;
   }
   return true;
 }
 
+static bool ReadFileContentUtf8(const std::string& path, std::string& out) {
+  const std::wstring wpath = ToWide(path);
+  HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ,
+                         FILE_SHARE_READ, nullptr,
+                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  LARGE_INTEGER size;
+  if (!GetFileSizeEx(h, &size) || size.QuadPart < 0) {
+    CloseHandle(h);
+    return false;
+  }
+  out.resize(static_cast<size_t>(size.QuadPart));
+  DWORD totalRead = 0;
+  while (totalRead < static_cast<DWORD>(out.size())) {
+    DWORD chunk = 0;
+    if (!ReadFile(h, &out[totalRead],
+                  static_cast<DWORD>(out.size()) - totalRead,
+                  &chunk, nullptr)) {
+      CloseHandle(h);
+      return false;
+    }
+    if (chunk == 0) break;
+    totalRead += chunk;
+  }
+  out.resize(totalRead);
+  CloseHandle(h);
+  return true;
+}
+
+static bool WriteFileContentUtf8(const std::string& path,
+                                 const std::string& content) {
+  const std::wstring wpath = ToWide(path);
+  HANDLE h = CreateFileW(wpath.c_str(), GENERIC_WRITE,
+                         0, nullptr,
+                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  DWORD written = 0;
+  BOOL ok = WriteFile(h, content.data(),
+                      static_cast<DWORD>(content.size()),
+                      &written, nullptr);
+  CloseHandle(h);
+  return ok && written == content.size();
+}
+
+static bool AppendFileContentUtf8(const std::string& path,
+                                  const std::string& content) {
+  const std::wstring wpath = ToWide(path);
+  HANDLE h = CreateFileW(wpath.c_str(), FILE_APPEND_DATA,
+                         FILE_SHARE_READ, nullptr,
+                         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  DWORD written = 0;
+  const BOOL ok = WriteFile(h, content.data(),
+                            static_cast<DWORD>(content.size()),
+                            &written, nullptr);
+  CloseHandle(h);
+  return ok && written == content.size();
+}
+
 void WriteTextFile(const std::string& path, const std::string& content) {
   EnsureDirectoryRecursive(path.substr(0, path.find_last_of("\\/")));
-  std::ofstream output(path, std::ios::binary | std::ios::trunc);
-  if (output) output << content;
+  WriteFileContentUtf8(path, content);
 }
 
 bool WriteBinaryFile(const std::string& path, const std::string& content) {
   EnsureDirectoryRecursive(path.substr(0, path.find_last_of("\\/")));
-  std::ofstream output(path, std::ios::binary | std::ios::trunc);
-  if (!output) {
-    return false;
-  }
-  output.write(content.data(), static_cast<std::streamsize>(content.size()));
-  return output.good();
+  return WriteFileContentUtf8(path, content);
 }
 
 std::string ReadTextFile(const std::string& path) {
-  std::ifstream input(path, std::ios::binary);
-  if (!input) return std::string();
-  std::ostringstream buffer;
-  buffer << input.rdbuf();
-  return buffer.str();
+  std::string out;
+  if (!ReadFileContentUtf8(path, out)) return std::string();
+  return out;
 }
 
 std::string EscapeField(const std::string& value) {
@@ -1911,7 +1973,10 @@ bool RestoreLegacyTextSnapshot(
 }  // namespace
 
 SessionManager::SessionManager(const std::string& sessionDir)
-    : sessionDir_(sessionDir) {}
+    : sessionDir_(sessionDir) {
+  metadata_.id = sessionDir_;
+  metadata_.startTime = TimestampNow();
+}
 
 void SessionManager::SetMessages(const std::vector<core::Message>& messages) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -1930,7 +1995,15 @@ void SessionManager::AppendMessage(const core::Message& message) {
 
 void SessionManager::SetMetadata(const core::SessionMetadata& metadata) {
   std::lock_guard<std::mutex> lock(mutex_);
-  metadata_ = metadata;
+  core::SessionMetadata merged = metadata;
+  if (merged.id.empty()) {
+    merged.id = metadata_.id.empty() ? sessionDir_ : metadata_.id;
+  }
+  if (merged.startTime.empty()) {
+    merged.startTime = metadata_.startTime.empty() ? TimestampNow()
+                                                   : metadata_.startTime;
+  }
+  metadata_ = merged;
 }
 
 core::SessionMetadata SessionManager::metadata() const {
@@ -2161,26 +2234,44 @@ std::string MessageToJsonl(const core::Message& msg) {
 }  // namespace
 
 void SessionManager::AppendTranscriptLine(const std::string& jsonLine) {
-  std::lock_guard<std::mutex> lock(transcriptMutex_);
-  transcriptBuffer_.push_back(jsonLine);
-  if (transcriptBuffer_.size() >= 50) {
+  bool shouldFlush = false;
+  {
+    std::lock_guard<std::mutex> lock(transcriptMutex_);
+    transcriptBuffer_.push_back(jsonLine);
+    shouldFlush = transcriptBuffer_.size() >= 50;
+  }
+  if (shouldFlush) {
     FlushTranscriptBuffer();
   }
 }
 
+std::vector<std::string> SessionManager::DrainTranscriptBufferLocked() {
+  std::vector<std::string> drained;
+  drained.swap(transcriptBuffer_);
+  return drained;
+}
+
 void SessionManager::FlushTranscriptBuffer() {
-  std::lock_guard<std::mutex> lock(transcriptMutex_);
-  if (transcriptBuffer_.empty()) return;
+  std::vector<std::string> pendingLines;
+  {
+    std::lock_guard<std::mutex> lock(transcriptMutex_);
+    if (transcriptBuffer_.empty()) return;
+    pendingLines = DrainTranscriptBufferLocked();
+  }
 
   std::string path = TranscriptJsonlPath();
   EnsureDirectoryRecursive(sessionDir_);
-  std::ofstream out(path, std::ios::app | std::ios::binary);
-  if (!out) return;
-
-  for (const auto& line : transcriptBuffer_) {
-    out << line << "\n";
+  std::string batch;
+  for (const auto& line : pendingLines) {
+    batch += line;
+    batch.push_back('\n');
   }
-  transcriptBuffer_.clear();
+  if (!AppendFileContentUtf8(path, batch)) {
+    std::lock_guard<std::mutex> lock(transcriptMutex_);
+    transcriptBuffer_.insert(transcriptBuffer_.begin(),
+                             pendingLines.begin(),
+                             pendingLines.end());
+  }
 }
 
 void SessionManager::AppendMessageToTranscript(const core::Message& msg) {
@@ -2210,13 +2301,11 @@ void SessionManager::AppendModelIoRecord(
   const std::string path =
       kind == ModelIoLogKind::Main ? MainModelIoPath() : ValidatorModelIoPath();
   const std::string line =
-      record.dump(-1, ' ', false, json::error_handler_t::replace);
+      record.dump(-1, ' ', false, json::error_handler_t::replace) + "\n";
 
   std::lock_guard<std::mutex> lock(transcriptMutex_);
   EnsureDirectoryRecursive(sessionDir_);
-  std::ofstream out(path, std::ios::app | std::ios::binary);
-  if (!out) return;
-  out << line << "\n";
+  AppendFileContentUtf8(path, line);
 }
 
 }  // namespace infra

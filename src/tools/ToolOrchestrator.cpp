@@ -22,6 +22,7 @@ namespace {
 
 static const int kDefaultMaxResultChars = 100000;
 static const int kMaxToolResultTruncation = 400000;
+static const long long kMaxFullReadBytes = 256 * 1024;
 static const wchar_t* kWebUserAgent = L"cpp-agent/1.0";
 
 std::string JoinPath(const std::string& lhs, const std::string& rhs);
@@ -44,6 +45,11 @@ struct HttpResponse {
   std::string body;
   std::string contentType;
   std::string location;
+};
+
+struct ShellToken {
+  std::string text;
+  bool wasQuoted = false;
 };
 
 std::wstring ToWide(const std::string& text) {
@@ -84,6 +90,63 @@ std::string Trim(const std::string& value) {
   return value.substr(start, end - start);
 }
 
+std::string QuoteForPowerShellSingleQuoted(const std::string& value) {
+  std::string escaped;
+  escaped.reserve(value.size() + 2);
+  for (char ch : value) {
+    if (ch == '\'') escaped += "''";
+    else escaped.push_back(ch);
+  }
+  return "'" + escaped + "'";
+}
+
+std::vector<ShellToken> TokenizeShellCommand(const std::string& command) {
+  std::vector<ShellToken> tokens;
+  ShellToken current;
+  bool inSingle = false;
+  bool inDouble = false;
+
+  auto flush = [&]() {
+    if (!current.text.empty() || current.wasQuoted) {
+      tokens.push_back(current);
+      current = ShellToken();
+    }
+  };
+
+  for (std::size_t i = 0; i < command.size(); ++i) {
+    const char ch = command[i];
+    if (!inDouble && ch == '\'') {
+      inSingle = !inSingle;
+      current.wasQuoted = true;
+      continue;
+    }
+    if (!inSingle && ch == '"') {
+      inDouble = !inDouble;
+      current.wasQuoted = true;
+      continue;
+    }
+    if (!inSingle && !inDouble &&
+        std::isspace(static_cast<unsigned char>(ch))) {
+      flush();
+      continue;
+    }
+    if (ch == '\\' && i + 1 < command.size()) {
+      const char next = command[i + 1];
+      if ((inDouble && (next == '"' || next == '\\')) ||
+          (!inSingle && !inDouble &&
+           (next == '"' || next == '\'' || next == '\\' ||
+            std::isspace(static_cast<unsigned char>(next))))) {
+        current.text.push_back(next);
+        ++i;
+        continue;
+      }
+    }
+    current.text.push_back(ch);
+  }
+  flush();
+  return tokens;
+}
+
 bool StartsWithCaseInsensitive(const std::string& value,
                                const std::string& prefix) {
   if (value.size() < prefix.size()) return false;
@@ -100,18 +163,15 @@ std::string NormalizeWindowsShellCommand(const std::string& command) {
   const std::string trimmed = Trim(command);
   if (trimmed.empty()) return trimmed;
 
-  std::istringstream stream(trimmed);
-  std::vector<std::string> tokens;
-  std::string token;
-  while (stream >> token) tokens.push_back(token);
+  const std::vector<ShellToken> tokens = TokenizeShellCommand(trimmed);
   if (tokens.empty()) return trimmed;
-  const std::string commandName = ToLowerAscii(tokens[0]);
+  const std::string commandName = ToLowerAscii(tokens[0].text);
 
   if (commandName == "ls") {
     bool useForce = false;
     std::vector<std::string> paths;
     for (std::size_t i = 1; i < tokens.size(); ++i) {
-      const std::string& current = tokens[i];
+      const std::string& current = tokens[i].text;
       if (!current.empty() && current[0] == '-') {
         for (std::size_t j = 1; j < current.size(); ++j) {
           const char flag = static_cast<char>(
@@ -133,7 +193,65 @@ std::string NormalizeWindowsShellCommand(const std::string& command) {
     normalized << "Get-ChildItem";
     if (useForce) normalized << " -Force";
     for (const auto& path : paths) {
-      normalized << " -Path '" << path << "'";
+      normalized << " -Path " << QuoteForPowerShellSingleQuoted(path);
+    }
+    normalized << " | Select-Object Mode,LastWriteTime,Length,Name";
+    return normalized.str();
+  }
+
+  if (commandName == "dir") {
+    bool bareNames = false;
+    bool filesOnly = false;
+    bool dirsOnly = false;
+    bool recurse = false;
+    bool useForce = false;
+    std::vector<std::string> paths;
+
+    for (std::size_t i = 1; i < tokens.size(); ++i) {
+      std::string current = ToLowerAscii(tokens[i].text);
+      if (!current.empty() && (current[0] == '/' || current[0] == '-')) {
+        if (current == "/b" || current == "-b") {
+          bareNames = true;
+          continue;
+        }
+        if (current == "/s" || current == "-s") {
+          recurse = true;
+          continue;
+        }
+        if (current == "/a" || current == "-a") {
+          useForce = true;
+          continue;
+        }
+        if (current == "/a-d" || current == "-a-d" || current == "/a:-d" ||
+            current == "-a:-d") {
+          filesOnly = true;
+          continue;
+        }
+        if (current == "/ad" || current == "-ad" || current == "/a:d" ||
+            current == "-a:d" || current == "/a+d" || current == "-a+d") {
+          dirsOnly = true;
+          continue;
+        }
+        return trimmed;
+      }
+      paths.push_back(tokens[i].text);
+    }
+
+    if (filesOnly && dirsOnly) return trimmed;
+
+    std::ostringstream normalized;
+    normalized << "Get-ChildItem";
+    if (useForce) normalized << " -Force";
+    if (recurse) normalized << " -Recurse";
+    if (filesOnly) normalized << " -File";
+    if (dirsOnly) normalized << " -Directory";
+    for (const auto& path : paths) {
+      normalized << " -Path " << QuoteForPowerShellSingleQuoted(path);
+    }
+    if (bareNames) {
+      normalized << " | ForEach-Object { $_.Name }";
+    } else {
+      normalized << " | Select-Object Mode,LastWriteTime,Length,Name";
     }
     return normalized.str();
   }
@@ -142,7 +260,8 @@ std::string NormalizeWindowsShellCommand(const std::string& command) {
     std::ostringstream normalized;
     normalized << "Get-Content";
     for (std::size_t i = 1; i < tokens.size(); ++i) {
-      normalized << " '" << tokens[i] << "'";
+      normalized << " "
+                 << QuoteForPowerShellSingleQuoted(tokens[i].text);
     }
     return normalized.str();
   }
@@ -151,16 +270,17 @@ std::string NormalizeWindowsShellCommand(const std::string& command) {
     std::string count = "10";
     std::string target;
     for (std::size_t i = 1; i < tokens.size(); ++i) {
-      if ((tokens[i] == "-n" || tokens[i] == "--lines") &&
+      if ((tokens[i].text == "-n" || tokens[i].text == "--lines") &&
           i + 1 < tokens.size()) {
-        count = tokens[i + 1];
+        count = tokens[i + 1].text;
         ++i;
       } else {
-        target = tokens[i];
+        target = tokens[i].text;
       }
     }
     if (!target.empty()) {
-      return "Get-Content '" + target + "' -TotalCount " + count;
+      return "Get-Content " + QuoteForPowerShellSingleQuoted(target) +
+             " -TotalCount " + count;
     }
   }
 
@@ -168,36 +288,97 @@ std::string NormalizeWindowsShellCommand(const std::string& command) {
     std::string count = "10";
     std::string target;
     for (std::size_t i = 1; i < tokens.size(); ++i) {
-      if ((tokens[i] == "-n" || tokens[i] == "--lines") &&
+      if ((tokens[i].text == "-n" || tokens[i].text == "--lines") &&
           i + 1 < tokens.size()) {
-        count = tokens[i + 1];
+        count = tokens[i + 1].text;
         ++i;
       } else {
-        target = tokens[i];
+        target = tokens[i].text;
       }
     }
     if (!target.empty()) {
-      return "Get-Content '" + target + "' -Tail " + count;
+      return "Get-Content " + QuoteForPowerShellSingleQuoted(target) +
+             " -Tail " + count;
     }
   }
 
   if (commandName == "wc" && tokens.size() >= 2) {
-    if (tokens[1] == "-l" && tokens.size() >= 3) {
-      return "(Get-Content '" + tokens[2] + "' | Measure-Object -Line).Lines";
+    if (tokens[1].text == "-l" && tokens.size() >= 3) {
+      return "(Get-Content " + QuoteForPowerShellSingleQuoted(tokens[2].text) +
+             " | Measure-Object -Line).Lines";
     }
   }
 
   if (commandName == "touch" && tokens.size() >= 2) {
-    return "New-Item -ItemType File -Force -Path '" + tokens[1] +
-           "' | Out-Null";
+    return "New-Item -ItemType File -Force -Path " +
+           QuoteForPowerShellSingleQuoted(tokens[1].text) + " | Out-Null";
+  }
+
+  // P1-02: Handle mkdir / mkdir -p
+  if (commandName == "mkdir" && tokens.size() >= 2) {
+    bool recursive = false;
+    std::vector<ShellToken> paths;
+    for (std::size_t i = 1; i < tokens.size(); ++i) {
+      const std::string& current = tokens[i].text;
+      if (current == "-p" || current == "--parents") {
+        recursive = true;
+        continue;
+      }
+      if (!current.empty() && current[0] == '-') continue;
+      paths.push_back(tokens[i]);
+    }
+    if (paths.empty()) return trimmed;
+    std::vector<std::string> expandedPaths;
+    for (const auto& pathToken : paths) {
+      const std::string& path = pathToken.text;
+      std::size_t braceStart = path.find('{');
+      std::size_t braceEnd = path.find('}');
+      if (pathToken.wasQuoted || braceStart == std::string::npos ||
+          braceEnd == std::string::npos || braceEnd <= braceStart) {
+        expandedPaths.push_back(path);
+        continue;
+      }
+      bool expandedAny = false;
+      const std::string prefix = path.substr(0, braceStart);
+      const std::string suffix = path.substr(braceEnd + 1);
+      const std::string braceContent =
+          path.substr(braceStart + 1, braceEnd - braceStart - 1);
+      std::size_t commaPos = 0;
+      std::size_t searchStart = 0;
+      while (true) {
+        commaPos = braceContent.find(',', searchStart);
+        std::string part = braceContent.substr(
+            searchStart, commaPos == std::string::npos
+                             ? std::string::npos
+                             : commaPos - searchStart);
+        part = Trim(part);
+        if (!part.empty()) {
+          expandedPaths.push_back(prefix + part + suffix);
+          expandedAny = true;
+        }
+        if (commaPos == std::string::npos) break;
+        searchStart = commaPos + 1;
+      }
+      if (!expandedAny) expandedPaths.push_back(path);
+    }
+    std::ostringstream normalized;
+    normalized << "New-Item -ItemType Directory";
+    if (recursive) normalized << " -Force";
+    for (const auto& path : expandedPaths) {
+      normalized << " -Path " << QuoteForPowerShellSingleQuoted(path);
+    }
+    return normalized.str();
   }
 
   if (commandName == "find" && tokens.size() >= 2) {
-    return "Get-ChildItem -Recurse -Name '" + tokens[1] + "'";
+    return "Get-ChildItem -Recurse -Name " +
+           QuoteForPowerShellSingleQuoted(tokens[1].text);
   }
 
   if (commandName == "grep" && tokens.size() >= 3) {
-    return "Select-String -Pattern '" + tokens[1] + "' -Path '" + tokens[2] + "'";
+    return "Select-String -Pattern " +
+           QuoteForPowerShellSingleQuoted(tokens[1].text) + " -Path " +
+           QuoteForPowerShellSingleQuoted(tokens[2].text);
   }
 
   return trimmed;
@@ -794,6 +975,19 @@ bool JsonGetBool(const std::string& jsonStr,
   return fallback;
 }
 
+int JsonGetInt(const std::string& jsonStr,
+               const std::string& key,
+               int fallback = 0) {
+  try {
+    json parsed = json::parse(jsonStr);
+    if (parsed.contains(key) && parsed[key].is_number_integer()) {
+      return parsed[key].get<int>();
+    }
+  } catch (...) {
+  }
+  return fallback;
+}
+
 std::string GetStateRootForTools(const std::string& workspaceRoot) {
   if (!workspaceRoot.empty()) {
     return JoinPath(workspaceRoot, ".cpp-agent");
@@ -976,19 +1170,85 @@ struct FileEntry {
   long long size = 0;
 };
 
-std::vector<FileEntry> GlobFiles(const std::string& directory,
-                                 const std::string& pattern) {
-  std::vector<FileEntry> entries;
-  std::string searchPath = directory;
-  if (!searchPath.empty() && searchPath.back() != '\\') {
-    searchPath.push_back('\\');
+bool WildcardMatch(const std::string& text, const std::string& pattern);
+
+bool GlobSegmentHasWildcard(const std::string& segment) {
+  return segment == "**" ||
+         segment.find('*') != std::string::npos ||
+         segment.find('?') != std::string::npos;
+}
+
+std::string NormalizeGlobPattern(std::string pattern) {
+  for (std::size_t i = 0; i < pattern.size(); ++i) {
+    if (pattern[i] == '\\') pattern[i] = '/';
   }
-  searchPath += pattern;
+  std::string normalized;
+  normalized.reserve(pattern.size());
+  bool previousSlash = false;
+  for (char ch : pattern) {
+    if (ch == '/') {
+      if (!previousSlash) normalized.push_back(ch);
+      previousSlash = true;
+    } else {
+      normalized.push_back(ch);
+      previousSlash = false;
+    }
+  }
+  return normalized;
+}
+
+std::vector<std::string> SplitGlobSegments(const std::string& path) {
+  std::vector<std::string> segments;
+  std::size_t start = 0;
+  while (start < path.size()) {
+    std::size_t slash = path.find('/', start);
+    std::string segment =
+        slash == std::string::npos ? path.substr(start)
+                                   : path.substr(start, slash - start);
+    if (!segment.empty()) segments.push_back(segment);
+    if (slash == std::string::npos) break;
+    start = slash + 1;
+  }
+  return segments;
+}
+
+bool MatchGlobSegments(const std::vector<std::string>& pathSegments,
+                       std::size_t pathIndex,
+                       const std::vector<std::string>& patternSegments,
+                       std::size_t patternIndex) {
+  if (patternIndex == patternSegments.size()) {
+    return pathIndex == pathSegments.size();
+  }
+  if (patternSegments[patternIndex] == "**") {
+    if (MatchGlobSegments(
+            pathSegments, pathIndex, patternSegments, patternIndex + 1)) {
+      return true;
+    }
+    return pathIndex < pathSegments.size() &&
+           MatchGlobSegments(
+               pathSegments, pathIndex + 1, patternSegments, patternIndex);
+  }
+  if (pathIndex >= pathSegments.size()) return false;
+  if (!WildcardMatch(pathSegments[pathIndex], patternSegments[patternIndex])) {
+    return false;
+  }
+  return MatchGlobSegments(
+      pathSegments, pathIndex + 1, patternSegments, patternIndex + 1);
+}
+
+void CollectGlobEntriesRecursive(const std::string& rootDirectory,
+                                 const std::string& relativeDirectory,
+                                 std::vector<FileEntry>* entries) {
+  if (entries == nullptr) return;
+  const std::string searchDirectory = relativeDirectory.empty()
+      ? rootDirectory
+      : JoinPath(rootDirectory, NormalizeSeparators(relativeDirectory));
+  std::string searchPath = EnsureTrailingSeparator(searchDirectory) + "*";
 
   WIN32_FIND_DATAW findData;
   HANDLE findHandle = FindFirstFileW(ToWide(searchPath).c_str(), &findData);
   if (findHandle == INVALID_HANDLE_VALUE) {
-    return entries;
+    return;
   }
 
   do {
@@ -997,16 +1257,77 @@ std::vector<FileEntry> GlobFiles(const std::string& directory,
       continue;
     }
     FileEntry entry;
-    entry.name = name;
-    entry.isDirectory = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    entry.name = relativeDirectory.empty() ? name : relativeDirectory + "/" + name;
+    entry.isDirectory =
+        (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     LARGE_INTEGER size;
     size.LowPart = findData.nFileSizeLow;
     size.HighPart = findData.nFileSizeHigh;
     entry.size = size.QuadPart;
-    entries.push_back(entry);
+    entries->push_back(entry);
+    if (entry.isDirectory) {
+      CollectGlobEntriesRecursive(rootDirectory, entry.name, entries);
+    }
   } while (FindNextFileW(findHandle, &findData));
 
   FindClose(findHandle);
+}
+
+std::vector<FileEntry> GlobFiles(const std::string& directory,
+                                 const std::string& pattern) {
+  std::vector<FileEntry> entries;
+  const std::string normalizedPattern = NormalizeGlobPattern(pattern);
+  const std::vector<std::string> allPatternSegments =
+      SplitGlobSegments(normalizedPattern);
+  if (allPatternSegments.empty()) return entries;
+
+  std::size_t prefixCount = 0;
+  while (prefixCount < allPatternSegments.size() &&
+         !GlobSegmentHasWildcard(allPatternSegments[prefixCount])) {
+    ++prefixCount;
+  }
+
+  std::string searchRoot = directory;
+  for (std::size_t i = 0; i < prefixCount; ++i) {
+    searchRoot = JoinPath(searchRoot, allPatternSegments[i]);
+  }
+  const DWORD attrs = GetFileAttributesW(ToWide(searchRoot).c_str());
+  if (attrs == INVALID_FILE_ATTRIBUTES) {
+    return entries;
+  }
+  if (prefixCount == allPatternSegments.size()) {
+    FileEntry entry;
+    entry.name = allPatternSegments.back();
+    entry.isDirectory = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    LARGE_INTEGER size;
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    ZeroMemory(&data, sizeof(data));
+    if (GetFileAttributesExW(
+            ToWide(searchRoot).c_str(), GetFileExInfoStandard, &data)) {
+      size.LowPart = data.nFileSizeLow;
+      size.HighPart = data.nFileSizeHigh;
+    } else {
+      size.LowPart = 0;
+      size.HighPart = 0;
+    }
+    entry.size = size.QuadPart;
+    entries.push_back(entry);
+    return entries;
+  }
+
+  std::vector<std::string> remainingPatternSegments(
+      allPatternSegments.begin() + static_cast<std::ptrdiff_t>(prefixCount),
+      allPatternSegments.end());
+  std::vector<FileEntry> candidates;
+  CollectGlobEntriesRecursive(searchRoot, std::string(), &candidates);
+  for (const auto& candidate : candidates) {
+    const std::vector<std::string> candidateSegments =
+        SplitGlobSegments(candidate.name);
+    if (MatchGlobSegments(
+            candidateSegments, 0, remainingPatternSegments, 0)) {
+      entries.push_back(candidate);
+    }
+  }
   return entries;
 }
 
@@ -1360,6 +1681,39 @@ std::string ToolOrchestrator::ExecuteFileRead(const std::string& inputJson,
     return TruncateResult(listing.str(), maxResultSize);
   }
 
+  const int offset = JsonGetInt(inputJson, "offset", 0);
+  const int limit = JsonGetInt(inputJson, "limit", 0);
+  if (offset < 0) {
+    if (error) *error = "Read tool offset must be >= 0";
+    return "Error: Read tool offset must be >= 0";
+  }
+  if (limit < 0) {
+    if (error) *error = "Read tool limit must be >= 0";
+    return "Error: Read tool limit must be >= 0";
+  }
+  if (offset == 0 && limit == 0 && attrs != INVALID_FILE_ATTRIBUTES) {
+    LARGE_INTEGER size;
+    size.QuadPart = 0;
+    HANDLE sizeHandle = CreateFileW(ToWide(filePath).c_str(), GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                        FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (sizeHandle != INVALID_HANDLE_VALUE) {
+      if (GetFileSizeEx(sizeHandle, &size) && size.QuadPart > kMaxFullReadBytes) {
+        CloseHandle(sizeHandle);
+        std::ostringstream oversized;
+        oversized << "Error: file too large to read in full (" << size.QuadPart
+                  << " bytes): " << filePath
+                  << ". Use Read with offset/limit to inspect a targeted line "
+                     "range, or use Grep to search first.";
+        if (error) *error = oversized.str();
+        return oversized.str();
+      }
+      CloseHandle(sizeHandle);
+    }
+  }
+
   std::string readErr;
   std::string content = ReadFileContent(filePath, &readErr);
   if (content.empty() && !readErr.empty()) {
@@ -1367,9 +1721,53 @@ std::string ToolOrchestrator::ExecuteFileRead(const std::string& inputJson,
     return "Error: " + readErr;
   }
 
+  const std::string normalized = NormalizeLineEndings(content);
+  if (offset > 0 || limit > 0) {
+    std::vector<std::string> lines;
+    std::size_t start = 0;
+    while (start <= normalized.size()) {
+      const std::size_t next = normalized.find('\n', start);
+      if (next == std::string::npos) {
+        lines.push_back(normalized.substr(start));
+        break;
+      }
+      lines.push_back(normalized.substr(start, next - start));
+      start = next + 1;
+      if (start == normalized.size()) {
+        lines.push_back(std::string());
+        break;
+      }
+    }
+
+    const int startLine = std::max(1, offset == 0 ? 1 : offset);
+    const int lastLine = limit > 0
+                             ? std::min(static_cast<int>(lines.size()),
+                                        startLine + limit - 1)
+                             : static_cast<int>(lines.size());
+
+    std::ostringstream output;
+    output << "<file path=\"" << filePath << "\"";
+    output << " start_line=\"" << startLine << "\"";
+    if (limit > 0) {
+      output << " line_count=\"" << std::max(0, lastLine - startLine + 1)
+             << "\"";
+    }
+    output << ">\n";
+    if (startLine > static_cast<int>(lines.size())) {
+      output << "(requested range is beyond end of file)\n";
+    } else {
+      for (int line = startLine; line <= lastLine; ++line) {
+        output << line << "->" << lines[static_cast<std::size_t>(line - 1)]
+               << "\n";
+      }
+    }
+    output << "</file>";
+    return TruncateResult(output.str(), maxResultSize);
+  }
+
   std::ostringstream output;
   output << "<file path=\"" << filePath << "\">\n";
-  output << NormalizeLineEndings(content);
+  output << normalized;
   if (!content.empty() && content.back() != '\n') {
     output << "\n";
   }
@@ -1576,8 +1974,10 @@ ToolOrchestrator::ExecuteResult ToolOrchestrator::Execute(
             block.asToolUse.id,
             "Tool requires confirmation in non-interactive skeleton mode: " +
                 decision.reason,
-            false));
+            true));
         result.userMessages.push_back(askMsg);
+        result.deniedCount++;
+        result.errorCount++;
         accumulatedMessages.push_back(askMsg);
         continue;
       }

@@ -1,8 +1,10 @@
+#include "app/RuntimePolicy.h"
 #include "agents/SubAgentManager.h"
 #include "api/ModelClient.h"
 #include "api/SideQueryClient.h"
 #include "core/QueryEngine.h"
 #include "infra/SessionManager.h"
+#include "mcp/McpClientManager.h"
 #include "memory/MemoryIndex.h"
 #include "permissions/PermissionEngine.h"
 #include "tools/ToolOrchestrator.h"
@@ -30,8 +32,18 @@ std::string JoinPath(const std::string& lhs, const std::string& rhs) {
   return lhs + "\\" + rhs;
 }
 
+std::wstring Utf8ToWide(const std::string& text) {
+  if (text.empty()) return std::wstring();
+  const int len = MultiByteToWideChar(
+      CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
+  std::wstring wide(static_cast<std::size_t>(len), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                      &wide[0], len);
+  return wide;
+}
+
 bool DirectoryExists(const std::string& path) {
-  DWORD attrs = GetFileAttributesA(path.c_str());
+  DWORD attrs = GetFileAttributesW(Utf8ToWide(path).c_str());
   return attrs != INVALID_FILE_ATTRIBUTES &&
          (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
@@ -46,15 +58,38 @@ bool EnsureDirectoryRecursive(const std::string& path) {
       if (!EnsureDirectoryRecursive(parent)) return false;
     }
   }
-  return CreateDirectoryA(path.c_str(), nullptr) ||
+  const std::wstring widePath = Utf8ToWide(path);
+  return CreateDirectoryW(widePath.c_str(), nullptr) ||
          GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
 std::string ReadAllText(const std::string& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) return std::string();
-  return std::string((std::istreambuf_iterator<char>(in)),
-                     std::istreambuf_iterator<char>());
+  const std::wstring widePath = Utf8ToWide(path);
+  HANDLE h = CreateFileW(widePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                         nullptr);
+  if (h == INVALID_HANDLE_VALUE) return std::string();
+  LARGE_INTEGER size;
+  if (!GetFileSizeEx(h, &size) || size.QuadPart < 0) {
+    CloseHandle(h);
+    return std::string();
+  }
+  std::string content(static_cast<std::size_t>(size.QuadPart), '\0');
+  DWORD totalRead = 0;
+  while (totalRead < content.size()) {
+    DWORD chunk = 0;
+    if (!ReadFile(h, &content[totalRead],
+                  static_cast<DWORD>(content.size() - totalRead),
+                  &chunk, nullptr)) {
+      CloseHandle(h);
+      return std::string();
+    }
+    if (chunk == 0) break;
+    totalRead += chunk;
+  }
+  CloseHandle(h);
+  content.resize(totalRead);
+  return content;
 }
 
 std::string GetEnvOrDefault(const char* name, const std::string& fallback) {
@@ -64,8 +99,30 @@ std::string GetEnvOrDefault(const char* name, const std::string& fallback) {
   return std::string(buffer, len);
 }
 
+int GetEnvIntOrDefault(const char* name, int fallback) {
+  const std::string value = GetEnvOrDefault(name, std::string());
+  if (value.empty()) return fallback;
+  char* end = nullptr;
+  const long parsed = std::strtol(value.c_str(), &end, 10);
+  if (end == value.c_str() || (end != nullptr && *end != '\0') || parsed <= 0) {
+    return fallback;
+  }
+  return static_cast<int>(parsed);
+}
+
 // #region debug-point A:runner-debug-env
 void LoadDebugEnvIntoProcess() {
+  char enabled[16] = {0};
+  DWORD enabledLen = GetEnvironmentVariableA(
+      "CPP_AGENT_ENABLE_DEBUG_SERVER", enabled, sizeof(enabled));
+  const std::string enabledValue =
+      enabledLen > 0 && enabledLen < sizeof(enabled)
+          ? std::string(enabled, enabledLen)
+          : std::string();
+  if (enabledValue != "1" && enabledValue != "true" &&
+      enabledValue != "TRUE") {
+    return;
+  }
   std::ifstream in(".dbg\\stream-response-stall.env", std::ios::binary);
   if (!in) return;
   std::string line;
@@ -94,18 +151,6 @@ int ExtractTurnCount(const std::string& snapshot) {
   }
   if (valueEnd == valueStart) return -1;
   return std::atoi(snapshot.substr(valueStart, valueEnd - valueStart).c_str());
-}
-
-std::string BuildSystemPrompt(const std::string& workspaceRoot) {
-  std::ostringstream prompt;
-  prompt
-      << "You are a helpful coding agent. Use the available tools to inspect "
-      << "code, explain findings, and make careful changes when requested. "
-      << "The trusted workspace root is `" << workspaceRoot << "`. "
-      << "Treat relative file paths as paths inside this workspace. "
-      << "If inspection, tests, or file changes are required, use tools to do "
-      << "real work instead of only describing a plan.";
-  return prompt.str();
 }
 
 }  // namespace
@@ -145,7 +190,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   std::cout << "directories_ready=true" << std::endl;
-  SetCurrentDirectoryA(workspaceRoot.c_str());
+  SetCurrentDirectoryW(Utf8ToWide(workspaceRoot).c_str());
 
   agent::core::LlmConfig llmCfg;
   llmCfg.apiEndpoint = GetEnvOrDefault(
@@ -169,7 +214,7 @@ int main(int argc, char** argv) {
   agent::permissions::PermissionEngine permissionEngine;
   agent::infra::SessionManager sessionManager(sessionDir);
 
-  for (const auto& tool : agent::tools::ToolRegistry::GetAllBaseTools()) {
+  for (const auto& tool : agent::app::GetSessionBaseTools(false)) {
     toolRegistry.RegisterTool(tool);
     permissionEngine.AddAlwaysAllowRule(tool.name);
     permissionEngine.AddAutoModeAllowlistedTool(tool.name);
@@ -183,51 +228,130 @@ int main(int argc, char** argv) {
   subAgentManager.SetMemoryIndex(&memoryIndex);
 
   agent::core::AgentConfig config = agent::core::AgentConfig::FromDefaults();
-  config.systemPrompt = BuildSystemPrompt(workspaceRoot);
+  config.systemPrompt =
+      agent::app::BuildWorkspaceSystemPrompt(workspaceRoot, true);
   config.defaultModel = llmCfg.mainModel;
   config.memoryRoot = memoryDir;
   config.sessionDir = sessionDir;
+  std::cout << "configured_prompt_has_workspace_first="
+            << (config.systemPrompt.find(
+                    "MUST first explore the workspace with Glob, Grep, or Read tools") !=
+                std::string::npos
+                    ? "true"
+                    : "false")
+            << std::endl;
+  std::cout << "configured_prompt_has_powershell="
+            << (config.systemPrompt.find("PowerShell, not bash") !=
+                        std::string::npos
+                    ? "true"
+                    : "false")
+            << std::endl;
 
   agent::core::QueryEngine engine(
       toolOrchestrator, permissionEngine, httpClient, sideQueryClient,
       toolRegistry, sessionManager);
   engine.SetConfig(config);
+  engine.SetSystemPrompt(config.systemPrompt);
   engine.SetModel(llmCfg.mainModel);
   engine.SetFallbackModel(llmCfg.fallbackModel);
   engine.SetValidatorModel(llmCfg.validatorModel);
   engine.SetMemoryIndex(&memoryIndex);
   engine.SetSubAgentManager(&subAgentManager);
   engine.SetSessionDir(sessionDir);
-  engine.SetMaxTurns(30);
+  const int runnerMaxTurns =
+      GetEnvIntOrDefault("CPP_AGENT_RUNNER_MAX_TURNS", 80);
+  const int runnerWallClockBudgetMs = GetEnvIntOrDefault(
+      "CPP_AGENT_RUNNER_WALL_CLOCK_BUDGET_MS", 10 * 60 * 1000);
+  const int runnerMaxSegments =
+      GetEnvIntOrDefault("CPP_AGENT_RUNNER_MAX_SEGMENTS", 4);
+  engine.SetMaxTurns(runnerMaxTurns);
+  engine.SetWallClockBudgetMs(runnerWallClockBudgetMs);
+  std::cout << "configured_max_turns=" << runnerMaxTurns << std::endl;
+  std::cout << "configured_wall_clock_budget_ms=" << runnerWallClockBudgetMs
+            << std::endl;
+  std::cout << "configured_max_segments=" << runnerMaxSegments << std::endl;
+  int assistantEventCount = 0;
+  int toolResultEventCount = 0;
+  std::string lastTerminalReason;
+  engine.SetEventCallback([&](const agent::core::QueryLoopEvent& event) {
+    if (event.type == agent::core::QueryLoopEvent::Type::StageChanged) {
+      std::cout << "stage=" << static_cast<int>(event.stage) << std::endl;
+      return;
+    }
+    if (event.type == agent::core::QueryLoopEvent::Type::ToolResult) {
+      ++toolResultEventCount;
+      return;
+    }
+    if (event.type == agent::core::QueryLoopEvent::Type::AssistantMessage) {
+      ++assistantEventCount;
+      return;
+    }
+    if (event.type == agent::core::QueryLoopEvent::Type::LoopCompleted) {
+      lastTerminalReason = event.terminalReason;
+      std::cout << "loop_completed_reason=" << event.terminalReason << std::endl;
+    }
+  });
 
   std::cout << "submitting_prompt=true" << std::endl;
   engine.SubmitUserPrompt(prompt);
-  std::cout << "running_turn=true" << std::endl;
-  // #region debug-point E:runner-heartbeat
-  std::atomic<bool> runCompleted(false);
-  std::thread heartbeat([&]() {
-    int beat = 0;
-    while (!runCompleted.load()) {
-      Sleep(5000);
-      if (runCompleted.load()) break;
-      std::cout << "runner_heartbeat=" << (++beat) << std::endl;
+  bool ok = true;
+  int segmentCount = 0;
+  int heartbeatBase = 0;
+  while (segmentCount < runnerMaxSegments) {
+    ++segmentCount;
+    std::cout << "running_turn=true" << std::endl;
+    std::cout << "running_turn_segment=" << segmentCount << std::endl;
+    lastTerminalReason.clear();
+    // #region debug-point E:runner-heartbeat
+    std::atomic<bool> runCompleted(false);
+    std::thread heartbeat([&]() {
+      int beat = heartbeatBase;
+      while (!runCompleted.load()) {
+        Sleep(5000);
+        if (runCompleted.load()) break;
+        std::cout << "runner_heartbeat=" << (++beat) << std::endl;
+      }
+      heartbeatBase = beat;
+    });
+    // #endregion
+    const bool segmentOk = engine.RunTurnWithRecovery();
+    runCompleted.store(true);
+    if (heartbeat.joinable()) heartbeat.join();
+    ok = ok && segmentOk;
+    if (!segmentOk) break;
+    if (lastTerminalReason != "wall_clock_budget_exceeded") break;
+    if (segmentCount >= runnerMaxSegments) {
+      std::cout << "runner_segment_limit_reached=true" << std::endl;
+      break;
     }
-  });
-  // #endregion
-  const bool ok = engine.RunTurnWithRecovery();
-  runCompleted.store(true);
-  if (heartbeat.joinable()) heartbeat.join();
+    const bool prepared = engine.PrepareForContinuationAfterWallClockTimeout();
+    std::cout << "continuing_after_wall_clock="
+              << (prepared ? "true" : "false") << std::endl;
+    if (!prepared) break;
+  }
   std::cout << "run_finished=true" << std::endl;
   sessionManager.FlushTranscriptBuffer();
+  sessionManager.SetMessages(engine.messages());
+  sessionManager.PersistSnapshot();
+  std::cout << "effective_prompt_has_workspace_first="
+            << (engine.loopContext().systemPrompt.find(
+                    "MUST first explore the workspace with Glob, Grep, or Read tools") !=
+                std::string::npos
+                    ? "true"
+                    : "false")
+            << std::endl;
+  std::cout << "assistant_event_count=" << assistantEventCount << std::endl;
+  std::cout << "tool_result_event_count=" << toolResultEventCount << std::endl;
 
-  const std::string snapshot = ReadAllText(sessionManager.SnapshotPath());
+  const std::string snapshot = ReadAllText(sessionManager.LegacySnapshotPath());
   const std::string transcript = ReadAllText(sessionManager.TranscriptJsonlPath());
   const int turnCount = ExtractTurnCount(snapshot);
 
   std::cout << "run_ok=" << (ok ? "true" : "false") << "\n";
   std::cout << "workspace=" << workspaceRoot << "\n";
   std::cout << "session_dir=" << sessionDir << "\n";
-  std::cout << "snapshot_path=" << sessionManager.SnapshotPath() << "\n";
+  std::cout << "snapshot_path=" << sessionManager.LegacySnapshotPath() << "\n";
+  std::cout << "snapshot_pb_path=" << sessionManager.SnapshotPath() << "\n";
   std::cout << "transcript_path=" << sessionManager.TranscriptJsonlPath() << "\n";
   std::cout << "turn_count=" << turnCount << "\n";
   std::cout << "message_count=" << engine.messages().size() << "\n";

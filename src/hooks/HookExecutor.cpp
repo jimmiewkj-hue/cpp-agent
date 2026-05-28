@@ -250,7 +250,6 @@ HookBatchResult HookExecutor::RunHooksForEvent(
   if (!config_->IsWorkspaceTrusted()) return batch;
 
   auto matchedHooks = config_->GetMatchingHooks(event, input, matchQuery);
-  if (matchedHooks.empty()) return batch;
 
   auto startTime = std::chrono::steady_clock::now();
 
@@ -314,7 +313,21 @@ HookBatchResult HookExecutor::RunHooksForEvent(
     if (static_cast<int>(sh.first) == static_cast<int>(event) && sh.second) {
       HookResult r = sh.second(input, toolUseID);
       batch.results.push_back(r);
-      if (r.outcome == HookOutcome::Success) ++batch.numSuccess;
+      switch (r.outcome) {
+        case HookOutcome::Success:
+          ++batch.numSuccess;
+          break;
+        case HookOutcome::Blocking:
+          ++batch.numBlocking;
+          break;
+        case HookOutcome::NonBlockingError:
+          ++batch.numNonBlockingError;
+          break;
+        case HookOutcome::Cancelled:
+          ++batch.numCancelled;
+          break;
+      }
+      if (r.outcome == HookOutcome::Blocking) break;
     }
   }
 

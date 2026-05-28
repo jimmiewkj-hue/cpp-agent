@@ -23,23 +23,23 @@ std::vector<ToolSchema> ToolRegistry::GetAllBaseTools() {
   {
     ToolSchema t;
     t.name = "Read";
-    t.description = "Read a file from the filesystem; relative paths resolve from the trusted workspace root";
-    t.inputSchemaJson = R"({"type":"object","properties":{"file_path":{"type":"string","description":"Path to the file. Use an absolute path for files outside the current workspace."}},"required":["file_path"]})";
+    t.description = "Read a file from the filesystem; relative paths resolve from the trusted workspace root. Use offset/limit to read a targeted line range from large files.";
+    t.inputSchemaJson = R"({"type":"object","properties":{"file_path":{"type":"string","description":"Path to the file. Use an absolute path for files outside the current workspace."},"offset":{"type":"integer","minimum":0,"description":"Optional 1-based start line for partial reads."},"limit":{"type":"integer","minimum":0,"description":"Optional number of lines to return starting at offset."}},"required":["file_path"]})";
     t.category = ToolExecCategory::ReadOnly;
     t.readOnlyHint = true;
     t.destructiveHint = false;
-    t.maxResultSizeChars = 0;
+    t.maxResultSizeChars = 100000;
     tools.push_back(t);
   }
   {
     ToolSchema t;
     t.name = "FileRead";
-    t.description = "Read a file from the filesystem; relative paths resolve from the trusted workspace root";
-    t.inputSchemaJson = R"({"type":"object","properties":{"file_path":{"type":"string","description":"Path to the file. Use an absolute path for files outside the current workspace."}},"required":["file_path"]})";
+    t.description = "Read a file from the filesystem; relative paths resolve from the trusted workspace root. Use offset/limit to read a targeted line range from large files.";
+    t.inputSchemaJson = R"({"type":"object","properties":{"file_path":{"type":"string","description":"Path to the file. Use an absolute path for files outside the current workspace."},"offset":{"type":"integer","minimum":0,"description":"Optional 1-based start line for partial reads."},"limit":{"type":"integer","minimum":0,"description":"Optional number of lines to return starting at offset."}},"required":["file_path"]})";
     t.category = ToolExecCategory::ReadOnly;
     t.readOnlyHint = true;
     t.destructiveHint = false;
-    t.maxResultSizeChars = 0;
+    t.maxResultSizeChars = 100000;
     tools.push_back(t);
   }
   {

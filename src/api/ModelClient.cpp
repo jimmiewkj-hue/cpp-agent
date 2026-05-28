@@ -24,6 +24,19 @@ struct DebugServerConfig {
   std::string sessionId = "stream-response-stall";
 };
 
+bool IsTruthyEnvValue(const std::string& value) {
+  return value == "1" || value == "true" || value == "TRUE" ||
+         value == "yes" || value == "YES" || value == "on" ||
+         value == "ON";
+}
+
+std::string GetEnvString(const char* name) {
+  char buffer[512] = {0};
+  DWORD len = GetEnvironmentVariableA(name, buffer, sizeof(buffer));
+  if (len == 0 || len >= sizeof(buffer)) return std::string();
+  return std::string(buffer, len);
+}
+
 std::string TrimDebugValue(const std::string& value) {
   std::size_t start = 0;
   std::size_t end = value.size();
@@ -42,18 +55,18 @@ std::string TrimDebugValue(const std::string& value) {
 
 DebugServerConfig LoadDebugServerConfig() {
   DebugServerConfig cfg;
-  char envUrl[512] = {0};
-  DWORD envUrlLen = GetEnvironmentVariableA(
-      "DEBUG_SERVER_URL", envUrl, sizeof(envUrl));
-  if (envUrlLen > 0 && envUrlLen < sizeof(envUrl)) {
-    cfg.url.assign(envUrl, envUrlLen);
+  const std::string allowDebugServer =
+      GetEnvString("CPP_AGENT_ENABLE_DEBUG_SERVER");
+  if (!IsTruthyEnvValue(allowDebugServer)) {
+    cfg.url.clear();
+    cfg.sessionId.clear();
+    return cfg;
   }
-  char envSession[256] = {0};
-  DWORD envSessionLen = GetEnvironmentVariableA(
-      "DEBUG_SESSION_ID", envSession, sizeof(envSession));
-  if (envSessionLen > 0 && envSessionLen < sizeof(envSession)) {
-    cfg.sessionId.assign(envSession, envSessionLen);
-  }
+
+  const std::string envUrl = GetEnvString("DEBUG_SERVER_URL");
+  if (!envUrl.empty()) cfg.url = envUrl;
+  const std::string envSession = GetEnvString("DEBUG_SESSION_ID");
+  if (!envSession.empty()) cfg.sessionId = envSession;
 
   std::ifstream in(".dbg\\stream-response-stall.env", std::ios::binary);
   if (!in) return cfg;

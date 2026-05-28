@@ -103,6 +103,7 @@ class QueryEngine {
   void SetSubAgentManager(agents::SubAgentManager* subAgentManager);
   void SetStabilityWatchdog(infra::StabilityWatchdog* watchdog);
   void SetMaxTurns(int maxTurns);
+  void SetWallClockBudgetMs(long long budgetMs);
   void SetSessionDir(const std::string& sessionDir);
   void SetEventCallback(QueryLoopEventCallback callback);
   void SetHookExecutor(hooks::HookExecutor* hookExecutor);
@@ -110,6 +111,7 @@ class QueryEngine {
   void SubmitUserPrompt(const std::string& prompt);
   void RunTurn();
   bool RunTurnWithRecovery();
+  bool PrepareForContinuationAfterWallClockTimeout();
 
   const std::vector<Message>& messages() const;
   const QueryLoopContext& loopContext() const;
@@ -134,6 +136,7 @@ class QueryEngine {
   SessionMetadata metadata_;
   QueryLoopContext loopCtx_;
   int maxTurns_ = 500;
+  long long wallClockBudgetMs_ = 0;
   std::string sessionDir_;
   QueryLoopEventCallback eventCallback_;
   hooks::HookExecutor* hookExecutor_ = nullptr;

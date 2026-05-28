@@ -1,3 +1,4 @@
+#include "app/RuntimePolicy.h"
 #include "app/TuiTaskPanel.h"
 #include "core/QueryEngine.h"
 #include "core/StateTypes.h"
@@ -15,6 +16,8 @@
 #include "tools/ToolRegistry.h"
 
 #include <windows.h>
+#include <io.h>
+#include <fcntl.h>
 
 #include <algorithm>
 #include <atomic>
@@ -36,6 +39,48 @@ namespace {
 
 std::wstring Utf8ToWide(const std::string& text);
 std::string WideToUtf8(const std::wstring& text);
+
+// ===== P0-01 Fix: Unicode-aware pipe input reader =====
+// Reads raw bytes from stdin, tries UTF-8 first, falls back to ACP (GBK/936).
+std::string ReadPipedInputLineUtf8() {
+  _setmode(_fileno(stdin), _O_BINARY);
+
+  std::string rawBytes;
+  rawBytes.reserve(4096);
+  while (true) {
+    char ch = 0;
+    DWORD read = 0;
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    if (!ReadFile(h, &ch, 1, &read, nullptr) || read == 0) break;
+    if (ch == '\n') break;
+    if (ch != '\r') rawBytes.push_back(ch);
+  }
+  if (rawBytes.empty()) return std::string();
+
+  int wideLen = MultiByteToWideChar(
+      CP_UTF8, MB_ERR_INVALID_CHARS,
+      rawBytes.data(), static_cast<int>(rawBytes.size()),
+      nullptr, 0);
+  if (wideLen > 0) {
+    return rawBytes;
+  }
+
+  wideLen = MultiByteToWideChar(
+      CP_ACP, 0,
+      rawBytes.data(), static_cast<int>(rawBytes.size()),
+      nullptr, 0);
+  if (wideLen > 0) {
+    std::wstring wide(static_cast<size_t>(wideLen), L'\0');
+    MultiByteToWideChar(
+        CP_ACP, 0,
+        rawBytes.data(), static_cast<int>(rawBytes.size()),
+        &wide[0], wideLen);
+    return WideToUtf8(wide);
+  }
+
+  return rawBytes;
+}
+
 
 std::string GetEnvOrDefault(const char* name, const std::string& fallback) {
   char* value = nullptr;
@@ -892,7 +937,8 @@ class AnsiTui {
     bool isConsole = GetConsoleMode(inHandle, &consoleMode) != 0;
 
     if (!isConsole) {
-      if (!std::getline(std::cin, line)) {
+      line = ReadPipedInputLineUtf8();
+      if (line.empty()) {
         HideCursor();
         return "";
       }
@@ -1287,10 +1333,12 @@ int main() {
   agent::infra::SessionManager sessionManager(sessionDir);
   agent::infra::StabilityWatchdog watchdog(agent::infra::StabilityConfig{});
 
-  const std::vector<agent::tools::ToolSchema> baseTools =
-      agent::tools::ToolRegistry::GetAllBaseTools();
-  for (const auto& tool : baseTools)
-    toolRegistry.RegisterTool(tool);
+  // ===== P1-03: Detect non-interactive mode =====
+  DWORD stdinModeForCheck = 0;
+  const bool isInteractiveSession =
+      GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &stdinModeForCheck) != 0;
+
+  agent::app::RegisterSessionBaseTools(&toolRegistry, isInteractiveSession);
 
   const char* safeAutoTools[] = {
       "FileRead", "Read", "FileWrite", "Write", "Grep", "Glob",
@@ -1312,33 +1360,8 @@ int main() {
   subAgentManager.SetMemoryIndex(&memoryIndex);
 
   agent::core::AgentConfig config = agent::core::AgentConfig::FromDefaults();
-  std::ostringstream systemPrompt;
-  systemPrompt
-      << "You are a helpful coding agent. Use the available tools to inspect "
-      << "code, explain findings, and make careful changes when requested. ";
-  if (workspace.trusted && !workspace.trustedRoot.empty()) {
-    systemPrompt
-        << "The trusted workspace root is `" << workspace.trustedRoot << "`. "
-        << "Treat relative file paths as paths inside this workspace. "
-        << "Create and modify project files inside this workspace, not inside "
-        << "the session or memory directories unless the user explicitly asks "
-        << "you to manage session memory. "
-        << "This runtime is on Windows and shell commands execute in "
-        << "PowerShell, not bash. Prefer explicit tools such as Read, Write, "
-        << "Grep, Glob, Task*, NotebookEdit, and MCP resource tools over raw "
-        << "shell commands whenever possible. "
-        << "If the user references files outside the workspace, read them via "
-        << "an explicit absolute local path or ask the user to copy them into "
-        << "the workspace first.";
-  } else {
-    systemPrompt
-        << "No workspace is currently trusted. Do not assume relative paths "
-        << "refer to a project; use explicit absolute local paths when the "
-        << "user references files outside the current session state. "
-        << "This runtime is on Windows and shell commands execute in "
-        << "PowerShell.";
-  }
-  config.systemPrompt = systemPrompt.str();
+  config.systemPrompt = agent::app::BuildWorkspaceSystemPrompt(
+      workspace.trustedRoot, workspace.trusted);
   config.defaultModel = llmCfg.mainModel;
   config.memoryRoot = memoryDir;
   config.sessionDir = sessionDir;
@@ -1354,6 +1377,9 @@ int main() {
   engine.SetSubAgentManager(&subAgentManager);
   engine.SetSessionDir(sessionDir);
   engine.SetHookExecutor(&hookExecutor);
+  // P0-02: Conservative max turns for CLI (reduced from 500 default)
+  engine.SetMaxTurns(80);
+  engine.SetWallClockBudgetMs(10 * 60 * 1000);
 
   watchdog.Start();
   engine.SetStabilityWatchdog(&watchdog);
@@ -1372,8 +1398,42 @@ int main() {
   tuiState.taskPanel = agent::app::LoadTuiTaskPanelData(taskStorePath);
 
   AnsiTui tui(tuiState);
-  tui.Init();
+  if (isInteractiveSession) {
+    tui.Init();
+  }
   engine.SetEventCallback([&](const agent::core::QueryLoopEvent& event) {
+    if (!isInteractiveSession) {
+      // P1-03: Plain-text output for non-interactive (pipe/redirect) mode
+      switch (event.type) {
+        case agent::core::QueryLoopEvent::Type::StageChanged:
+          std::cout << "[stage] " << QueryStageLabel(event.stage) << std::endl;
+          break;
+        case agent::core::QueryLoopEvent::Type::AssistantMessage: {
+          const std::string txt = ExtractText(event.message);
+          if (!txt.empty())
+            std::cout << "[assistant] " << txt << std::endl;
+          break;
+        }
+        case agent::core::QueryLoopEvent::Type::ToolProgress: {
+          if (!event.message.content.empty() &&
+              event.message.content.front().type ==
+                  agent::core::BlockType::ToolUse) {
+            const auto& tu = event.message.content.front().asToolUse;
+            std::cout << "[tool_call] " << tu.name
+                      << " " << Shorten(tu.inputJson, 120) << std::endl;
+          }
+          break;
+        }
+        case agent::core::QueryLoopEvent::Type::ToolResult:
+          std::cout << "[tool_result] received" << std::endl;
+          break;
+        case agent::core::QueryLoopEvent::Type::LoopCompleted:
+          std::cout << "[loop_completed] " << event.terminalReason << std::endl;
+          break;
+        default: break;
+      }
+      return;
+    }
     switch (event.type) {
       case agent::core::QueryLoopEvent::Type::StageChanged:
         tui.SetLiveStage(QueryStageLabel(event.stage));
@@ -1405,19 +1465,33 @@ int main() {
     }
   });
 
-  tui.AppendMessage("Ready. Type a prompt or command.");
-  if (workspace.trusted && !workspace.trustedRoot.empty()) {
-    tui.AppendMessage("Trusted workspace: " + workspace.trustedRoot);
-  } else {
-    tui.AppendMessage(
-        "Workspace not trusted. Use absolute paths for external files.");
+  for (const auto& message : agent::app::BuildStartupMessages(
+           isInteractiveSession, workspace.trusted, workspace.trustedRoot,
+           loadedHookFiles.size())) {
+    tui.AppendMessage(message);
   }
-  if (!loadedHookFiles.empty()) {
-    tui.AppendMessage("Loaded hook config files: " +
-                      std::to_string(loadedHookFiles.size()));
+
+  // ===== P1-03: Non-interactive mode reads from stdin directly =====
+  if (!isInteractiveSession) {
+    std::string pipedLine;
+    while (true) {
+      pipedLine = ReadPipedInputLineUtf8();
+      if (pipedLine.empty()) break;
+      std::string line = Trim(pipedLine);
+      if (line.empty()) continue;
+      if (line == "/exit" || line == "/quit") break;
+      if (!line.empty() && line[0] == '/') continue;
+
+      engine.SubmitUserPrompt(line);
+      const bool ok = engine.RunTurnWithRecovery();
+      sessionManager.PersistSnapshot();
+      if (!ok) std::cout << "[error] Turn failed." << std::endl;
+    }
+    tuiState.quitRequested.store(true);
   }
 
   while (!tuiState.quitRequested.load()) {
+    if (!isInteractiveSession) break;
     tuiState.statusText = "Ready  |  /help for commands  |  Esc to quit";
     tui.RefreshStatus();
 
@@ -1654,7 +1728,11 @@ int main() {
     tuiState.running.store(false);
   }
 
-  tui.Shutdown();
+  if (isInteractiveSession) {
+    tui.Shutdown();
+  } else {
+    std::cout << "Session saved. Bye." << std::endl;
+  }
   sessionManager.PersistSnapshot();
   watchdog.Stop();
 

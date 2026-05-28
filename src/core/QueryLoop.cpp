@@ -19,6 +19,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <chrono>
 #include <sstream>
 
 using json = nlohmann::json;
@@ -331,6 +332,70 @@ bool AssistantIntendsWorkspaceWrite(const std::vector<Message>& assistantMessage
          ContainsToken(original, "写入文件");
 }
 
+bool IsExplorationToolName(const std::string& toolName) {
+  return toolName == "Read" || toolName == "FileRead" ||
+         toolName == "Grep" || toolName == "Glob" || toolName == "LS";
+}
+
+bool IsWorkspaceWriteToolName(const std::string& toolName) {
+  return toolName == "Write" || toolName == "FileWrite" ||
+         toolName == "NotebookEdit";
+}
+
+bool HasExplorationToolUse(
+    const std::vector<ContentBlock>& toolUseBlocks) {
+  for (const auto& block : toolUseBlocks) {
+    if (block.type != BlockType::ToolUse) continue;
+    if (IsExplorationToolName(block.asToolUse.name)) return true;
+  }
+  return false;
+}
+
+bool HasPriorExplorationEvidence(const std::vector<Message>& messages) {
+  for (const auto& msg : messages) {
+    for (const auto& block : msg.content) {
+      if (block.type == BlockType::ToolUse &&
+          IsExplorationToolName(block.asToolUse.name)) {
+        return true;
+      }
+      if (block.type == BlockType::ToolResult &&
+          (msg.uuid.find("tool-result-Read") != std::string::npos ||
+           msg.uuid.find("tool-result-FileRead") != std::string::npos ||
+           msg.uuid.find("tool-result-Grep") != std::string::npos ||
+           msg.uuid.find("tool-result-Glob") != std::string::npos ||
+           msg.uuid.find("tool-result-LS") != std::string::npos)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool HasWorkspaceWriteToolUse(const std::vector<ContentBlock>& toolUseBlocks) {
+  for (const auto& block : toolUseBlocks) {
+    if (block.type != BlockType::ToolUse) continue;
+    if (IsWorkspaceWriteToolName(block.asToolUse.name)) return true;
+  }
+  return false;
+}
+
+bool UserRequestedDirectCreation(const std::vector<Message>& messages) {
+  for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
+    if (it->role != MessageRole::User) continue;
+    const std::string prompt = CollectText({*it});
+    const std::string lower = ToLowerAscii(prompt);
+    return ContainsToken(lower, "create a new project") ||
+           ContainsToken(lower, "new project from scratch") ||
+           ContainsToken(lower, "start from scratch") ||
+           ContainsToken(lower, "scaffold a new project") ||
+           ContainsToken(prompt, "新建项目") ||
+           ContainsToken(prompt, "从零开始") ||
+           ContainsToken(prompt, "直接创建") ||
+           ContainsToken(prompt, "直接新建");
+  }
+  return false;
+}
+
 bool AssistantIntendsFurtherExecution(
     const std::vector<Message>& assistantMessages) {
   const std::string original = CollectText(assistantMessages);
@@ -376,7 +441,11 @@ bool AssistantIntendsFurtherExecution(
          ContainsToken(lower, "check the project") ||
          ContainsToken(lower, "inspect the project") ||
          ContainsToken(original, "让我先") ||
+         ContainsToken(original, "我先规划") ||
+         ContainsToken(original, "我先继续") ||
          ContainsToken(original, "接下来") ||
+         ContainsToken(original, "然后继续") ||
+         ContainsToken(original, "继续当前任务") ||
          ContainsToken(original, "下一步") ||
          ContainsToken(original, "我先查看") ||
          ContainsToken(original, "我先检查") ||
@@ -794,7 +863,47 @@ bool HandleMissingExpectedToolUse(QueryLoopContext& ctx,
   return true;
 }
 
+bool HandleMissingWorkspaceExploration(QueryLoopContext& ctx,
+                                       QueryLoopInternalState& state) {
+  if (state.hasPromptedForWorkspaceExploration) return false;
+  if (state.turnCount != 1) return false;
+  if (state.toolUseBlocks.empty()) return false;
+  if (!HasWorkspaceWriteToolUse(state.toolUseBlocks)) return false;
+  if (HasExplorationToolUse(state.toolUseBlocks)) return false;
+  if (HasPriorExplorationEvidence(ctx.messages)) return false;
+  if (UserRequestedDirectCreation(ctx.messages)) return false;
+
+  for (const auto& msg : state.assistantMessages)
+    ctx.messages.push_back(msg);
+  PersistMessagesToTranscript(ctx.sessionManager, state.assistantMessages);
+
+  Message nudge;
+  nudge.role = MessageRole::System;
+  nudge.uuid = "workspace-exploration-nudge";
+  nudge.isMeta = true;
+  nudge.content.push_back(ContentBlock::MakeText(
+      "Before writing project files for an analysis or modification task, "
+      "you must first inspect the existing workspace with Read, Grep, or Glob. "
+      "Do not call Write/FileWrite yet. Explore the relevant files first, then "
+      "decide what to change."));
+  ctx.messages.push_back(nudge);
+  PersistMessagesToTranscript(ctx.sessionManager, {nudge});
+
+  state.assistantMessages.clear();
+  state.toolUseBlocks.clear();
+  state.hasPromptedForWorkspaceExploration = true;
+  state.transition = TransitionReason::ForcedContinuation;
+  state.stage = QueryStage::ToolResultBudget;
+  return true;
+}
+
 }  // namespace
+
+long long CurrentTimeMs() {
+  return static_cast<long long>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count());
+}
 
 QueryLoop::QueryLoop(tools::ToolOrchestrator& toolOrchestrator,
                      permissions::PermissionEngine& permissionEngine,
@@ -806,6 +915,86 @@ QueryLoop::QueryLoop(tools::ToolOrchestrator& toolOrchestrator,
       sideQueryClient_(sideQueryClient) {}
 
 void QueryLoop::SetMaxTurns(int maxTurns) { maxTurns_ = maxTurns; }
+
+void QueryLoop::SetWallClockBudget(long long budgetMs) {
+  wallClockBudgetMs_ = budgetMs;
+}
+
+bool QueryLoop::IsWallClockExpired(QueryLoopContext& ctx) const {
+  if (wallClockBudgetMs_ <= 0) return false;
+  if (loopStartTimeMs_ <= 0) return false;
+  const long long elapsedMs = CurrentTimeMs() - loopStartTimeMs_;
+  if (elapsedMs < wallClockBudgetMs_) return false;
+
+  Message timeout;
+  timeout.role = MessageRole::System;
+  timeout.uuid = "wall-clock-timeout";
+  timeout.isMeta = true;
+  timeout.content.push_back(ContentBlock::MakeText(
+      "[system] Terminating: wall-clock budget exceeded after " +
+      std::to_string(elapsedMs) + " ms (budget " +
+      std::to_string(wallClockBudgetMs_) + " ms)."));
+  ctx.messages.push_back(timeout);
+  if (ctx.sessionManager != nullptr) {
+    ctx.sessionManager->AppendMessageToTranscript(timeout);
+  }
+  return true;
+}
+
+std::string QueryLoop::MakeToolFingerprint(const ContentBlock& block) const {
+  if (block.type != BlockType::ToolUse) return std::string();
+  std::string input = block.asToolUse.inputJson;
+  input.erase(std::remove_if(input.begin(), input.end(),
+      [](unsigned char c) { return std::isspace(c); }),
+      input.end());
+  return block.asToolUse.name + ":" + input;
+}
+
+bool QueryLoop::ShouldTerminateOnDuplicates(
+    QueryLoopContext& ctx,
+    QueryLoopInternalState& state) const {
+  std::vector<ContentBlock> currentBlocks =
+      CollectToolUseBlocks(state.assistantMessages);
+  if (currentBlocks.empty()) return false;
+
+  std::string latestFingerprint;
+  for (const auto& block : currentBlocks) {
+    std::string fp = MakeToolFingerprint(block);
+    if (!fp.empty()) {
+      if (!latestFingerprint.empty()) latestFingerprint += "|";
+      latestFingerprint += fp;
+    }
+  }
+
+  if (!latestFingerprint.empty() &&
+      !state.recentToolFingerprints.empty() &&
+      state.recentToolFingerprints.back() == latestFingerprint) {
+    state.consecutiveDuplicateToolCalls++;
+    if (state.consecutiveDuplicateToolCalls >= 3) {
+      Message terminationMsg;
+      terminationMsg.role = MessageRole::System;
+      terminationMsg.uuid = "dup-terminate";
+      terminationMsg.isMeta = true;
+      terminationMsg.content.push_back(ContentBlock::MakeText(
+          "[system] Terminating: identical tool calls detected "
+          + std::to_string(state.consecutiveDuplicateToolCalls)
+          + " consecutive times. The agent appears to be in a loop."));
+      ctx.messages.push_back(terminationMsg);
+      EmitQueryLoopEvent(ctx, QueryLoopEvent::Type::LoopCompleted,
+                         QueryStage::Completed, nullptr,
+                         "duplicate_tool_loop");
+      return true;
+    }
+  } else {
+    state.consecutiveDuplicateToolCalls = 1;
+  }
+
+  state.recentToolFingerprints.push_back(latestFingerprint);
+  if (state.recentToolFingerprints.size() > 10)
+    state.recentToolFingerprints.erase(state.recentToolFingerprints.begin());
+
+  return false;
+}
 
 std::vector<Message> QueryLoop::BuildMessagesForTurn(
     const QueryLoopContext& ctx,
@@ -987,12 +1176,6 @@ bool QueryLoop::IsPromptTooLong(const Message& msg) {
   return false;
 }
 
-long long CurrentTimeMs() {
-  return static_cast<long long>(
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::system_clock::now().time_since_epoch()).count());
-}
-
 void QueryLoop::ApplyStepBudget(QueryLoopContext& ctx,
                                 QueryLoopInternalState& state) {
   for (auto& msg : state.messagesForTurn) {
@@ -1054,22 +1237,69 @@ void QueryLoop::ApplyStepSnip(QueryLoopContext& ctx,
   }
 }
 
+// ===== P2-01 Fix: Microcompact preserves tool name, result summary, and error status =====
 void QueryLoop::ApplyStepMicrocompact(QueryLoopContext& ctx,
                                       QueryLoopInternalState& state) {
   (void)ctx;
   const long long now = CurrentTimeMs();
 
+  // Build a map from tool_use_id to tool name by scanning all messages
+  std::map<std::string, std::string> toolUseIdToName;
+  for (const auto& msg : state.messagesForTurn) {
+    for (const auto& block : msg.content) {
+      if (block.type == BlockType::ToolUse &&
+          !block.asToolUse.id.empty()) {
+        toolUseIdToName[block.asToolUse.id] = block.asToolUse.name;
+      }
+    }
+  }
+
+  std::string latestToolResultId;
+  for (const auto& msg : state.messagesForTurn) {
+    for (const auto& block : msg.content) {
+      if (block.type == BlockType::ToolResult &&
+          !block.asToolResult.toolUseId.empty()) {
+        latestToolResultId = block.asToolResult.toolUseId;
+      }
+    }
+  }
+
   int compactedCount = 0;
   for (auto& msg : state.messagesForTurn) {
     for (auto& block : msg.content) {
       if (block.type != BlockType::ToolResult) continue;
+      if (!latestToolResultId.empty() &&
+          block.asToolResult.toolUseId == latestToolResultId) {
+        continue;
+      }
       if (static_cast<int>(block.asToolResult.content.size()) <=
           kMicroCompactOldMarkerBytes) continue;
-      block.asToolResult.content =
-          std::string("[Tool result compacted at ") +
-          std::to_string(now) + ", " +
-          std::to_string(static_cast<int>(block.asToolResult.content.size())) +
-          " bytes]";
+
+      // P2-01: Build a compact summary instead of just a placeholder
+      const std::string& toolUseId = block.asToolResult.toolUseId;
+      std::string toolName = "unknown";
+      auto it = toolUseIdToName.find(toolUseId);
+      if (it != toolUseIdToName.end()) toolName = it->second;
+
+      // Truncate to a reasonable summary (first 120 chars)
+      const std::string& origContent = block.asToolResult.content;
+      std::string summary;
+      if (origContent.size() <= 200) {
+        summary = origContent;
+      } else {
+        summary = origContent.substr(0, 120) + "...";
+        // Replace newlines with spaces for compactness
+        std::replace(summary.begin(), summary.end(), '\n', ' ');
+      }
+
+      std::ostringstream compact;
+      compact << "[Tool: " << toolName << "] "
+              << (block.asToolResult.isError ? "(error) " : "(ok) ")
+              << "[" << summary << "]"
+              << " [compacted " << static_cast<int>(origContent.size())
+              << " bytes at " << now << "]";
+
+      block.asToolResult.content = compact.str();
       ++compactedCount;
     }
   }
@@ -1080,7 +1310,7 @@ void QueryLoop::ApplyStepMicrocompact(QueryLoopContext& ctx,
     boundary.isMeta = true;
     boundary.content.push_back(ContentBlock::MakeText(
         "[microcompact] " + std::to_string(compactedCount) +
-        " old tool results compacted to protect prompt cache window."));
+        " old tool results compacted (tool name + summary retained)."));
     state.messagesForTurn.insert(state.messagesForTurn.begin(), boundary);
   }
 }
@@ -1194,10 +1424,23 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
 
   std::ostringstream textBuffer;
 
-  bool useStreamingExecution = true;
-  if (ShouldRunValidation(ctx))
-    useStreamingExecution = false;
-  StreamingToolExecutor streamingExecutor(toolOrchestrator_, state.messagesForTurn);
+  // Tool execution stays in the normal RunTools stage so guards such as
+  // workspace-first validation can inspect streamed tool_use blocks before
+  // any side effects happen.
+  const bool useStreamingExecution = false;
+  const std::string modelTraceId = MakeQueryLoopTraceId("model-call");
+  ReportQueryLoopDebugEvent(
+      "1", "QueryLoop.cpp:model-call:start",
+      "[DEBUG] About to start model call",
+      {{"turnCount", state.turnCount},
+       {"messageCountForTurn", static_cast<int>(state.messagesForTurn.size())},
+       {"contextMessageCount", static_cast<int>(ctx.messages.size())},
+       {"activeModelCandidate", ctx.model},
+       {"validatorEnabled", ShouldRunValidation(ctx)},
+       {"useStreamingExecution", useStreamingExecution},
+       {"maxOutputTokensOverride", state.maxOutputTokensOverride},
+       {"transition", static_cast<int>(state.transition)}},
+      modelTraceId);
 
   api::SseEventCallback callback =
       [&](const std::string& event, const std::string& data) {
@@ -1240,10 +1483,6 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
         EmitQueryLoopEvent(
             ctx, QueryLoopEvent::Type::ToolProgress, QueryStage::ModelCall,
             &toolMessage);
-        if (useStreamingExecution) {
-          streamingExecutor.AddTool(tb);
-          streamingExecutor.ExecutePending();
-        }
       }
     } else if (event == "stop_reason") {
       currentAssistant.stopReason = data;
@@ -1272,6 +1511,18 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
                               BuildToolsJson(toolOrchestrator_.GetToolRegistry()),
                               callback,
                               state.maxOutputTokensOverride);
+  ReportQueryLoopDebugEvent(
+      "1", "QueryLoop.cpp:model-call:return",
+      "[DEBUG] Model call returned control to QueryLoop",
+      {{"turnCount", state.turnCount},
+       {"assistantCount", static_cast<int>(state.assistantMessages.size())},
+       {"toolUseCount", static_cast<int>(state.toolUseBlocks.size())},
+       {"pendingFollowupCount",
+        static_cast<int>(state.pendingFollowupMessages.size())},
+       {"currentStopReason", currentAssistant.stopReason},
+       {"currentIsApiError", currentAssistant.isApiErrorMessage},
+       {"bufferedTextSize", static_cast<int>(textBuffer.str().size())}},
+      modelTraceId);
 
   if (!textBuffer.str().empty())
     currentAssistant.content.push_back(
@@ -1298,6 +1549,15 @@ void QueryLoop::ApplyStepValidator(QueryLoopContext& ctx,
   if (state.assistantMessages.empty()) return;
 
   const std::string validatorModel = ResolveValidatorModel(ctx);
+  const std::string validatorTraceId = MakeQueryLoopTraceId("validator");
+  ReportQueryLoopDebugEvent(
+      "2", "QueryLoop.cpp:validator:start",
+      "[DEBUG] Starting validator side query",
+      {{"turnCount", state.turnCount},
+       {"validatorModel", validatorModel},
+       {"assistantCount", static_cast<int>(state.assistantMessages.size())},
+       {"toolUseCount", static_cast<int>(state.toolUseBlocks.size())}},
+      validatorTraceId);
 
   std::string contextJson = BuildValidationContext(
       ctx.messages, state.assistantMessages, state.toolUseBlocks,
@@ -1321,6 +1581,14 @@ void QueryLoop::ApplyStepValidator(QueryLoopContext& ctx,
   }
 
   api::SideQueryResponse response = sideQueryClient_.Query(request);
+  ReportQueryLoopDebugEvent(
+      "2", "QueryLoop.cpp:validator:return",
+      "[DEBUG] Validator side query returned",
+      {{"turnCount", state.turnCount},
+       {"ok", response.ok},
+       {"error", response.error},
+       {"messageCount", static_cast<int>(response.messages.size())}},
+      validatorTraceId);
   if (ctx.sessionManager) {
     ctx.sessionManager->AppendModelIoRecord(
         infra::ModelIoLogKind::Validator, "response", validatorModel,
@@ -1522,6 +1790,7 @@ StopHookResult QueryLoop::ExecuteStopHooks(QueryLoopContext& ctx,
                                            QueryLoopInternalState& state) {
   StopHookResult result;
   if (state.assistantMessages.empty()) return result;
+  if (state.stopHookActive) return result;
   const Message& lastMsg = state.assistantMessages.back();
   if (lastMsg.isApiErrorMessage) return result;
 
@@ -1571,6 +1840,10 @@ StopHookResult QueryLoop::ExecuteStopHooks(QueryLoopContext& ctx,
         result.preventContinuation = true;
       }
     }
+    if (!result.followupMessages.empty() || !result.blockingErrors.empty() ||
+        result.preventContinuation) {
+      state.stopHookActive = true;
+    }
   }
   return result;
 }
@@ -1603,6 +1876,7 @@ bool QueryLoop::ApplyStepRunTools(QueryLoopContext& ctx,
           &toolMsg);
     }
     state.assistantMessages.clear();
+  state.stopHookActive = false;
     state.forcedContinuationCount = 0;
     state.toolUseBlocks.clear();
     return !simulatedResults.empty();
@@ -1650,6 +1924,7 @@ bool QueryLoop::ApplyStepRunTools(QueryLoopContext& ctx,
         ctx, QueryLoopEvent::Type::ToolResult, QueryStage::RunTools, &rm);
   }
   state.assistantMessages.clear();
+  state.stopHookActive = false;
   state.forcedContinuationCount = 0;
   state.toolUseBlocks.clear();
   return !execResult.userMessages.empty();
@@ -1676,6 +1951,20 @@ bool QueryLoop::ApplyStepTerminate(QueryLoopContext& ctx,
 
 bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
                                          QueryLoopInternalState& state) {
+  ReportQueryLoopDebugEvent(
+      "4", "QueryLoop.cpp:no-tool:entry",
+      "[DEBUG] Evaluating no-tool continuation",
+      {{"turnCount", state.turnCount},
+       {"validatorRequestedRetry", state.validatorRequestedRetry},
+       {"pendingFollowupCount",
+        static_cast<int>(state.pendingFollowupMessages.size())},
+       {"toolResultMessageCount",
+        static_cast<int>(state.toolResultMessages.size())},
+       {"assistantPreview",
+        TruncateDebugText(CollectText(state.assistantMessages))},
+       {"forceContinuation", state.forceContinuation},
+       {"forceContinuationReason", state.forceContinuationReason}},
+      MakeQueryLoopTraceId("no-tool"));
   if (state.validatorRequestedRetry || !state.pendingFollowupMessages.empty()) {
     ReportQueryLoopDebugEvent(
         "3", "QueryLoop.cpp:no-tool:validator-retry",
@@ -1761,6 +2050,7 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
 
 void QueryLoop::RunFull(QueryLoopContext& ctx) {
   QueryLoopInternalState state;
+  loopStartTimeMs_ = CurrentTimeMs();
 
   auto persistMsg = [&ctx](const Message& msg) {
     if (ctx.sessionManager) ctx.sessionManager->AppendMessageToTranscript(msg);
@@ -1770,6 +2060,13 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
   };
 
   while (!state.completed) {
+    if (state.stage == QueryStage::ToolResultBudget &&
+        state.modelCallCount > 0 &&
+        IsWallClockExpired(ctx)) {
+      state.completed = true;
+      state.terminalReason = "wall_clock_budget_exceeded";
+      continue;
+    }
     EmitQueryLoopEvent(
         ctx, QueryLoopEvent::Type::StageChanged, state.stage, nullptr);
     ReportQueryLoopDebugEvent(
@@ -1820,6 +2117,7 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
       }
       case QueryStage::ModelCall: {
         bool hasTools = ApplyStepModelCall(ctx, state);
+        ++state.modelCallCount;
 
         if (Handle413Recovery(ctx, state)) {
           state.stage = QueryStage::ToolResultBudget; continue;
@@ -1852,6 +2150,22 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
              {"assistantPreview",
               TruncateDebugText(CollectText(state.assistantMessages))}},
             MakeQueryLoopTraceId("model"));
+        if (state.toolUseBlocks.empty() &&
+            wallClockBudgetMs_ > 0 &&
+            loopStartTimeMs_ > 0 &&
+            CurrentTimeMs() - loopStartTimeMs_ >= wallClockBudgetMs_) {
+          AppendTurnArtifacts(
+              ctx, state.assistantMessages, state.toolResultMessages,
+              state.pendingFollowupMessages);
+          state.assistantMessages.clear();
+          state.toolResultMessages.clear();
+          state.pendingFollowupMessages.clear();
+          state.toolUseBlocks.clear();
+          IsWallClockExpired(ctx);
+          state.completed = true;
+          state.terminalReason = "wall_clock_budget_exceeded";
+          continue;
+        }
         if (lastMsg.isApiErrorMessage &&
             !IsPromptTooLong(lastMsg) &&
             state.transition != TransitionReason::MaxOutputTokensRecovery &&
@@ -1886,6 +2200,9 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
         } else if (state.toolUseBlocks.empty()) {
           HandleNoToolContinuation(ctx, state);
         } else {
+          if (HandleMissingWorkspaceExploration(ctx, state)) {
+            continue;
+          }
           state.stage = QueryStage::StopHooks;
         }
         continue;
@@ -1899,6 +2216,9 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
         }
         if (state.toolUseBlocks.empty()) {
           HandleNoToolContinuation(ctx, state);
+          continue;
+        }
+        if (HandleMissingWorkspaceExploration(ctx, state)) {
           continue;
         }
         state.stage = QueryStage::StopHooks;
@@ -1935,6 +2255,12 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
         continue;
       }
       case QueryStage::RunTools: {
+        // P0-02: Check for duplicate tool call loops
+        if (ShouldTerminateOnDuplicates(ctx, state)) {
+          state.completed = true;
+          state.terminalReason = "duplicate_tool_loop";
+          continue;
+        }
         bool hasToolResults = ApplyStepRunTools(ctx, state);
         if (!hasToolResults) {
           state.completed = true;
