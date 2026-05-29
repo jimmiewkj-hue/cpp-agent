@@ -94,6 +94,7 @@ std::string GetEnvOrDefault(const char* name, const std::string& fallback) {
   return result;
 }
 
+
 std::string ReadUtf8File(const std::string& path) {
   HANDLE handle = CreateFileW(Utf8ToWide(path).c_str(), GENERIC_READ,
                               FILE_SHARE_READ | FILE_SHARE_WRITE |
@@ -249,6 +250,17 @@ std::string TrimWhitespace(const std::string& value) {
   if (begin == std::string::npos) return std::string();
   const std::size_t end = value.find_last_not_of(whitespace);
   return value.substr(begin, end - begin + 1);
+}
+
+int GetEnvIntOrDefault(const char* name, int fallback) {
+  const std::string value = TrimWhitespace(GetEnvOrDefault(name, ""));
+  if (value.empty()) return fallback;
+  char* end = nullptr;
+  const long parsed = std::strtol(value.c_str(), &end, 10);
+  if (end == value.c_str() || (end != nullptr && *end != '\0')) {
+    return fallback;
+  }
+  return static_cast<int>(parsed);
 }
 
 struct WorkspaceSelection {
@@ -685,6 +697,44 @@ const char* QueryStageLabel(agent::core::QueryStage stage) {
   return "Unknown";
 }
 
+const char* PermissionModeLabel(agent::core::PermissionMode mode) {
+  switch (mode) {
+    case agent::core::PermissionMode::Default:
+      return "default";
+    case agent::core::PermissionMode::Auto:
+      return "auto";
+    case agent::core::PermissionMode::BypassPermissions:
+      return "bypass";
+    case agent::core::PermissionMode::Plan:
+      return "plan";
+    case agent::core::PermissionMode::AcceptEdits:
+      return "acceptedits";
+    case agent::core::PermissionMode::DontAsk:
+      return "dontask";
+  }
+  return "unknown";
+}
+
+std::string MakePermissionPreview(const agent::core::ContentBlock& toolUse) {
+  if (toolUse.type != agent::core::BlockType::ToolUse) return "";
+  std::string preview = toolUse.asToolUse.inputJson;
+  preview.erase(
+      std::remove(preview.begin(), preview.end(), '\r'), preview.end());
+  std::replace(preview.begin(), preview.end(), '\n', ' ');
+  if (preview.size() > 220) {
+    preview = preview.substr(0, 217) + "...";
+  }
+  return preview;
+}
+
+struct PermissionPromptChoice {
+  agent::core::PermissionBehavior behavior =
+      agent::core::PermissionBehavior::Ask;
+  std::string reason;
+  bool updateMode = false;
+  agent::core::PermissionMode newMode = agent::core::PermissionMode::Default;
+};
+
 bool CopyUtf8ToClipboard(const std::string& text) {
   const std::wstring wide = Utf8ToWide(text);
   if (!OpenClipboard(nullptr)) return false;
@@ -724,6 +774,11 @@ struct TuiState {
   std::string liveResponse;
   std::string liveToolStatus;
   std::string liveStage;
+  std::string permissionModeLabel;
+  bool permissionPromptActive = false;
+  std::string permissionPromptTitle;
+  std::string permissionPromptReason;
+  std::string permissionPromptDetails;
   agent::app::TuiTaskPanelData taskPanel;
   std::string projectRoot;
   std::string modelName;
@@ -788,18 +843,22 @@ class AnsiTui {
     const int w = sz.width;
     const int h = sz.height;
     int taskHeight = 0;
+    int permissionHeight = 0;
     {
       std::lock_guard<std::mutex> lock(state_.mutex);
       if (!state_.taskPanel.tasks.empty()) {
         taskHeight = std::min(8, std::max(4, 2 + static_cast<int>(std::min<std::size_t>(
                                                      state_.taskPanel.tasks.size(), 4))));
       }
+      if (state_.permissionPromptActive) {
+        permissionHeight = 8;
+      }
     }
     welcomeLines_ = static_cast<int>(RenderWelcome().size());
     RenderWelcome(y);
     y += welcomeLines_;
     msgTop_ = y;
-    msgHeight_ = h - y - 4 - taskHeight;
+    msgHeight_ = h - y - 4 - taskHeight - permissionHeight;
     if (msgHeight_ < 3) msgHeight_ = 3;
     RenderMessageArea(y, msgHeight_, w);
     y += msgHeight_;
@@ -808,6 +867,12 @@ class AnsiTui {
     if (taskHeight_ > 0) {
       RenderTaskPanel(y, taskHeight_, w);
       y += taskHeight_;
+    }
+    permissionTop_ = y;
+    permissionHeight_ = permissionHeight;
+    if (permissionHeight_ > 0) {
+      RenderPermissionPanel(y, permissionHeight_, w);
+      y += permissionHeight_;
     }
     RenderStatusBar(y, w);
     RenderInputLine(h - 1, w);
@@ -852,6 +917,133 @@ class AnsiTui {
       }
     }
     RefreshStatus();
+  }
+
+  void SetPermissionModeLabel(const std::string& label) {
+    {
+      std::lock_guard<std::mutex> lock(state_.mutex);
+      state_.permissionModeLabel = label;
+    }
+    RefreshStatus();
+  }
+
+  PermissionPromptChoice PromptForPermission(
+      const std::string& title,
+      const std::string& reason,
+      const std::string& details) {
+    const auto sz = GetConsoleSize();
+    std::string previousStatus;
+    {
+      std::lock_guard<std::mutex> lock(state_.mutex);
+      previousStatus = state_.statusText;
+      state_.permissionPromptActive = true;
+      state_.permissionPromptTitle = title;
+      state_.permissionPromptReason = reason;
+      state_.permissionPromptDetails = details;
+      state_.statusText = "Permission required";
+    }
+    RedrawAll();
+
+    auto clearPrompt = [&]() {
+      {
+        std::lock_guard<std::mutex> lock(state_.mutex);
+        state_.permissionPromptActive = false;
+        state_.permissionPromptTitle.clear();
+        state_.permissionPromptReason.clear();
+        state_.permissionPromptDetails.clear();
+        state_.statusText = previousStatus;
+      }
+      RedrawAll();
+    };
+
+    PermissionPromptChoice choice;
+    HANDLE inHandle = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD consoleMode = 0;
+    if (GetConsoleMode(inHandle, &consoleMode) == 0) {
+      clearPrompt();
+      choice.behavior = agent::core::PermissionBehavior::Deny;
+      choice.reason = "interactive permission prompt unavailable";
+      return choice;
+    }
+
+    while (true) {
+      INPUT_RECORD record;
+      DWORD eventsRead = 0;
+      if (!ReadConsoleInputW(inHandle, &record, 1, &eventsRead) ||
+          eventsRead == 0) {
+        choice.behavior = agent::core::PermissionBehavior::Deny;
+        choice.reason = "interactive permission prompt interrupted";
+        break;
+      }
+      if (record.EventType != KEY_EVENT) continue;
+      KEY_EVENT_RECORD& key = record.Event.KeyEvent;
+      if (!key.bKeyDown) continue;
+      if (key.wVirtualKeyCode == VK_ESCAPE) {
+        choice.behavior = agent::core::PermissionBehavior::Deny;
+        choice.reason = "permission request rejected interactively";
+        break;
+      }
+      if (key.wVirtualKeyCode == VK_RETURN) {
+        choice.behavior = agent::core::PermissionBehavior::Allow;
+        choice.reason = "permission request approved interactively";
+        break;
+      }
+
+      wchar_t wideChar = key.uChar.UnicodeChar;
+      if (wideChar == 0) continue;
+      char ch = static_cast<char>(std::tolower(static_cast<unsigned char>(wideChar)));
+      if (ch == 'y') {
+        choice.behavior = agent::core::PermissionBehavior::Allow;
+        choice.reason = "permission request approved interactively";
+        break;
+      }
+      if (ch == 'n') {
+        choice.behavior = agent::core::PermissionBehavior::Deny;
+        choice.reason = "permission request rejected interactively";
+        break;
+      }
+      if (ch == 'b') {
+        choice.behavior = agent::core::PermissionBehavior::Allow;
+        choice.reason =
+            "permission request approved interactively; mode switched to bypass";
+        choice.updateMode = true;
+        choice.newMode = agent::core::PermissionMode::BypassPermissions;
+        break;
+      }
+      if (ch == 'a') {
+        choice.behavior = agent::core::PermissionBehavior::Deny;
+        choice.reason = "permission mode switched to auto";
+        choice.updateMode = true;
+        choice.newMode = agent::core::PermissionMode::Auto;
+        break;
+      }
+      if (ch == 'd') {
+        choice.behavior = agent::core::PermissionBehavior::Deny;
+        choice.reason = "permission mode switched to default";
+        choice.updateMode = true;
+        choice.newMode = agent::core::PermissionMode::Default;
+        break;
+      }
+      if (ch == 'p') {
+        choice.behavior = agent::core::PermissionBehavior::Deny;
+        choice.reason = "permission mode switched to plan";
+        choice.updateMode = true;
+        choice.newMode = agent::core::PermissionMode::Plan;
+        break;
+      }
+      if (ch == 'e') {
+        choice.behavior = agent::core::PermissionBehavior::Allow;
+        choice.reason =
+            "permission request approved interactively; mode switched to acceptedits";
+        choice.updateMode = true;
+        choice.newMode = agent::core::PermissionMode::AcceptEdits;
+        break;
+      }
+    }
+
+    clearPrompt();
+    SetCursorPosition(2, sz.height - 1);
+    return choice;
   }
 
   void ClearLiveState() {
@@ -916,7 +1108,8 @@ class AnsiTui {
 
   void RefreshStatus() {
     const auto sz = GetConsoleSize();
-    RenderStatusBar(msgTop_ + msgHeight_, sz.width);
+    RenderStatusBar(msgTop_ + msgHeight_ + taskHeight_ + permissionHeight_,
+                    sz.width);
     SetCursorPosition(2, sz.height - 1);
   }
 
@@ -1227,26 +1420,75 @@ class AnsiTui {
     std::cout << "\xe2\x94\x98\x1b[0m";
   }
 
+  void RenderPermissionPanel(int startY, int height, int width) {
+    const int boxW = width - 2;
+    if (boxW < 10 || height < 3) return;
+
+    std::vector<std::string> lines;
+    {
+      std::lock_guard<std::mutex> lock(state_.mutex);
+      if (!state_.permissionPromptActive) return;
+      lines.push_back("Tool: " + state_.permissionPromptTitle);
+      lines.push_back("Reason: " + state_.permissionPromptReason);
+      if (!state_.permissionPromptDetails.empty()) {
+        const auto detailLines = WrapLineVisually(
+            "Input: " + state_.permissionPromptDetails, std::max(1, boxW - 2));
+        lines.insert(lines.end(), detailLines.begin(), detailLines.end());
+      }
+      lines.push_back("Keys: [Y] allow once  [N] deny once  [B] bypass+allow");
+      lines.push_back("      [A] auto  [D] default  [P] plan  [E] acceptEdits");
+    }
+
+    SetCursorPosition(0, startY);
+    std::cout << "\x1b[33m\xe2\x94\x8c\xe2\x94\x80 Permission Request ";
+    for (int i = 0; i < boxW - 22; ++i) std::cout << "\xe2\x94\x80";
+    std::cout << "\xe2\x94\x90\x1b[0m";
+
+    for (int row = 1; row < height - 1; ++row) {
+      SetCursorPosition(0, startY + row);
+      std::cout << "\x1b[33m\xe2\x94\x82\x1b[0m ";
+      const std::size_t idx = static_cast<std::size_t>(row - 1);
+      if (idx < lines.size()) {
+        const std::string line = TruncateVisually(lines[idx], boxW - 2);
+        std::cout << PadRightVisual(line, boxW - 2);
+      } else {
+        std::cout << PadRightVisual("", boxW - 2);
+      }
+      std::cout << "\x1b[33m\xe2\x94\x82\x1b[0m";
+    }
+
+    SetCursorPosition(0, startY + height - 1);
+    std::cout << "\x1b[33m\xe2\x94\x94";
+    for (int i = 0; i < boxW; ++i) std::cout << "\xe2\x94\x80";
+    std::cout << "\xe2\x94\x98\x1b[0m";
+  }
+
   void RenderStatusBar(int y, int width) {
     SetCursorPosition(0, y);
     std::string status;
     bool running;
     std::string liveStage;
+    std::string permissionModeLabel;
     {
       std::lock_guard<std::mutex> lock(state_.mutex);
       status = state_.statusText;
       running = state_.running.load();
       liveStage = state_.liveStage;
+      permissionModeLabel = state_.permissionModeLabel;
     }
     if (status.empty()) status = "Ready";
     if (running && !liveStage.empty() &&
         status.find(liveStage) == std::string::npos) {
       status += " [" + liveStage + "]";
     }
+    if (!permissionModeLabel.empty()) {
+      status += " | Perm:" + permissionModeLabel;
+    }
 
     std::ostringstream ss;
     ss << "\x1b[7m"
-       << PadRight(" " + status + " ", width - 10)
+       << PadRightVisual(TruncateVisually(" " + status + " ", width - 10),
+                         width - 10)
        << (running ? "\x1b[43m\x1b[30m BUSY \x1b[0m"
                    : "\x1b[42m\x1b[30m IDLE \x1b[0m")
        << "\x1b[27m";
@@ -1267,6 +1509,8 @@ class AnsiTui {
   int msgHeight_ = 0;
   int taskTop_ = 0;
   int taskHeight_ = 0;
+  int permissionTop_ = 0;
+  int permissionHeight_ = 0;
   int welcomeLines_ = 0;
   int scrollOffset_ = 0;
   HANDLE inputHandle_ = INVALID_HANDLE_VALUE;
@@ -1298,7 +1542,7 @@ int main() {
   llmCfg.apiEndpoint = GetEnvOrDefault(
       "CPP_AGENT_API_ENDPOINT", "http://127.0.0.1:8080/v1/chat/completions");
   llmCfg.mainModel = GetEnvOrDefault(
-      "CPP_AGENT_MAIN_MODEL", "Qwen3.6-35B-A3B-UD-Q6_K");
+      "CPP_AGENT_MAIN_MODEL", "Qwen3.6-35B-A3B-Q8_0.gguf");
   llmCfg.validatorModel = GetEnvOrDefault(
       "CPP_AGENT_VALIDATOR_MODEL", "");
   llmCfg.fallbackModel = GetEnvOrDefault(
@@ -1380,6 +1624,8 @@ int main() {
   // P0-02: Conservative max turns for CLI (reduced from 500 default)
   engine.SetMaxTurns(80);
   engine.SetWallClockBudgetMs(10 * 60 * 1000);
+  const int nonInteractiveMaxSegments =
+      std::max(1, GetEnvIntOrDefault("CPP_AGENT_MAX_SEGMENTS", 4));
 
   watchdog.Start();
   engine.SetStabilityWatchdog(&watchdog);
@@ -1395,11 +1641,33 @@ int main() {
           ? "Anthropic" : "OpenAI-compatible";
   tuiState.toolsList = JoinToolNames(toolRegistry.ListTools());
   tuiState.statusText = "Press /help for commands | Esc to quit";
+  tuiState.permissionModeLabel =
+      PermissionModeLabel(permissionEngine.GetPermissionMode());
   tuiState.taskPanel = agent::app::LoadTuiTaskPanelData(taskStorePath);
 
   AnsiTui tui(tuiState);
   if (isInteractiveSession) {
     tui.Init();
+    permissionEngine.SetManualApprovalCallback(
+        [&](const agent::core::ContentBlock& toolUse,
+            const std::vector<agent::core::Message>&,
+            const agent::core::PermissionDecision& pendingDecision) {
+          PermissionPromptChoice choice = tui.PromptForPermission(
+              toolUse.asToolUse.name,
+              pendingDecision.reason,
+              MakePermissionPreview(toolUse));
+          if (choice.updateMode) {
+            permissionEngine.SetPermissionMode(choice.newMode);
+            tui.SetPermissionModeLabel(PermissionModeLabel(choice.newMode));
+            tui.AppendMessage(
+                std::string("[permission] mode set to ") +
+                PermissionModeLabel(choice.newMode));
+          }
+          agent::core::PermissionDecision resolved;
+          resolved.behavior = choice.behavior;
+          resolved.reason = choice.reason;
+          return resolved;
+        });
   }
   engine.SetEventCallback([&](const agent::core::QueryLoopEvent& event) {
     if (!isInteractiveSession) {
@@ -1483,7 +1751,33 @@ int main() {
       if (!line.empty() && line[0] == '/') continue;
 
       engine.SubmitUserPrompt(line);
-      const bool ok = engine.RunTurnWithRecovery();
+      bool ok = true;
+      int segmentCount = 0;
+      while (segmentCount < nonInteractiveMaxSegments) {
+        ++segmentCount;
+        const bool segmentOk = engine.RunTurnWithRecovery();
+        ok = ok && segmentOk;
+        if (!segmentOk) break;
+
+        bool shouldContinueAfterWallClock = false;
+        const auto& msgs = engine.messages();
+        if (!msgs.empty()) {
+          const auto& last = msgs.back();
+          shouldContinueAfterWallClock =
+              last.role == agent::core::MessageRole::System &&
+              last.isMeta &&
+              last.uuid == "wall-clock-timeout";
+        }
+        if (!shouldContinueAfterWallClock) break;
+        if (segmentCount >= nonInteractiveMaxSegments) {
+          std::cout << "[segment_limit_reached] "
+                    << nonInteractiveMaxSegments << std::endl;
+          break;
+        }
+        if (!engine.PrepareForContinuationAfterWallClockTimeout()) break;
+        std::cout << "[continuing_after_wall_clock] segment="
+                  << (segmentCount + 1) << std::endl;
+      }
       sessionManager.PersistSnapshot();
       if (!ok) std::cout << "[error] Turn failed." << std::endl;
     }
@@ -1516,6 +1810,7 @@ int main() {
       tui.AppendMessage("/history   Show recent messages");
       tui.AppendMessage("/clear     Clear message log");
       tui.AppendMessage("/exit      Save session and quit");
+      tui.AppendMessage("Permission prompt: Y allow, N deny, B bypass, A auto, D default, P plan, E acceptEdits");
       tui.AppendMessage("Tip: Enter to send, Ctrl+Enter for newline.");
       continue;
     }
@@ -1523,18 +1818,23 @@ int main() {
       std::string mode = Trim(line.substr(12));
       if (mode == "default") {
         permissionEngine.SetPermissionMode(agent::core::PermissionMode::Default);
+        tui.SetPermissionModeLabel("default");
         tui.AppendMessage("Permission mode: default (interactive)");
       } else if (mode == "auto") {
         permissionEngine.SetPermissionMode(agent::core::PermissionMode::Auto);
+        tui.SetPermissionModeLabel("auto");
         tui.AppendMessage("Permission mode: auto (classifier)");
       } else if (mode == "bypass" || mode == "bypassPermissions") {
         permissionEngine.SetPermissionMode(agent::core::PermissionMode::BypassPermissions);
+        tui.SetPermissionModeLabel("bypass");
         tui.AppendMessage("Permission mode: bypass (allow all)");
       } else if (mode == "plan") {
         permissionEngine.SetPermissionMode(agent::core::PermissionMode::Plan);
+        tui.SetPermissionModeLabel("plan");
         tui.AppendMessage("Permission mode: plan (no execution)");
       } else if (mode == "acceptedits" || mode == "acceptEdits") {
         permissionEngine.SetPermissionMode(agent::core::PermissionMode::AcceptEdits);
+        tui.SetPermissionModeLabel("acceptedits");
         tui.AppendMessage("Permission mode: acceptEdits (auto-approve edits)");
       } else {
         tui.AppendMessage("Usage: /permission [default|auto|bypass|plan|acceptedits]");

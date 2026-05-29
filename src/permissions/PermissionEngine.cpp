@@ -94,6 +94,11 @@ void PermissionEngine::SetClassifierCallback(ClassifierCallback callback) {
   classifierCallback_ = std::move(callback);
 }
 
+void PermissionEngine::SetManualApprovalCallback(
+    ManualApprovalCallback callback) {
+  manualApprovalCallback_ = std::move(callback);
+}
+
 void PermissionEngine::SetFailClosed(bool failClosed) {
   failClosed_ = failClosed;
 }
@@ -124,6 +129,23 @@ core::CanUseTool PermissionEngine::BuildCanUseTool() {
 core::PermissionDecision PermissionEngine::Evaluate(
     const core::ContentBlock& toolUse,
     const std::vector<core::Message>& messages) {
+  auto resolveAsk = [&](const std::string& reason) {
+    core::PermissionDecision pending{
+        core::PermissionBehavior::Ask, reason};
+    if (!manualApprovalCallback_) return pending;
+    core::PermissionDecision resolved =
+        manualApprovalCallback_(toolUse, messages, pending);
+    if (resolved.behavior == core::PermissionBehavior::Allow) {
+      denialState_.RecordApproval();
+      return resolved;
+    }
+    if (resolved.behavior == core::PermissionBehavior::Deny) {
+      denialState_.RecordDenial();
+      return resolved;
+    }
+    return pending;
+  };
+
   // Step 0: mode-based shortcuts
   if (permissionMode_ == core::PermissionMode::BypassPermissions) {
     return {core::PermissionBehavior::Allow, "bypass permissions mode"};
@@ -155,12 +177,12 @@ core::PermissionDecision PermissionEngine::Evaluate(
 
   // Step 4: circuit breaker
   if (denialState_.IsCircuitBroken()) {
-    return {core::PermissionBehavior::Ask,
-            "circuit broken — maxConsecutive=" +
-                std::to_string(denialState_.maxConsecutive) +
-                " maxTotal=" +
-                std::to_string(denialState_.maxTotal) +
-                " — manual confirmation required"};
+    return resolveAsk(
+        "circuit broken — maxConsecutive=" +
+        std::to_string(denialState_.maxConsecutive) +
+        " maxTotal=" +
+        std::to_string(denialState_.maxTotal) +
+        " — manual confirmation required");
   }
 
   // Step 5: classifier callback (auto-mode YOLO classifier)
@@ -172,8 +194,11 @@ core::PermissionDecision PermissionEngine::Evaluate(
         denialState_.RecordDenial();
         return decision;
       }
-      denialState_.RecordApproval();
-      return decision;
+      if (decision.behavior == core::PermissionBehavior::Allow) {
+        denialState_.RecordApproval();
+        return decision;
+      }
+      return resolveAsk(decision.reason);
     } catch (...) {
       // classifier unavailable → fail-open or fail-closed
       if (failClosed_) {
@@ -181,13 +206,11 @@ core::PermissionDecision PermissionEngine::Evaluate(
         return {core::PermissionBehavior::Deny,
                 "classifier unavailable, fail-closed gate active"};
       }
-      return {core::PermissionBehavior::Ask,
-              "classifier unavailable, manual confirmation required"};
+      return resolveAsk("classifier unavailable, manual confirmation required");
     }
   }
 
-  return {core::PermissionBehavior::Ask,
-          "no rule matched; requires confirmation"};
+  return resolveAsk("no rule matched; requires confirmation");
 }
 
 const core::DenialTrackingState& PermissionEngine::denialState() const {

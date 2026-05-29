@@ -13,12 +13,17 @@ namespace permissions {
 using ClassifierCallback = std::function<core::PermissionDecision(
     const core::ContentBlock& toolUse,
     const std::vector<core::Message>& messages)>;
+using ManualApprovalCallback = std::function<core::PermissionDecision(
+    const core::ContentBlock& toolUse,
+    const std::vector<core::Message>& messages,
+    const core::PermissionDecision& pendingDecision)>;
 
 class PermissionEngine {
  public:
   void AddAlwaysAllowRule(const std::string& token);
   void AddAlwaysDenyRule(const std::string& token);
   void SetClassifierCallback(ClassifierCallback callback);
+  void SetManualApprovalCallback(ManualApprovalCallback callback);
   void SetFailClosed(bool failClosed);
   void AddAutoModeAllowlistedTool(const std::string& token);
   void SetPermissionMode(core::PermissionMode mode);
@@ -44,6 +49,7 @@ class PermissionEngine {
   std::vector<std::string> denyRules_;
   std::vector<std::string> autoModeAllowlistedTools_;
   ClassifierCallback classifierCallback_;
+  ManualApprovalCallback manualApprovalCallback_;
   core::DenialTrackingState denialState_;
   core::PermissionMode permissionMode_ = core::PermissionMode::Default;
   bool failClosed_ = true;

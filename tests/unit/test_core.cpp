@@ -428,6 +428,64 @@ class PlanningOnlyModelClient : public agent::api::ModelClient {
   int streamCalls = 0;
 };
 
+class RepeatedMissingToolUseModelClient : public agent::api::ModelClient {
+ public:
+  explicit RepeatedMissingToolUseModelClient(std::string outputPath)
+      : outputPath_(std::move(outputPath)) {}
+
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  void StreamResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&,
+      const std::string&,
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
+    ++streamCalls;
+    if (!onEvent) return;
+    if (streamCalls == 1) {
+      onEvent("text_delta", "现在需要创建 visualizer.py。让我创建这个模块。");
+      onEvent("stop_reason", "end_turn");
+      return;
+    }
+    if (streamCalls == 2) {
+      onEvent("text_delta", "还需要创建 report_generator.py。首先创建 visualizer.py。");
+      onEvent("stop_reason", "end_turn");
+      return;
+    }
+    if (streamCalls == 3) {
+      std::string payload =
+          std::string("{\"id\":\"rmu-write-001\",\"name\":\"Write\",\"input\":")
+          + "{\"file_path\":\"" + outputPath_ +
+          "\",\"content\":\"value = 1\\n\"}}";
+      onEvent("text_delta", "现在直接创建缺失文件。");
+      onEvent("tool_use", payload);
+      onEvent("stop_reason", "tool_use");
+      return;
+    }
+    onEvent("text_delta", "缺失文件已创建完成。");
+    onEvent("stop_reason", "end_turn");
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  int streamCalls = 0;
+
+ private:
+  std::string outputPath_;
+};
+
 class SnipCaptureModelClient : public agent::api::ModelClient {
  public:
   std::vector<agent::core::Message> GenerateResponse(
@@ -1223,6 +1281,75 @@ void TestForcedContinuationLimitPersistsAcrossFollowups() {
         "Forced continuation count should stop repeated plan-only turns");
 }
 
+void TestMissingToolUseNudgeCanRetryForRepeatedTextOnlyWrites() {
+  const std::string workspaceRoot =
+      "g:\\downloads\\claude-code\\yuanma-poxi\\cpp-agent";
+  const std::string outputPath =
+      workspaceRoot + "\\build\\repeated-missing-tool-use.py";
+  const std::string toolFilePath = "build/repeated-missing-tool-use.py";
+  DeleteFileA(outputPath.c_str());
+
+  agent::tools::ToolRegistry toolRegistry;
+  for (const auto& tool : agent::tools::ToolRegistry::GetAllBaseTools()) {
+    if (tool.name == "Write") {
+      toolRegistry.RegisterTool(tool);
+    }
+  }
+
+  agent::tools::ToolOrchestrator orchestrator;
+  orchestrator.SetToolRegistry(&toolRegistry);
+  orchestrator.SetWorkspaceRoot(workspaceRoot);
+
+  agent::permissions::PermissionEngine permissionEngine;
+  permissionEngine.AddAlwaysAllowRule("Write");
+
+  RepeatedMissingToolUseModelClient modelClient(toolFilePath);
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::core::QueryLoop loop(
+      orchestrator, permissionEngine, modelClient, sideQueryClient);
+  loop.SetMaxTurns(12);
+
+  agent::core::QueryLoopContext ctx;
+  ctx.systemPrompt = agent::app::BuildWorkspaceSystemPrompt(workspaceRoot, true);
+  ctx.model = "main-model";
+
+  agent::core::Message user;
+  user.role = agent::core::MessageRole::User;
+  user.uuid = "user-missing-tool";
+  user.content.push_back(agent::core::ContentBlock::MakeText(
+      "请继续完善项目，并把缺失模块真正写入工作区。"));
+  ctx.messages.push_back(user);
+
+  loop.RunFull(ctx);
+
+  int nudgeCount = 0;
+  bool sawWriteToolUse = false;
+  for (const auto& msg : ctx.messages) {
+    for (const auto& block : msg.content) {
+      if (block.type == agent::core::BlockType::Text &&
+          (block.asText.text.find("no tool call was emitted") != std::string::npos ||
+           block.asText.text.find("still planning to create files without emitting a tool call") !=
+               std::string::npos)) {
+        ++nudgeCount;
+      }
+      if (block.type == agent::core::BlockType::ToolUse &&
+          block.asToolUse.name == "Write") {
+        sawWriteToolUse = true;
+      }
+    }
+  }
+
+  Check(nudgeCount >= 2,
+        "Missing tool-use guidance should be able to retry after repeated text-only turns");
+  Check(sawWriteToolUse,
+        "Repeated missing-tool-use nudges should still lead to a concrete Write tool call");
+
+  const DWORD attrs = GetFileAttributesA(outputPath.c_str());
+  Check(attrs != INVALID_FILE_ATTRIBUTES,
+        "Repeated missing-tool-use recovery should create the requested file");
+  DeleteFileA(outputPath.c_str());
+}
+
 void TestHistorySnipPreservesOriginalUserTask() {
   agent::tools::ToolOrchestrator orchestrator;
   agent::permissions::PermissionEngine permissionEngine;
@@ -1418,6 +1545,9 @@ void TestRuntimePolicySharedRules() {
   Check(prompt.find("Read with offset/limit for a targeted line range") !=
             std::string::npos,
         "Shared prompt should prefer targeted range reads for large files");
+  Check(prompt.find("older tool results may be compacted or truncated later") !=
+            std::string::npos,
+        "Shared prompt should warn that old tool results may be compacted");
 
   const auto silentStartup =
       agent::app::BuildStartupMessages(false, true, "C:\\workspace", 2);
@@ -1712,6 +1842,7 @@ int main() {
   TestHttpLlmClientConstruction();
   TestQueryEngineEmitsStreamingEvents();
   TestForcedContinuationLimitPersistsAcrossFollowups();
+  TestMissingToolUseNudgeCanRetryForRepeatedTextOnlyWrites();
   TestHistorySnipPreservesOriginalUserTask();
   TestStopHookCanForceContinuation();
   TestCompactHooksFireDuringSnip();

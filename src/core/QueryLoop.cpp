@@ -323,13 +323,24 @@ bool AssistantIntendsWorkspaceWrite(const std::vector<Message>& assistantMessage
   return ContainsToken(lower, "let me create") ||
          ContainsToken(lower, "i will create") ||
          ContainsToken(lower, "i'll create") ||
+         ContainsToken(lower, "need to create") ||
+         ContainsToken(lower, "create the remaining") ||
+         ContainsToken(lower, "create the next") ||
+         ContainsToken(lower, "first create") ||
+         ContainsToken(lower, "now create") ||
          ContainsToken(lower, "write this to") ||
          ContainsToken(lower, "save this as") ||
          ContainsToken(lower, "standalone html file") ||
          ContainsToken(original, "我来创建") ||
          ContainsToken(original, "我将创建") ||
          ContainsToken(original, "创建这个") ||
-         ContainsToken(original, "写入文件");
+         ContainsToken(original, "写入文件") ||
+         ContainsToken(original, "需要创建") ||
+         ContainsToken(original, "现在创建") ||
+         ContainsToken(original, "首先创建") ||
+         ContainsToken(original, "继续创建") ||
+         ContainsToken(original, "还需要创建") ||
+         ContainsToken(original, "创建剩余");
 }
 
 bool IsExplorationToolName(const std::string& toolName) {
@@ -431,6 +442,15 @@ bool AssistantIntendsFurtherExecution(
          ContainsToken(lower, "going to create") ||
          ContainsToken(lower, "going to write") ||
          ContainsToken(lower, "going to build") ||
+         ContainsToken(lower, "need to create") ||
+         ContainsToken(lower, "need to write") ||
+         ContainsToken(lower, "need to build") ||
+         ContainsToken(lower, "still need to") ||
+         ContainsToken(lower, "continue creating") ||
+         ContainsToken(lower, "continue building") ||
+         ContainsToken(lower, "continue writing") ||
+         ContainsToken(lower, "first create") ||
+         ContainsToken(lower, "now create") ||
          ContainsToken(lower, "next step") ||
          ContainsToken(lower, "proceed to") ||
          ContainsToken(lower, "next, i will") ||
@@ -445,6 +465,15 @@ bool AssistantIntendsFurtherExecution(
          ContainsToken(original, "我先继续") ||
          ContainsToken(original, "接下来") ||
          ContainsToken(original, "然后继续") ||
+         ContainsToken(original, "现在需要") ||
+         ContainsToken(original, "现在需要创建") ||
+         ContainsToken(original, "让我继续创建") ||
+         ContainsToken(original, "继续创建") ||
+         ContainsToken(original, "继续实现") ||
+         ContainsToken(original, "先从") ||
+         ContainsToken(original, "首先创建") ||
+         ContainsToken(original, "还需要创建") ||
+         ContainsToken(original, "继续完成") ||
          ContainsToken(original, "继续当前任务") ||
          ContainsToken(original, "下一步") ||
          ContainsToken(original, "我先查看") ||
@@ -836,7 +865,8 @@ void PersistMessagesToTranscript(infra::SessionManager* sm,
 
 bool HandleMissingExpectedToolUse(QueryLoopContext& ctx,
                                   QueryLoopInternalState& state) {
-  if (state.hasPromptedForMissingToolUse) return false;
+  static const int kMaxMissingToolUseNudges = 3;
+  if (state.missingToolUsePromptCount >= kMaxMissingToolUseNudges) return false;
   if (!state.toolUseBlocks.empty()) return false;
   if (state.assistantMessages.empty()) return false;
   if (!AssistantIntendsWorkspaceWrite(state.assistantMessages)) return false;
@@ -849,17 +879,25 @@ bool HandleMissingExpectedToolUse(QueryLoopContext& ctx,
   nudge.role = MessageRole::System;
   nudge.uuid = "missing-tool-use-nudge";
   nudge.isMeta = true;
-  nudge.content.push_back(ContentBlock::MakeText(
+  std::string nudgeText =
       "You said you would create or write a file, but no tool call was emitted. "
       "If the deliverable should exist in the workspace, use the Write/FileWrite "
       "tool now instead of describing the plan. After the tool result, provide "
-      "a concise completion message."));
+      "a concise completion message.";
+  if (state.missingToolUsePromptCount > 0) {
+    nudgeText =
+        "You are still planning to create files without emitting a tool call. "
+        "Do not describe the next file in plain text. If you are unsure which "
+        "files already exist, inspect the workspace with Glob first, then emit "
+        "a concrete Write/FileWrite call for the next missing deliverable.";
+  }
+  nudge.content.push_back(ContentBlock::MakeText(nudgeText));
   ctx.messages.push_back(nudge);
   PersistMessagesToTranscript(ctx.sessionManager, {nudge});
 
   state.assistantMessages.clear();
   state.toolUseBlocks.clear();
-  state.hasPromptedForMissingToolUse = true;
+  ++state.missingToolUsePromptCount;
   return true;
 }
 

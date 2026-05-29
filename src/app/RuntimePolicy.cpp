@@ -48,7 +48,11 @@ std::string BuildWorkspaceSystemPrompt(const std::string& workspaceRoot,
       << "explore the workspace with Glob, Grep, or Read tools to understand "
       << "the existing files BEFORE creating or modifying any files. "
       << "Never write or edit files without first reading or searching the "
-      << "relevant parts of the codebase. ";
+      << "relevant parts of the codebase. "
+      << "When a tool result contains important facts, decisions, or file "
+      << "creation progress that you will need later, write those facts down "
+      << "in your next assistant message because older tool results may be "
+      << "compacted or truncated later. ";
   if (workspaceTrusted && !workspaceRoot.empty()) {
     prompt
         << "The trusted workspace root is `" << workspaceRoot << "`. "

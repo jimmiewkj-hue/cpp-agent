@@ -269,6 +269,48 @@ void TestPermissionEngineModes() {
         "Default mode set");
 }
 
+void TestPermissionEngineManualApprovalCallbackAllowsAsk() {
+  agent::permissions::PermissionEngine engine;
+  engine.SetManualApprovalCallback(
+      [](const agent::core::ContentBlock&,
+         const std::vector<agent::core::Message>&,
+         const agent::core::PermissionDecision& pending) {
+        Check(pending.behavior == agent::core::PermissionBehavior::Ask,
+              "Manual callback receives ask decision");
+        agent::core::PermissionDecision resolved;
+        resolved.behavior = agent::core::PermissionBehavior::Allow;
+        resolved.reason = "approved in callback";
+        return resolved;
+      });
+
+  agent::core::ContentBlock block =
+      agent::core::ContentBlock::MakeToolUse(
+          "tu-7", "Bash", R"({"command":"unknown_cmd"})");
+  auto decision = engine.Evaluate(block, {});
+  Check(decision.behavior == agent::core::PermissionBehavior::Allow,
+        "Manual approval callback converts ask to allow");
+}
+
+void TestPermissionEngineManualApprovalCallbackDeniesAsk() {
+  agent::permissions::PermissionEngine engine;
+  engine.SetManualApprovalCallback(
+      [](const agent::core::ContentBlock&,
+         const std::vector<agent::core::Message>&,
+         const agent::core::PermissionDecision&) {
+        agent::core::PermissionDecision resolved;
+        resolved.behavior = agent::core::PermissionBehavior::Deny;
+        resolved.reason = "rejected in callback";
+        return resolved;
+      });
+
+  agent::core::ContentBlock block =
+      agent::core::ContentBlock::MakeToolUse(
+          "tu-8", "Bash", R"({"command":"unknown_cmd"})");
+  auto decision = engine.Evaluate(block, {});
+  Check(decision.behavior == agent::core::PermissionBehavior::Deny,
+        "Manual approval callback converts ask to deny");
+}
+
 }  // namespace
 
 int main() {
@@ -288,6 +330,8 @@ int main() {
   TestPermissionEngineBuildCanUseTool();
   TestPermissionEngineFailClosed();
   TestPermissionEngineModes();
+  TestPermissionEngineManualApprovalCallbackAllowsAsk();
+  TestPermissionEngineManualApprovalCallbackDeniesAsk();
 
   std::cout << "[test_classifier] Failures: " << failures << std::endl;
   return failures > 0 ? 1 : 0;
