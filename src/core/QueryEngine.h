@@ -135,7 +135,7 @@ class QueryEngine {
   std::vector<Message> messages_;
   SessionMetadata metadata_;
   QueryLoopContext loopCtx_;
-  int maxTurns_ = 500;
+  int maxTurns_ = 0;
   long long wallClockBudgetMs_ = 0;
   std::string sessionDir_;
   QueryLoopEventCallback eventCallback_;

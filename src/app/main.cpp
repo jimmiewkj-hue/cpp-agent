@@ -263,6 +263,17 @@ int GetEnvIntOrDefault(const char* name, int fallback) {
   return static_cast<int>(parsed);
 }
 
+long long GetEnvLongLongOrDefault(const char* name, long long fallback) {
+  const std::string value = TrimWhitespace(GetEnvOrDefault(name, ""));
+  if (value.empty()) return fallback;
+  char* end = nullptr;
+  const long long parsed = std::strtoll(value.c_str(), &end, 10);
+  if (end == value.c_str() || (end != nullptr && *end != '\0')) {
+    return fallback;
+  }
+  return parsed;
+}
+
 struct WorkspaceSelection {
   std::string launchDir;
   std::string candidateRoot;
@@ -1544,7 +1555,7 @@ int main() {
   llmCfg.mainModel = GetEnvOrDefault(
       "CPP_AGENT_MAIN_MODEL", "Qwen3.6-35B-A3B-Q8_0.gguf");
   llmCfg.validatorModel = GetEnvOrDefault(
-      "CPP_AGENT_VALIDATOR_MODEL", "");
+      "CPP_AGENT_VALIDATOR_MODEL", "gemma-4-31B-it-Q8_0");
   llmCfg.fallbackModel = GetEnvOrDefault(
       "CPP_AGENT_FALLBACK_MODEL", "gemma-4-31B-it-Q8_0");
   llmCfg.connectTimeoutMs = 30000;
@@ -1621,9 +1632,11 @@ int main() {
   engine.SetSubAgentManager(&subAgentManager);
   engine.SetSessionDir(sessionDir);
   engine.SetHookExecutor(&hookExecutor);
-  // P0-02: Conservative max turns for CLI (reduced from 500 default)
-  engine.SetMaxTurns(80);
-  engine.SetWallClockBudgetMs(10 * 60 * 1000);
+  const int maxTurns = GetEnvIntOrDefault("CPP_AGENT_MAX_TURNS", 0);
+  engine.SetMaxTurns(maxTurns);
+  const long long wallClockBudgetMs =
+      GetEnvLongLongOrDefault("CPP_AGENT_WALL_CLOCK_BUDGET_MS", 0);
+  engine.SetWallClockBudgetMs(wallClockBudgetMs);
   const int nonInteractiveMaxSegments =
       std::max(1, GetEnvIntOrDefault("CPP_AGENT_MAX_SEGMENTS", 4));
 

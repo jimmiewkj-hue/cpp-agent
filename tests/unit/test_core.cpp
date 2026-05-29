@@ -662,6 +662,59 @@ class ResumeAfterWallClockModelClient : public agent::api::ModelClient {
   int streamCalls = 0;
 };
 
+class ManyToolTurnsModelClient : public agent::api::ModelClient {
+ public:
+  ManyToolTurnsModelClient(int toolTurns, std::vector<std::string> readPaths)
+      : toolTurns_(toolTurns), readPaths_(std::move(readPaths)) {}
+
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  void StreamResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&,
+      const std::string&,
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
+    ++streamCalls;
+    if (!onEvent) return;
+    if (streamCalls <= toolTurns_) {
+      const std::string toolId =
+          "many-turn-read-" + std::to_string(streamCalls);
+      const std::string& readPath =
+          readPaths_[static_cast<std::size_t>(streamCalls - 1) % readPaths_.size()];
+      const std::string payload =
+          std::string("{\"id\":\"") + toolId +
+          "\",\"name\":\"FileRead\",\"input\":{\"path\":\"" + readPath +
+          "\"}}";
+      onEvent("text_delta", "继续读取上下文。");
+      onEvent("tool_use", payload);
+      onEvent("stop_reason", "tool_use");
+      return;
+    }
+    onEvent("text_delta", "跨过默认轮次后完成。");
+    onEvent("stop_reason", "end_turn");
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  int streamCalls = 0;
+
+ private:
+  int toolTurns_ = 0;
+  std::vector<std::string> readPaths_;
+};
+
 class MicrocompactCaptureModelClient : public agent::api::ModelClient {
  public:
   std::vector<agent::core::Message> GenerateResponse(
@@ -1633,6 +1686,61 @@ void TestQueryEngineCanContinueAfterWallClockTimeout() {
         "Second run should resume execution with a fresh wall-clock budget");
 }
 
+void TestQueryEngineDefaultMaxTurnsIsDisabled() {
+  const int toolTurns = 81;
+
+  agent::tools::ToolRegistry toolRegistry;
+  agent::tools::ToolSchema fileRead;
+  fileRead.name = "FileRead";
+  fileRead.description = "read file";
+  fileRead.category = agent::tools::ToolExecCategory::ReadOnly;
+  fileRead.readOnlyHint = true;
+  toolRegistry.RegisterTool(fileRead);
+
+  agent::tools::ToolOrchestrator orchestrator;
+  orchestrator.SetToolRegistry(&toolRegistry);
+  orchestrator.SetWorkspaceRoot(
+      "g:\\downloads\\claude-code\\yuanma-poxi\\cpp-agent");
+
+  agent::permissions::PermissionEngine permissionEngine;
+  permissionEngine.AddAlwaysAllowRule("FileRead");
+
+  ManyToolTurnsModelClient modelClient(
+      toolTurns,
+      {"tests/unit/test_core.cpp", "src/core/QueryEngine.cpp"});
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::infra::SessionManager sessionManager(
+      "build\\query-engine-default-maxturns-session");
+  agent::core::QueryEngine engine(
+      orchestrator, permissionEngine, modelClient, sideQueryClient,
+      toolRegistry, sessionManager);
+  engine.SetSessionDir("build\\query-engine-default-maxturns-session");
+
+  engine.SubmitUserPrompt("继续读取上下文，直到真正完成。");
+  engine.RunTurn();
+
+  bool sawFinalAssistant = false;
+  int toolResultCount = 0;
+  for (const auto& msg : engine.messages()) {
+    for (const auto& block : msg.content) {
+      if (block.type == agent::core::BlockType::Text &&
+          block.asText.text.find("跨过默认轮次后完成") != std::string::npos) {
+        sawFinalAssistant = true;
+      }
+      if (block.type == agent::core::BlockType::ToolResult) {
+        ++toolResultCount;
+      }
+    }
+  }
+
+  Check(modelClient.streamCalls == toolTurns + 1,
+        "Default QueryEngine maxTurns should not stop execution before turn 81");
+  Check(toolResultCount == toolTurns,
+        "Default QueryEngine maxTurns should allow all intermediate tool turns");
+  Check(sawFinalAssistant,
+        "Default QueryEngine maxTurns should allow the final assistant completion");
+}
+
 void TestQueryEngineSetConfigOverridesPromptAndModel() {
   agent::tools::ToolRegistry toolRegistry;
   agent::tools::ToolOrchestrator orchestrator;
@@ -1849,6 +1957,7 @@ int main() {
   TestRuntimePolicySharedRules();
   TestQueryEngineWallClockBudgetTerminatesLoop();
   TestQueryEngineCanContinueAfterWallClockTimeout();
+  TestQueryEngineDefaultMaxTurnsIsDisabled();
   TestQueryEngineSetConfigOverridesPromptAndModel();
   TestQueryEngineBuildEffectivePromptAppendsMemoryInjection();
   TestQueryEngineRunTurnUpdatesMetadataWithoutWatchdog();

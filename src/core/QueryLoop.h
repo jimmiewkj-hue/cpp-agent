@@ -147,7 +147,7 @@ class QueryLoop {
   permissions::PermissionEngine& permissionEngine_;
   api::ModelClient& modelClient_;
   api::SideQueryClient& sideQueryClient_;
-  int maxTurns_ = 500;
+  int maxTurns_ = 0;
   long long wallClockBudgetMs_ = 0;
   long long loopStartTimeMs_ = 0;
 };

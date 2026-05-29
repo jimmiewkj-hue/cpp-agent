@@ -952,7 +952,9 @@ QueryLoop::QueryLoop(tools::ToolOrchestrator& toolOrchestrator,
       modelClient_(modelClient),
       sideQueryClient_(sideQueryClient) {}
 
-void QueryLoop::SetMaxTurns(int maxTurns) { maxTurns_ = maxTurns; }
+void QueryLoop::SetMaxTurns(int maxTurns) {
+  maxTurns_ = maxTurns > 0 ? maxTurns : 0;
+}
 
 void QueryLoop::SetWallClockBudget(long long budgetMs) {
   wallClockBudgetMs_ = budgetMs;
@@ -2124,7 +2126,7 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
         state.messagesForTurn = BuildMessagesForTurn(ctx, state);
         state.nextTurnCount = state.turnCount + 1;
         ++state.turnCount;
-        if (state.turnCount > maxTurns_) {
+        if (maxTurns_ > 0 && state.turnCount > maxTurns_) {
           state.completed = true;
           state.terminalReason = "max_turns";
           continue;

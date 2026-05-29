@@ -103,7 +103,7 @@ void QueryEngine::SetStabilityWatchdog(infra::StabilityWatchdog* watchdog) {
 }
 
 void QueryEngine::SetMaxTurns(int maxTurns) {
-  maxTurns_ = maxTurns;
+  maxTurns_ = maxTurns > 0 ? maxTurns : 0;
 }
 
 void QueryEngine::SetWallClockBudgetMs(long long budgetMs) {
