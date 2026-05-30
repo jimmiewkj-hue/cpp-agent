@@ -43,7 +43,8 @@ enum ProtoSnapshotFieldTag {
 
 enum MetadataFieldTag {
   kMetadataId = 1,
-  kMetadataTurnCount = 2
+  kMetadataTurnCount = 2,
+  kMetadataLastTerminalReason = 3
 };
 
 enum MessageFieldTag {
@@ -1090,6 +1091,8 @@ std::string SerializeMetadata(const agent::core::SessionMetadata& metadata) {
   AppendField(&output, kMetadataId, MakeStringFieldPayload(metadata.id));
   AppendField(&output, kMetadataTurnCount,
               MakeI32FieldPayload(metadata.turnCount));
+  AppendField(&output, kMetadataLastTerminalReason,
+              MakeStringFieldPayload(metadata.lastTerminalReason));
   return output;
 }
 
@@ -1112,6 +1115,9 @@ bool DeserializeMetadata(
         break;
       case kMetadataTurnCount:
         ReadI32Payload(fieldPayload, &metadata->turnCount);
+        break;
+      case kMetadataLastTerminalReason:
+        metadata->lastTerminalReason = fieldPayload;
         break;
       default:
         break;
@@ -1586,6 +1592,8 @@ std::string SerializeProtoMetadata(const agent::core::SessionMetadata& metadata)
   std::string output;
   protolite::WriteString(&output, kMetadataId, metadata.id);
   protolite::WriteInt32(&output, kMetadataTurnCount, metadata.turnCount);
+  protolite::WriteString(
+      &output, kMetadataLastTerminalReason, metadata.lastTerminalReason);
   return output;
 }
 
@@ -1604,6 +1612,9 @@ bool DeserializeProtoMetadata(
         break;
       case kMetadataTurnCount:
         protolite::FieldToInt32(field, &metadata->turnCount);
+        break;
+      case kMetadataLastTerminalReason:
+        protolite::FieldToString(field, &metadata->lastTerminalReason);
         break;
       default:
         break;
@@ -1789,6 +1800,8 @@ void BuildLegacySnapshotText(
   body << "session_id=" << snap.sessionId << "\n";
   body << "timestamp=" << snap.timestamp << "\n";
   body << "turn_count=" << snap.metadata.turnCount << "\n";
+  body << "terminal_reason="
+       << EscapeField(snap.metadata.lastTerminalReason) << "\n";
   body << "message_count=" << snap.messages.size() << "\n";
   body << "subtask_count=" << snap.subAgentTasks.size() << "\n";
 
@@ -1892,6 +1905,8 @@ bool RestoreLegacyTextSnapshot(
   snapshot->timestamp = ReadSnapshotValue(lines, "timestamp");
   snapshot->metadata.id = snapshot->sessionId;
   snapshot->metadata.turnCount = ReadSnapshotInt(lines, "turn_count");
+  snapshot->metadata.lastTerminalReason =
+      ReadSnapshotValue(lines, "terminal_reason");
 
   const int messageCount = ReadSnapshotInt(lines, "message_count");
   for (int i = 0; i < messageCount; ++i) {

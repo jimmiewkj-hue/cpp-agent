@@ -96,6 +96,7 @@ struct SessionMetadata {
   std::string startTime;
   int turnCount = 0;
   bool aborted = false;
+  std::string lastTerminalReason;
 };
 
 }  // namespace core

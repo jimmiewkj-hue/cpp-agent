@@ -66,6 +66,7 @@ struct QueryLoopContext {
   bool hasAttemptedReactiveCompact = false;
   std::string sessionDir;
   infra::SessionManager* sessionManager = nullptr;
+  std::string lastTerminalReason;
   QueryLoopEventCallback eventCallback;
   hooks::HookExecutor* hookExecutor = nullptr;
 };

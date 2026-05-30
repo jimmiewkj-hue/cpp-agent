@@ -36,6 +36,8 @@ struct QueryLoopInternalState {
   std::vector<ContentBlock> toolUseBlocks;
   bool completed = false;
   bool validatorRequestedRetry = false;
+  int validatorRetryCount = 0;
+  std::string lastValidatorGuidance;
   int missingToolUsePromptCount = 0;
   bool hasPromptedForWorkspaceExploration = false;
   bool forceContinuation = false;

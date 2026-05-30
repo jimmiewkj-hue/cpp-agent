@@ -243,6 +243,61 @@ std::string ToLowerAscii(std::string value) {
   return value;
 }
 
+std::string NormalizePathSeparators(std::string value) {
+  std::replace(value.begin(), value.end(), '/', '\\');
+  return value;
+}
+
+std::string MakeWorkspaceRelativePath(const std::string& workspaceRoot,
+                                      const std::string& candidatePath) {
+  if (workspaceRoot.empty() || candidatePath.empty()) return std::string();
+  std::string normalizedRoot = NormalizePathSeparators(workspaceRoot);
+  std::string normalizedCandidate = NormalizePathSeparators(candidatePath);
+  if (normalizedRoot.empty() || normalizedCandidate.empty()) return std::string();
+  if (normalizedRoot.back() != '\\') normalizedRoot.push_back('\\');
+
+  const std::string lowerRoot = ToLowerAscii(normalizedRoot);
+  const std::string lowerCandidate = ToLowerAscii(normalizedCandidate);
+  if (lowerCandidate.size() < lowerRoot.size()) return std::string();
+  if (lowerCandidate.compare(0, lowerRoot.size(), lowerRoot) != 0) {
+    return std::string();
+  }
+
+  std::string relative = normalizedCandidate.substr(normalizedRoot.size());
+  while (!relative.empty() &&
+         (relative.front() == '\\' || relative.front() == '/')) {
+    relative.erase(relative.begin());
+  }
+  return relative;
+}
+
+bool RewriteWorkspaceRelativePaths(json* value,
+                                   const std::string& workspaceRoot) {
+  if (value == nullptr || workspaceRoot.empty()) return false;
+  bool changed = false;
+  if (value->is_object()) {
+    static const std::set<std::string> kPathKeys = {
+        "file_path", "path", "cwd", "notebook_path"};
+    for (auto it = value->begin(); it != value->end(); ++it) {
+      if (kPathKeys.find(it.key()) != kPathKeys.end() && it->is_string()) {
+        const std::string relative =
+            MakeWorkspaceRelativePath(workspaceRoot, it->get<std::string>());
+        if (!relative.empty()) {
+          *it = relative;
+          changed = true;
+        }
+        continue;
+      }
+      changed = RewriteWorkspaceRelativePaths(&(*it), workspaceRoot) || changed;
+    }
+  } else if (value->is_array()) {
+    for (auto& item : *value) {
+      changed = RewriteWorkspaceRelativePaths(&item, workspaceRoot) || changed;
+    }
+  }
+  return changed;
+}
+
 std::string CollectText(const std::vector<Message>& messages) {
   std::ostringstream out;
   bool first = true;
@@ -255,6 +310,114 @@ std::string CollectText(const std::vector<Message>& messages) {
     }
   }
   return out.str();
+}
+
+std::string NormalizeForFingerprint(const std::string& text) {
+  std::string normalized;
+  normalized.reserve(text.size());
+  bool previousWasSpace = false;
+  for (unsigned char ch : text) {
+    if (std::isspace(ch)) {
+      if (!previousWasSpace && !normalized.empty()) normalized.push_back(' ');
+      previousWasSpace = true;
+      continue;
+    }
+    normalized.push_back(static_cast<char>(std::tolower(ch)));
+    previousWasSpace = false;
+    if (normalized.size() >= 160) break;
+  }
+  while (!normalized.empty() && normalized.back() == ' ') {
+    normalized.pop_back();
+  }
+  return normalized;
+}
+
+std::string CollectToolResultFingerprint(const Message& message,
+                                         bool errorsOnly) {
+  std::ostringstream out;
+  bool first = true;
+  for (const auto& block : message.content) {
+    if (block.type != BlockType::ToolResult) continue;
+    if (errorsOnly && !block.asToolResult.isError) continue;
+    const std::string normalized =
+        NormalizeForFingerprint(block.asToolResult.content);
+    if (normalized.empty()) continue;
+    if (!first) out << "|";
+    first = false;
+    out << (block.asToolResult.isError ? "error:" : "ok:") << normalized;
+  }
+  return out.str();
+}
+
+int CountConsecutiveRecentToolResults(const std::vector<Message>& messages,
+                                      bool errorsOnly,
+                                      std::string* latestFingerprint) {
+  std::string target;
+  int count = 0;
+  for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
+    const std::string fingerprint =
+        CollectToolResultFingerprint(*it, errorsOnly);
+    if (fingerprint.empty()) continue;
+    if (target.empty()) {
+      target = fingerprint;
+      count = 1;
+      continue;
+    }
+    if (fingerprint != target) break;
+    ++count;
+  }
+  if (latestFingerprint != nullptr) *latestFingerprint = target;
+  return count;
+}
+
+std::string BuildRecentExecutionMemory(const QueryLoopContext& ctx,
+                                       const QueryLoopInternalState& state) {
+  std::vector<std::string> lines;
+  if (state.validatorRetryCount >= 2) {
+    std::string line =
+        "Validator has already requested a retry_from_tools "
+        + std::to_string(state.validatorRetryCount)
+        + " consecutive times.";
+    if (!state.lastValidatorGuidance.empty()) {
+      line += " Latest guidance: " + state.lastValidatorGuidance;
+    }
+    lines.push_back(line);
+  }
+
+  std::string repeatedErrorFingerprint;
+  const int repeatedErrorCount = CountConsecutiveRecentToolResults(
+      ctx.messages, true, &repeatedErrorFingerprint);
+  if (repeatedErrorCount >= 2 && !repeatedErrorFingerprint.empty()) {
+    lines.push_back(
+        "The same error tool result has appeared "
+        + std::to_string(repeatedErrorCount)
+        + " consecutive times. Do not rerun the same failing action without a"
+          " concrete change. Latest error: "
+        + repeatedErrorFingerprint);
+  }
+
+  if (lines.empty()) return std::string();
+
+  std::ostringstream out;
+  out << "[Recent execution memory]";
+  for (const auto& line : lines) {
+    out << "\n- " << line;
+  }
+  return out.str();
+}
+
+Message MakeTerminalTranscriptRecord(const QueryLoopInternalState& state) {
+  Message record;
+  record.role = MessageRole::System;
+  record.uuid = "query-loop-terminal-" + state.terminalReason;
+  record.isMeta = true;
+  record.stopReason = state.terminalReason;
+  record.content.push_back(ContentBlock::MakeText(
+      "[session] query loop completed with terminal reason: "
+      + state.terminalReason
+      + " (turn_count=" + std::to_string(state.turnCount)
+      + ", model_calls=" + std::to_string(state.modelCallCount) + ")"));
+  return record;
 }
 
 bool MessageHasTextOrToolContent(const Message& message) {
@@ -470,6 +633,14 @@ bool AssistantIntendsFurtherExecution(
          ContainsToken(original, "让我继续创建") ||
          ContainsToken(original, "继续创建") ||
          ContainsToken(original, "继续实现") ||
+         ContainsToken(original, "继续处理") ||
+         ContainsToken(original, "继续修复") ||
+         ContainsToken(original, "继续检查") ||
+         ContainsToken(original, "继续执行") ||
+         ContainsToken(original, "我继续处理") ||
+         ContainsToken(original, "我继续修复") ||
+         ContainsToken(original, "我继续检查") ||
+         ContainsToken(original, "我继续执行") ||
          ContainsToken(original, "先从") ||
          ContainsToken(original, "首先创建") ||
          ContainsToken(original, "还需要创建") ||
@@ -689,7 +860,8 @@ std::string BuildValidationContext(
     const std::vector<Message>& messages,
     const std::vector<Message>& assistantMessages,
     const std::vector<ContentBlock>& toolUseBlocks,
-    const tools::ToolRegistry* toolRegistry) {
+    const tools::ToolRegistry* toolRegistry,
+    const std::string& workspaceRoot) {
   std::string goal;
   for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
     if (it->role != MessageRole::User) continue;
@@ -721,6 +893,7 @@ std::string BuildValidationContext(
       action["input"] = tb.asToolUse.inputJson.empty()
           ? json::object()
           : json::parse(tb.asToolUse.inputJson);
+      RewriteWorkspaceRelativePaths(&action["input"], workspaceRoot);
     } catch (...) {
       action["input"] = json::object();
     }
@@ -817,6 +990,10 @@ corrected text here
 Rules:
 - Only intervene when there is a real error or safety concern
 - For tool_interventions, you can both rewrite some tools and block others
+- If the only issue is path formatting for files inside the current workspace,
+  prefer a "rewrite" intervention over "block" or "retry_from_tools"
+- Absolute workspace paths and relative workspace paths are both acceptable for
+  read/search tools when they resolve to the same in-workspace target
 - "retry_from_tools" means the assistant fundamentally misunderstood and needs to redo tool work
 - Never invent information not present in the context)VALIDATOR";
 }
@@ -1038,8 +1215,18 @@ bool QueryLoop::ShouldTerminateOnDuplicates(
 
 std::vector<Message> QueryLoop::BuildMessagesForTurn(
     const QueryLoopContext& ctx,
-    const QueryLoopInternalState&) const {
-  return ctx.messages;
+    const QueryLoopInternalState& state) const {
+  std::vector<Message> messages = ctx.messages;
+  const std::string executionMemory = BuildRecentExecutionMemory(ctx, state);
+  if (!executionMemory.empty()) {
+    Message memory;
+    memory.role = MessageRole::System;
+    memory.uuid = "recent-execution-memory";
+    memory.isMeta = true;
+    memory.content.push_back(ContentBlock::MakeText(executionMemory));
+    messages.push_back(memory);
+  }
+  return messages;
 }
 
 void QueryLoop::AppendTurnArtifacts(
@@ -1601,7 +1788,7 @@ void QueryLoop::ApplyStepValidator(QueryLoopContext& ctx,
 
   std::string contextJson = BuildValidationContext(
       ctx.messages, state.assistantMessages, state.toolUseBlocks,
-      toolOrchestrator_.GetToolRegistry());
+      toolOrchestrator_.GetToolRegistry(), toolOrchestrator_.workspaceRoot());
 
   api::SideQueryRequest request;
   request.querySource = "validator";
@@ -1692,16 +1879,24 @@ void QueryLoop::ApplyStepValidator(QueryLoopContext& ctx,
   }
 
   if (vresult.finalResponseAction == "retry_from_tools") {
+    const std::string retryGuidance =
+        vresult.retryGuidance.empty()
+            ? "Retry from tools."
+            : vresult.retryGuidance;
     state.validatorRequestedRetry = true;
+    ++state.validatorRetryCount;
+    state.lastValidatorGuidance = retryGuidance;
     state.toolUseBlocks.clear();
     Message guidance;
     guidance.role = MessageRole::User;
     guidance.uuid = "validator-retry";
     guidance.isMeta = true;
     guidance.content.push_back(ContentBlock::MakeText(
-        "[Validator] " + (vresult.retryGuidance.empty()
-            ? "Retry from tools." : vresult.retryGuidance)));
+        "[Validator] " + retryGuidance));
     state.pendingFollowupMessages.push_back(guidance);
+  } else {
+    state.validatorRetryCount = 0;
+    state.lastValidatorGuidance.clear();
   }
 }
 
@@ -1916,7 +2111,9 @@ bool QueryLoop::ApplyStepRunTools(QueryLoopContext& ctx,
           &toolMsg);
     }
     state.assistantMessages.clear();
-  state.stopHookActive = false;
+    state.stopHookActive = false;
+    state.validatorRetryCount = 0;
+    state.lastValidatorGuidance.clear();
     state.forcedContinuationCount = 0;
     state.toolUseBlocks.clear();
     return !simulatedResults.empty();
@@ -1965,6 +2162,8 @@ bool QueryLoop::ApplyStepRunTools(QueryLoopContext& ctx,
   }
   state.assistantMessages.clear();
   state.stopHookActive = false;
+  state.validatorRetryCount = 0;
+  state.lastValidatorGuidance.clear();
   state.forcedContinuationCount = 0;
   state.toolUseBlocks.clear();
   return !execResult.userMessages.empty();
@@ -1991,6 +2190,8 @@ bool QueryLoop::ApplyStepTerminate(QueryLoopContext& ctx,
 
 bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
                                          QueryLoopInternalState& state) {
+  static const int kMaxValidatorRetryContinuations = 3;
+  static const int kMaxRepeatedErrorToolResults = 3;
   ReportQueryLoopDebugEvent(
       "4", "QueryLoop.cpp:no-tool:entry",
       "[DEBUG] Evaluating no-tool continuation",
@@ -2005,6 +2206,31 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
        {"forceContinuation", state.forceContinuation},
        {"forceContinuationReason", state.forceContinuationReason}},
       MakeQueryLoopTraceId("no-tool"));
+  if (state.validatorRequestedRetry &&
+      state.validatorRetryCount >= kMaxValidatorRetryContinuations) {
+    Message note;
+    note.role = MessageRole::System;
+    note.uuid = "validator-retry-limit";
+    note.isMeta = true;
+    std::string text =
+        "[system] Terminating: validator requested retry_from_tools "
+        + std::to_string(state.validatorRetryCount)
+        + " consecutive times. Stop the retry loop and surface the current "
+          "state instead of repeating the same correction cycle.";
+    if (!state.lastValidatorGuidance.empty()) {
+      text += " Latest guidance: " + state.lastValidatorGuidance;
+    }
+    note.content.push_back(ContentBlock::MakeText(text));
+    AppendTurnArtifacts(
+        ctx, state.assistantMessages, state.toolResultMessages, {note});
+    state.assistantMessages.clear();
+    state.toolResultMessages.clear();
+    state.pendingFollowupMessages.clear();
+    state.toolUseBlocks.clear();
+    state.completed = true;
+    state.terminalReason = "validator_retry_limit";
+    return false;
+  }
   if (state.validatorRequestedRetry || !state.pendingFollowupMessages.empty()) {
     ReportQueryLoopDebugEvent(
         "3", "QueryLoop.cpp:no-tool:validator-retry",
@@ -2044,6 +2270,37 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
     state.transition = TransitionReason::ForcedContinuation;
     state.stage = QueryStage::ToolResultBudget;
     return true;
+  }
+
+  std::string repeatedErrorFingerprint;
+  const int repeatedErrorCount = CountConsecutiveRecentToolResults(
+      ctx.messages, true, &repeatedErrorFingerprint);
+  const bool intendsMoreExecution =
+      state.forceContinuation ||
+      AssistantIntendsWorkspaceWrite(state.assistantMessages) ||
+      AssistantIntendsFurtherExecution(state.assistantMessages);
+  if (intendsMoreExecution &&
+      repeatedErrorCount >= kMaxRepeatedErrorToolResults &&
+      !repeatedErrorFingerprint.empty()) {
+    Message note;
+    note.role = MessageRole::System;
+    note.uuid = "repeated-tool-error-limit";
+    note.isMeta = true;
+    note.content.push_back(ContentBlock::MakeText(
+        "[system] Terminating: the same failing tool result repeated "
+        + std::to_string(repeatedErrorCount)
+        + " consecutive times. Do not keep rerunning the same failing action "
+          "without a concrete code or dependency change. Latest error: "
+        + repeatedErrorFingerprint));
+    AppendTurnArtifacts(
+        ctx, state.assistantMessages, state.toolResultMessages, {note});
+    state.assistantMessages.clear();
+    state.toolResultMessages.clear();
+    state.pendingFollowupMessages.clear();
+    state.toolUseBlocks.clear();
+    state.completed = true;
+    state.terminalReason = "repeated_tool_result_loop";
+    return false;
   }
 
   if (ShouldForceContinuation(ctx, state)) {
@@ -2331,6 +2588,14 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
   EmitQueryLoopEvent(
       ctx, QueryLoopEvent::Type::LoopCompleted, QueryStage::Completed, nullptr,
       state.terminalReason);
+  ctx.lastTerminalReason = state.terminalReason;
+  if (ctx.sessionManager != nullptr) {
+    SessionMetadata metadata = ctx.sessionManager->metadata();
+    metadata.lastTerminalReason = state.terminalReason;
+    ctx.sessionManager->SetMetadata(metadata);
+    ctx.sessionManager->AppendMessageToTranscript(
+        MakeTerminalTranscriptRecord(state));
+  }
   ctx.maxOutputTokensRecoveryCount = state.maxOutputTokensRecoveryCount;
   ctx.hasAttemptedReactiveCompact = state.hasAttemptedReactiveCompact;
 }

@@ -155,6 +155,7 @@ void QueryEngine::RunTurn() {
   loopCtx_.validatorModel = validatorModel_;
   loopCtx_.sessionDir = sessionDir_;
   loopCtx_.sessionManager = &sessionManager_;
+  loopCtx_.lastTerminalReason.clear();
   loopCtx_.eventCallback = eventCallback_;
   loopCtx_.hookExecutor = hookExecutor_;
 
@@ -165,6 +166,7 @@ void QueryEngine::RunTurn() {
   loop.RunFull(loopCtx_);
 
   messages_ = loopCtx_.messages;
+  metadata_.lastTerminalReason = loopCtx_.lastTerminalReason;
   SyncSessionState();
 
   sessionManager_.FlushTranscriptBuffer();

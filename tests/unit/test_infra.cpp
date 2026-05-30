@@ -102,6 +102,22 @@ void TestSessionManagerKeepsDefaultMetadata() {
         "SessionManager snapshot should retain session id after empty metadata");
 }
 
+void TestSessionManagerPersistsTerminalReasonMetadata() {
+  EnsureTestSessionDir();
+  agent::infra::SessionManager mgr(TestSessionDir());
+
+  agent::core::SessionMetadata metadata = mgr.metadata();
+  metadata.lastTerminalReason = "validator_retry_limit";
+  mgr.SetMetadata(metadata);
+  mgr.PersistSnapshot();
+
+  agent::infra::SessionManager restored(TestSessionDir());
+  Check(restored.RestoreFromDisk(),
+        "SessionManager should restore snapshot with terminal reason metadata");
+  Check(restored.metadata().lastTerminalReason == "validator_retry_limit",
+        "Restored metadata should preserve the last terminal reason");
+}
+
 void TestSessionManagerFlushesTranscriptAtThreshold() {
   EnsureTestSessionDir();
   agent::infra::SessionManager mgr(TestSessionDir());
@@ -236,6 +252,7 @@ int main() {
   TestSessionManager();
   TestSessionManagerReadback();
   TestSessionManagerKeepsDefaultMetadata();
+  TestSessionManagerPersistsTerminalReasonMetadata();
   TestSessionManagerFlushesTranscriptAtThreshold();
   TestStabilityWatchdog();
   TestStabilityWatchdogCallbacks();

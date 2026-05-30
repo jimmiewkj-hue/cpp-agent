@@ -315,6 +315,70 @@ class ValidatorRetryModelClient : public agent::api::ModelClient {
   bool secondCallSawPreviousToolUse = false;
 };
 
+class ValidatorRetryLoopModelClient : public agent::api::ModelClient {
+ public:
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  void StreamResponse(
+      const std::vector<agent::core::Message>& messages,
+      const std::string&,
+      const std::string&,
+      const std::string&,
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
+    ++streamCalls;
+    if (streamCalls == 3) {
+      thirdCallSawExecutionMemory = ContainsText(
+          messages, "[Recent execution memory]");
+    }
+    if (!onEvent) return;
+    onEvent("text_delta", "我先直接读取 README。");
+    onEvent(
+        "tool_use",
+        R"({"id":"validator-loop-tu","name":"FileRead","input":{"path":"README.md"}})");
+    onEvent("stop_reason", "tool_use");
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    ++validatorCalls;
+    agent::core::Message msg;
+    msg.role = agent::core::MessageRole::Assistant;
+    msg.content.push_back(agent::core::ContentBlock::MakeText(
+        "<validation_json>{"
+        "\"text_correction\":{\"needed\":false},"
+        "\"tool_interventions\":[],"
+        "\"final_response_action\":\"retry_from_tools\","
+        "\"retry_guidance\":\"Stop rereading README and inspect the project structure first.\""
+        "}</validation_json>"));
+    return {msg};
+  }
+
+  static bool ContainsText(const std::vector<agent::core::Message>& messages,
+                           const std::string& needle) {
+    for (const auto& msg : messages) {
+      for (const auto& block : msg.content) {
+        if (block.type == agent::core::BlockType::Text &&
+            block.asText.text.find(needle) != std::string::npos) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  int streamCalls = 0;
+  int validatorCalls = 0;
+  bool thirdCallSawExecutionMemory = false;
+};
+
 class ValidatorCorrectionModelClient : public agent::api::ModelClient {
  public:
   std::vector<agent::core::Message> GenerateResponse(
@@ -426,6 +490,76 @@ class PlanningOnlyModelClient : public agent::api::ModelClient {
   }
 
   int streamCalls = 0;
+};
+
+class RepeatedToolFailureModelClient : public agent::api::ModelClient {
+ public:
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  void StreamResponse(
+      const std::vector<agent::core::Message>& messages,
+      const std::string&,
+      const std::string&,
+      const std::string&,
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
+    ++streamCalls;
+    if (streamCalls == 4) {
+      fourthCallSawExecutionMemory = ContainsText(
+          messages, "[Recent execution memory]");
+      if (onEvent) {
+        onEvent("text_delta", "我继续处理这个错误。");
+        onEvent("stop_reason", "end_turn");
+      }
+      return;
+    }
+    if (!onEvent) return;
+    onEvent("text_delta", "我再检查一次失败原因。");
+    if (streamCalls % 2 == 1) {
+      onEvent(
+          "tool_use",
+          R"({"id":"repeat-glob","name":"Glob","input":{"pattern":"src/*.cpp"}})");
+      onEvent(
+          "tool_use",
+          R"({"id":"repeat-read","name":"FileRead","input":{"path":"build/missing-loop-target.txt"}})");
+    } else {
+      onEvent(
+          "tool_use",
+          R"({"id":"repeat-read","name":"FileRead","input":{"path":"build/missing-loop-target.txt"}})");
+      onEvent(
+          "tool_use",
+          R"({"id":"repeat-glob","name":"Glob","input":{"pattern":"src/*.cpp"}})");
+    }
+    onEvent("stop_reason", "tool_use");
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  static bool ContainsText(const std::vector<agent::core::Message>& messages,
+                           const std::string& needle) {
+    for (const auto& msg : messages) {
+      for (const auto& block : msg.content) {
+        if (block.type == agent::core::BlockType::Text &&
+            block.asText.text.find(needle) != std::string::npos) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  int streamCalls = 0;
+  bool fourthCallSawExecutionMemory = false;
 };
 
 class RepeatedMissingToolUseModelClient : public agent::api::ModelClient {
@@ -541,7 +675,7 @@ class StopHookContinuationModelClient : public agent::api::ModelClient {
       onEvent("stop_reason", "end_turn");
       return;
     }
-    onEvent("text_delta", "根据 stop hook 提示，我继续执行测试。");
+    onEvent("text_delta", "根据 stop hook 提示，测试已执行完成。");
     onEvent("stop_reason", "end_turn");
   }
 
@@ -553,6 +687,86 @@ class StopHookContinuationModelClient : public agent::api::ModelClient {
   }
 
   int streamCalls = 0;
+};
+
+class ValidatorPathNormalizationModelClient : public agent::api::ModelClient {
+ public:
+  explicit ValidatorPathNormalizationModelClient(std::string absolutePath)
+      : absolutePath_(std::move(absolutePath)) {}
+
+  std::vector<agent::core::Message> GenerateResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&) override {
+    return {};
+  }
+
+  void StreamResponse(
+      const std::vector<agent::core::Message>&,
+      const std::string&,
+      const std::string&,
+      const std::string&,
+      const agent::api::SseEventCallback& onEvent,
+      int) override {
+    ++streamCalls;
+    if (!onEvent) return;
+    if (streamCalls == 1) {
+      const std::string payload =
+          std::string("{\"id\":\"validator-path-read\",\"name\":\"Read\",\"input\":")
+          + "{\"file_path\":\"" + absolutePath_ +
+          "\",\"offset\":1,\"limit\":5}}";
+      onEvent("text_delta", "我先读取目标文件。");
+      onEvent("tool_use", payload);
+      onEvent("stop_reason", "tool_use");
+      return;
+    }
+    onEvent("text_delta", "路径归一化验证完成。");
+    onEvent("stop_reason", "end_turn");
+  }
+
+  std::vector<agent::core::Message> SideQuery(
+      const std::vector<agent::core::Message>& messages,
+      const std::string& systemPrompt,
+      const std::string&) override {
+    ++validatorCalls;
+    if (validatorCalls == 1) {
+      capturedValidationContext.clear();
+      for (const auto& msg : messages) {
+        for (const auto& block : msg.content) {
+          if (block.type == agent::core::BlockType::Text) {
+            capturedValidationContext += block.asText.text;
+          }
+        }
+      }
+      capturedValidatorSystemPrompt = systemPrompt;
+      sawRelativePath =
+          capturedValidationContext.find("\"file_path\": \"tests\\\\unit\\\\test_core.cpp\"") !=
+          std::string::npos;
+      sawAbsolutePath =
+          capturedValidationContext.find("G:/downloads/claude-code/yuanma-poxi/cpp-agent/tests/unit/test_core.cpp") !=
+          std::string::npos;
+    }
+
+    agent::core::Message msg;
+    msg.role = agent::core::MessageRole::Assistant;
+    msg.content.push_back(agent::core::ContentBlock::MakeText(
+        "<validation_json>{"
+        "\"text_correction\":{\"needed\":false},"
+        "\"tool_interventions\":[],"
+        "\"final_response_action\":\"approve\""
+        "}</validation_json>"));
+    return {msg};
+  }
+
+  int streamCalls = 0;
+  int validatorCalls = 0;
+  bool sawRelativePath = false;
+  bool sawAbsolutePath = false;
+  std::string capturedValidationContext;
+  std::string capturedValidatorSystemPrompt;
+
+ private:
+  std::string absolutePath_;
 };
 
 class CompactHookModelClient : public agent::api::ModelClient {
@@ -1176,6 +1390,87 @@ void TestQueryLoopValidatorRetryBeforeToolExecution() {
         "Second-turn assistant answer should be persisted");
 }
 
+void TestValidatorRetryTerminatesAfterRetryLimit() {
+  const std::string sessionDir = "build\\validator-retry-limit-session";
+  agent::tools::ToolRegistry toolRegistry;
+  agent::tools::ToolSchema fileRead;
+  fileRead.name = "FileRead";
+  fileRead.description = "read file";
+  fileRead.category = agent::tools::ToolExecCategory::ReadOnly;
+  fileRead.readOnlyHint = true;
+  toolRegistry.RegisterTool(fileRead);
+
+  agent::tools::ToolOrchestrator orchestrator;
+  orchestrator.SetToolRegistry(&toolRegistry);
+  orchestrator.SetWorkspaceRoot(
+      "g:\\downloads\\claude-code\\yuanma-poxi\\cpp-agent");
+
+  agent::permissions::PermissionEngine permissionEngine;
+  permissionEngine.AddAlwaysAllowRule("FileRead");
+
+  ValidatorRetryLoopModelClient modelClient;
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::infra::SessionManager sessionManager(sessionDir);
+  agent::core::QueryLoop loop(
+      orchestrator, permissionEngine, modelClient, sideQueryClient);
+
+  std::string terminalReason;
+  agent::core::QueryLoopContext ctx;
+  ctx.systemPrompt = "system";
+  ctx.model = "main-model";
+  ctx.validatorModel = "validator-model";
+  ctx.sessionManager = &sessionManager;
+  ctx.eventCallback =
+      [&](const agent::core::QueryLoopEvent& event) {
+        if (event.type == agent::core::QueryLoopEvent::Type::LoopCompleted) {
+          terminalReason = event.terminalReason;
+        }
+      };
+
+  agent::core::Message user;
+  user.role = agent::core::MessageRole::User;
+  user.uuid = "user-validator-limit";
+  user.content.push_back(agent::core::ContentBlock::MakeText(
+      "先看结构再修复，不要一直重复读同一个文件。"));
+  ctx.messages.push_back(user);
+
+  loop.RunFull(ctx);
+
+  Check(modelClient.streamCalls == 3,
+        "Validator retry loop should stop after the retry limit");
+  Check(modelClient.validatorCalls == 3,
+        "Validator retry loop should only consume the configured retry budget");
+  Check(modelClient.thirdCallSawExecutionMemory,
+        "Later retry turns should receive recent execution memory guidance");
+  Check(terminalReason == "validator_retry_limit",
+        "Validator retry limit should complete with a dedicated terminal reason");
+
+  bool sawRetryLimitNote = false;
+  for (const auto& msg : ctx.messages) {
+    for (const auto& block : msg.content) {
+      if (block.type == agent::core::BlockType::Text &&
+          block.asText.text.find("validator requested retry_from_tools 3 consecutive times") !=
+              std::string::npos) {
+        sawRetryLimitNote = true;
+      }
+    }
+  }
+  Check(sawRetryLimitNote,
+        "Validator retry limit should append an explicit termination note");
+
+  sessionManager.FlushTranscriptBuffer();
+  const agent::core::SessionMetadata metadata = sessionManager.metadata();
+  Check(metadata.lastTerminalReason == "validator_retry_limit",
+        "Session metadata should store validator_retry_limit");
+
+  std::ifstream transcript(sessionManager.TranscriptJsonlPath(), std::ios::binary);
+  std::string transcriptText((std::istreambuf_iterator<char>(transcript)),
+                             std::istreambuf_iterator<char>());
+  Check(transcriptText.find("\"stop_reason\":\"validator_retry_limit\"") !=
+            std::string::npos,
+        "Transcript should include the validator_retry_limit stop reason record");
+}
+
 void TestQueryLoopValidatorTextCorrection() {
   agent::tools::ToolOrchestrator orchestrator;
   agent::permissions::PermissionEngine permissionEngine;
@@ -1220,6 +1515,57 @@ void TestQueryLoopValidatorTextCorrection() {
         "Validator corrected text should replace the assistant output");
   Check(!sawOriginalAnswer,
         "Original uncorrected text should not remain in final history");
+}
+
+void TestValidatorSeesWorkspaceRelativePathsAndRewriteGuidance() {
+  const std::string workspaceRoot =
+      "g:\\downloads\\claude-code\\yuanma-poxi\\cpp-agent";
+  const std::string absolutePath =
+      "G:/downloads/claude-code/yuanma-poxi/cpp-agent/tests/unit/test_core.cpp";
+
+  agent::tools::ToolRegistry toolRegistry;
+  for (const auto& tool : agent::tools::ToolRegistry::GetAllBaseTools()) {
+    if (tool.name == "Read") {
+      toolRegistry.RegisterTool(tool);
+    }
+  }
+
+  agent::tools::ToolOrchestrator orchestrator;
+  orchestrator.SetToolRegistry(&toolRegistry);
+  orchestrator.SetWorkspaceRoot(workspaceRoot);
+
+  agent::permissions::PermissionEngine permissionEngine;
+  permissionEngine.AddAlwaysAllowRule("Read");
+
+  ValidatorPathNormalizationModelClient modelClient(absolutePath);
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::core::QueryLoop loop(
+      orchestrator, permissionEngine, modelClient, sideQueryClient);
+
+  agent::core::QueryLoopContext ctx;
+  ctx.systemPrompt = "system";
+  ctx.model = "main-model";
+  ctx.validatorModel = "validator-model";
+
+  agent::core::Message user;
+  user.role = agent::core::MessageRole::User;
+  user.uuid = "user-path-normalization";
+  user.content.push_back(agent::core::ContentBlock::MakeText(
+      "请读取 test_core.cpp 的前几行。"));
+  ctx.messages.push_back(user);
+
+  loop.RunFull(ctx);
+
+  Check(modelClient.validatorCalls >= 1,
+        "Validator should run for the path normalization test");
+  Check(modelClient.sawRelativePath,
+        "Validation context should normalize in-workspace absolute paths to relative paths");
+  Check(!modelClient.sawAbsolutePath,
+        "Validation context should avoid leaking absolute workspace paths when a relative path is enough");
+  Check(modelClient.capturedValidatorSystemPrompt.find(
+            "prefer a \"rewrite\" intervention over \"block\" or \"retry_from_tools\"") !=
+            std::string::npos,
+        "Validator prompt should steer path-only issues toward rewrite instead of retry");
 }
 
 void TestHttpLlmClientConstruction() {
@@ -1332,6 +1678,81 @@ void TestForcedContinuationLimitPersistsAcrossFollowups() {
 
   Check(modelClient.streamCalls == 9,
         "Forced continuation count should stop repeated plan-only turns");
+}
+
+void TestRepeatedToolFailureTerminatesContinuationLoop() {
+  const std::string sessionDir = "build\\repeated-tool-result-loop-session";
+  agent::tools::ToolRegistry toolRegistry;
+  for (const auto& tool : agent::tools::ToolRegistry::GetAllBaseTools()) {
+    if (tool.name == "FileRead" || tool.name == "Glob") {
+      toolRegistry.RegisterTool(tool);
+    }
+  }
+
+  agent::tools::ToolOrchestrator orchestrator;
+  orchestrator.SetToolRegistry(&toolRegistry);
+  orchestrator.SetWorkspaceRoot(
+      "g:\\downloads\\claude-code\\yuanma-poxi\\cpp-agent");
+
+  agent::permissions::PermissionEngine permissionEngine;
+  permissionEngine.AddAlwaysAllowRule("FileRead");
+  permissionEngine.AddAlwaysAllowRule("Glob");
+
+  RepeatedToolFailureModelClient modelClient;
+  agent::api::SideQueryClient sideQueryClient(modelClient);
+  agent::infra::SessionManager sessionManager(sessionDir);
+  agent::core::QueryLoop loop(
+      orchestrator, permissionEngine, modelClient, sideQueryClient);
+  loop.SetMaxTurns(20);
+
+  std::string terminalReason;
+  agent::core::QueryLoopContext ctx;
+  ctx.systemPrompt = "system";
+  ctx.model = "main-model";
+  ctx.sessionManager = &sessionManager;
+  ctx.eventCallback =
+      [&](const agent::core::QueryLoopEvent& event) {
+        if (event.type == agent::core::QueryLoopEvent::Type::LoopCompleted) {
+          terminalReason = event.terminalReason;
+        }
+      };
+
+  agent::core::Message user;
+  user.role = agent::core::MessageRole::User;
+  user.uuid = "user-repeat-tool-failure";
+  user.content.push_back(agent::core::ContentBlock::MakeText(
+      "继续修复并运行，不要反复卡在同一个错误上。"));
+  ctx.messages.push_back(user);
+
+  loop.RunFull(ctx);
+
+  Check(modelClient.streamCalls == 4,
+        "Repeated failing tool results should stop continuation before another retry turn");
+  Check(modelClient.fourthCallSawExecutionMemory,
+        "Repeated failure turns should receive recent execution memory guidance");
+  Check(terminalReason == "repeated_tool_result_loop",
+        "Repeated failing tool results should produce a dedicated terminal reason");
+
+  bool sawRepeatedFailureNote = false;
+  for (const auto& msg : ctx.messages) {
+    for (const auto& block : msg.content) {
+      if (block.type == agent::core::BlockType::Text &&
+          block.asText.text.find("same failing tool result repeated 3 consecutive times") !=
+              std::string::npos) {
+        sawRepeatedFailureNote = true;
+      }
+    }
+  }
+  Check(sawRepeatedFailureNote,
+        "Repeated failing tool results should append an explicit termination note");
+
+  sessionManager.FlushTranscriptBuffer();
+  std::ifstream transcript(sessionManager.TranscriptJsonlPath(), std::ios::binary);
+  std::string transcriptText((std::istreambuf_iterator<char>(transcript)),
+                             std::istreambuf_iterator<char>());
+  Check(transcriptText.find("\"stop_reason\":\"repeated_tool_result_loop\"") !=
+            std::string::npos,
+        "Transcript should include the repeated_tool_result_loop stop reason record");
 }
 
 void TestMissingToolUseNudgeCanRetryForRepeatedTextOnlyWrites() {
@@ -1500,7 +1921,7 @@ void TestStopHookCanForceContinuation() {
   for (const auto& message : ctx.messages) {
     for (const auto& block : message.content) {
       if (block.type == agent::core::BlockType::Text &&
-          block.asText.text.find("继续执行测试") != std::string::npos) {
+          block.asText.text.find("测试已执行完成") != std::string::npos) {
         sawContinuedText = true;
       }
     }
@@ -1844,6 +2265,8 @@ void TestQueryEngineRunTurnUpdatesMetadataWithoutWatchdog() {
         "RunTurn should increment metadata turn count without watchdog");
   Check(metadata.id == sessionDir,
         "RunTurn should preserve the session id for non-watchdog sessions");
+  Check(metadata.lastTerminalReason == "completed",
+        "RunTurn should persist the final terminal reason into session metadata");
 
   std::ifstream snapshot(sessionManager.LegacySnapshotPath(), std::ios::binary);
   std::string snapshotText((std::istreambuf_iterator<char>(snapshot)),
@@ -1852,6 +2275,8 @@ void TestQueryEngineRunTurnUpdatesMetadataWithoutWatchdog() {
         "Persisted snapshot should store the incremented turn count");
   Check(snapshotText.find("session_id=" + sessionDir) != std::string::npos,
         "Persisted snapshot should store the session id");
+  Check(snapshotText.find("terminal_reason=completed") != std::string::npos,
+        "Persisted snapshot should store the final terminal reason");
 }
 
 void TestMicrocompactPreservesLatestToolResult() {
@@ -1946,10 +2371,13 @@ int main() {
   TestQueryLoopMaxTokensEscalation();
   TestQueryLoopFallbackModelRetry();
   TestQueryLoopValidatorRetryBeforeToolExecution();
+  TestValidatorRetryTerminatesAfterRetryLimit();
   TestQueryLoopValidatorTextCorrection();
+  TestValidatorSeesWorkspaceRelativePathsAndRewriteGuidance();
   TestHttpLlmClientConstruction();
   TestQueryEngineEmitsStreamingEvents();
   TestForcedContinuationLimitPersistsAcrossFollowups();
+  TestRepeatedToolFailureTerminatesContinuationLoop();
   TestMissingToolUseNudgeCanRetryForRepeatedTextOnlyWrites();
   TestHistorySnipPreservesOriginalUserTask();
   TestStopHookCanForceContinuation();
