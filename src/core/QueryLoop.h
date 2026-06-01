@@ -37,6 +37,7 @@ struct QueryLoopInternalState {
   bool completed = false;
   bool validatorRequestedRetry = false;
   int validatorRetryCount = 0;
+  int validatorNudgeCount = 0;
   std::string lastValidatorGuidance;
   int missingToolUsePromptCount = 0;
   bool hasPromptedForWorkspaceExploration = false;

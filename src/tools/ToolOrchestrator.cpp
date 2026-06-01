@@ -1,4 +1,4 @@
-#include "tools/ToolOrchestrator.h"
+﻿#include "tools/ToolOrchestrator.h"
 
 #include "agents/SubAgentManager.h"
 #include "mcp/McpClientManager.h"
@@ -1463,6 +1463,10 @@ void ToolOrchestrator::SetWorkspaceRoot(const std::string& workspaceRoot) {
   workspaceRoot_ = GetFullPathString(workspaceRoot);
 }
 
+void ToolOrchestrator::SetToolCompletionCallback(ToolCompletionCallback cb) {
+  toolCompletionCallback_ = std::move(cb);
+}
+
 std::vector<ToolBatch> ToolOrchestrator::PartitionToolCalls(
     const std::vector<core::ContentBlock>& toolUseBlocks) const {
   std::vector<ToolBatch> batches;
@@ -1514,71 +1518,85 @@ std::string ToolOrchestrator::ExecuteToolBlock(
   const std::string& name = block.asToolUse.name;
   const std::string& inputJson = block.asToolUse.inputJson;
 
-  if (CaseInsensitiveCompare(name, "Bash")) {
+  const auto CanonicalizeToolAlias = [](const std::string& toolName) {
+    if (CaseInsensitiveCompare(toolName, "write_file") ||
+        CaseInsensitiveCompare(toolName, "file_write")) {
+      return std::string("Write");
+    }
+    if (CaseInsensitiveCompare(toolName, "read_file") ||
+        CaseInsensitiveCompare(toolName, "file_read")) {
+      return std::string("Read");
+    }
+    return toolName;
+  };
+
+  const std::string resolvedName = CanonicalizeToolAlias(name);
+
+  if (CaseInsensitiveCompare(resolvedName, "Bash")) {
     return ExecuteBash(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "FileRead") ||
-      CaseInsensitiveCompare(name, "Read")) {
+  if (CaseInsensitiveCompare(resolvedName, "FileRead") ||
+      CaseInsensitiveCompare(resolvedName, "Read")) {
     return ExecuteFileRead(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "FileWrite") ||
-      CaseInsensitiveCompare(name, "Write")) {
+  if (CaseInsensitiveCompare(resolvedName, "FileWrite") ||
+      CaseInsensitiveCompare(resolvedName, "Write")) {
     return ExecuteFileWrite(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "Grep")) {
+  if (CaseInsensitiveCompare(resolvedName, "Grep")) {
     return ExecuteGrep(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "Glob")) {
+  if (CaseInsensitiveCompare(resolvedName, "Glob")) {
     return ExecuteGlob(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "Agent")) {
+  if (CaseInsensitiveCompare(resolvedName, "Agent")) {
     return ExecuteAgent(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "TodoWrite")) {
+  if (CaseInsensitiveCompare(resolvedName, "TodoWrite")) {
     return ExecuteTodoWrite(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "TaskCreate")) {
+  if (CaseInsensitiveCompare(resolvedName, "TaskCreate")) {
     return ExecuteTaskCreate(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "TaskGet")) {
+  if (CaseInsensitiveCompare(resolvedName, "TaskGet")) {
     return ExecuteTaskGet(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "TaskUpdate")) {
+  if (CaseInsensitiveCompare(resolvedName, "TaskUpdate")) {
     return ExecuteTaskUpdate(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "TaskList")) {
+  if (CaseInsensitiveCompare(resolvedName, "TaskList")) {
     return ExecuteTaskList(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "TaskStop")) {
+  if (CaseInsensitiveCompare(resolvedName, "TaskStop")) {
     return ExecuteTaskStop(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "AskUserQuestion")) {
+  if (CaseInsensitiveCompare(resolvedName, "AskUserQuestion")) {
     return ExecuteAskUserQuestion(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "FileEdit")) {
+  if (CaseInsensitiveCompare(resolvedName, "FileEdit")) {
     return ExecuteFileEdit(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "NotebookEdit")) {
+  if (CaseInsensitiveCompare(resolvedName, "NotebookEdit")) {
     return ExecuteNotebookEdit(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "Skill")) {
+  if (CaseInsensitiveCompare(resolvedName, "Skill")) {
     return ExecuteSkill(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "ListMcpResources")) {
+  if (CaseInsensitiveCompare(resolvedName, "ListMcpResources")) {
     return ExecuteListMcpResources(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "ReadMcpResource")) {
+  if (CaseInsensitiveCompare(resolvedName, "ReadMcpResource")) {
     return ExecuteReadMcpResource(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "WebFetch")) {
+  if (CaseInsensitiveCompare(resolvedName, "WebFetch")) {
     return ExecuteWebFetch(inputJson, maxResultSize, error);
   }
-  if (CaseInsensitiveCompare(name, "WebSearch")) {
+  if (CaseInsensitiveCompare(resolvedName, "WebSearch")) {
     return ExecuteWebSearch(inputJson, maxResultSize, error);
   }
 
   if (error) {
-    *error = "unknown tool: " + name;
+    *error = "unknown tool: " + resolvedName;
   }
   return std::string();
 }

@@ -581,6 +581,22 @@ int main() {
     Check(validationModelClient.lastSideQueryModel == "gemma-test",
           "Validator should use configured validator model");
     Check(!validationMsgs.empty(), "Validator run should produce messages");
+    if (!(validationMsgs.back().content.size() == 1 &&
+          validationMsgs.back().content[0].type == agent::core::BlockType::Text &&
+          validationMsgs.back().content[0].asText.text == "validated answer")) {
+      std::cerr << "DEBUG_VALIDATION_LAST_MESSAGE: size="
+                << validationMsgs.back().content.size()
+                << " firstType="
+                << (validationMsgs.back().content.empty()
+                        ? -1
+                        : static_cast<int>(validationMsgs.back().content[0].type))
+                << " text=[";
+      for (const auto& block : validationMsgs.back().content) {
+        if (block.type == agent::core::BlockType::Text)
+          std::cerr << block.asText.text << '|';
+      }
+      std::cerr << "]" << std::endl;
+    }
     Check(validationMsgs.back().content.size() == 1,
           "Validated assistant should contain one text block");
     Check(validationMsgs.back().content[0].type == agent::core::BlockType::Text,

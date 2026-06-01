@@ -1436,10 +1436,11 @@ void TestValidatorRetryTerminatesAfterRetryLimit() {
 
   loop.RunFull(ctx);
 
-  Check(modelClient.streamCalls == 3,
-        "Validator retry loop should stop after the retry limit");
-  Check(modelClient.validatorCalls == 3,
-        "Validator retry loop should only consume the configured retry budget");
+  // Two-phase: 3 retries -> nudge -> 3 more retries -> hard-terminate (total 6 calls)
+  Check(modelClient.streamCalls == 6,
+        "Validator retry loop should allow a full second cycle after nudge");
+  Check(modelClient.validatorCalls == 6,
+        "Validator should run for all retry calls including post-nudge cycle");
   Check(modelClient.thirdCallSawExecutionMemory,
         "Later retry turns should receive recent execution memory guidance");
   Check(terminalReason == "validator_retry_limit",
@@ -1449,7 +1450,7 @@ void TestValidatorRetryTerminatesAfterRetryLimit() {
   for (const auto& msg : ctx.messages) {
     for (const auto& block : msg.content) {
       if (block.type == agent::core::BlockType::Text &&
-          block.asText.text.find("validator requested retry_from_tools 3 consecutive times") !=
+          block.asText.text.find("validator requested retry_from_tools") !=
               std::string::npos) {
         sawRetryLimitNote = true;
       }

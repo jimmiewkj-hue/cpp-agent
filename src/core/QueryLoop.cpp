@@ -562,6 +562,12 @@ bool UserRequestedDirectCreation(const std::vector<Message>& messages) {
            ContainsToken(lower, "new project from scratch") ||
            ContainsToken(lower, "start from scratch") ||
            ContainsToken(lower, "scaffold a new project") ||
+           ContainsToken(lower, "create a file") ||
+           ContainsToken(lower, "create the file") ||
+           ContainsToken(lower, "write a file") ||
+           ContainsToken(lower, "generate a file") ||
+           ContainsToken(prompt, "创建文件") ||
+           ContainsToken(prompt, "创建一个文件") ||
            ContainsToken(prompt, "新建项目") ||
            ContainsToken(prompt, "从零开始") ||
            ContainsToken(prompt, "直接创建") ||
@@ -726,6 +732,12 @@ ValidationResult ParseValidationResponse(const std::string& text) {
           result.correctedText =
               correction["corrected_text"].get<std::string>();
         }
+      }
+
+      // Fallback: accept top-level corrected_text (some LLMs omit the text_correction wrapper)
+      if (result.correctedText.empty() && j.contains("corrected_text") &&
+          j["corrected_text"].is_string()) {
+        result.correctedText = j["corrected_text"].get<std::string>();
       }
 
       if (j.contains("final_response_action") &&
@@ -2208,28 +2220,53 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
       MakeQueryLoopTraceId("no-tool"));
   if (state.validatorRequestedRetry &&
       state.validatorRetryCount >= kMaxValidatorRetryContinuations) {
-    Message note;
-    note.role = MessageRole::System;
-    note.uuid = "validator-retry-limit";
-    note.isMeta = true;
-    std::string text =
-        "[system] Terminating: validator requested retry_from_tools "
-        + std::to_string(state.validatorRetryCount)
-        + " consecutive times. Stop the retry loop and surface the current "
-          "state instead of repeating the same correction cycle.";
-    if (!state.lastValidatorGuidance.empty()) {
-      text += " Latest guidance: " + state.lastValidatorGuidance;
+    if (state.validatorNudgeCount >= 1) {
+      // Already nudged once without improvement - hard-terminate
+      Message note;
+      note.role = MessageRole::System;
+      note.uuid = "validator-retry-limit";
+      note.isMeta = true;
+      std::string text =
+          "[system] Terminating: validator requested retry_from_tools "
+          + std::to_string(state.validatorRetryCount
+              + state.validatorNudgeCount * kMaxValidatorRetryContinuations)
+          + " consecutive times across multiple cycles. Stop the retry loop"
+          " and surface the current state.";
+      if (!state.lastValidatorGuidance.empty()) {
+        text += " Latest guidance: " + state.lastValidatorGuidance;
+      }
+      note.content.push_back(ContentBlock::MakeText(text));
+      AppendTurnArtifacts(
+          ctx, state.assistantMessages, state.toolResultMessages, {note});
+      state.assistantMessages.clear();
+      state.toolResultMessages.clear();
+      state.pendingFollowupMessages.clear();
+      state.toolUseBlocks.clear();
+      state.completed = true;
+      state.terminalReason = "validator_retry_limit";
+      return false;
     }
-    note.content.push_back(ContentBlock::MakeText(text));
-    AppendTurnArtifacts(
-        ctx, state.assistantMessages, state.toolResultMessages, {note});
-    state.assistantMessages.clear();
-    state.toolResultMessages.clear();
-    state.pendingFollowupMessages.clear();
-    state.toolUseBlocks.clear();
-    state.completed = true;
-    state.terminalReason = "validator_retry_limit";
-    return false;
+    // First cycle: send a stronger nudge (aligned with local-ace forced continuation)
+    ++state.validatorNudgeCount;
+    state.validatorRetryCount = 0;
+    Message nudge;
+    nudge.role = MessageRole::User;
+    nudge.uuid = "validator-retry-limit-nudge";
+    nudge.isMeta = true;
+    std::string nudgeText =
+        "[system] Validator has requested retry_from_tools "
+        + std::to_string(kMaxValidatorRetryContinuations)
+        + " consecutive times. You MUST now take a concrete action: either"
+        + " provide a complete final answer or execute a tool call immediately."
+        + " Do NOT repeat the same plan or reasoning.";
+    if (!state.lastValidatorGuidance.empty()) {
+      nudgeText += " Validator guidance: " + state.lastValidatorGuidance;
+    }
+    nudge.content.push_back(ContentBlock::MakeText(nudgeText));
+    std::vector<Message> nudgeFollowups = {nudge};
+    return ContinueWithFollowup(
+        ctx, state, nudgeFollowups,
+        TransitionReason::ValidatorRetry, false);
   }
   if (state.validatorRequestedRetry || !state.pendingFollowupMessages.empty()) {
     ReportQueryLoopDebugEvent(

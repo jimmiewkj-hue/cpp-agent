@@ -1,4 +1,4 @@
-#include "app/RuntimePolicy.h"
+﻿#include "app/RuntimePolicy.h"
 #include "app/TuiTaskPanel.h"
 #include "core/QueryEngine.h"
 #include "core/StateTypes.h"
@@ -930,6 +930,14 @@ class AnsiTui {
     RefreshStatus();
   }
 
+  void SetStatusText(const std::string& text) {
+    {
+      std::lock_guard<std::mutex> lock(state_.mutex);
+      state_.statusText = text;
+    }
+    RefreshStatus();
+  }
+
   void SetPermissionModeLabel(const std::string& label) {
     {
       std::lock_guard<std::mutex> lock(state_.mutex);
@@ -1659,6 +1667,20 @@ int main() {
   tuiState.taskPanel = agent::app::LoadTuiTaskPanelData(taskStorePath);
 
   AnsiTui tui(tuiState);
+
+  // Per-tool completion callback: refresh task panel immediately when a
+  // task-modifying tool finishes, instead of waiting for the entire
+  // Execute() batch to complete.  Fixes stale task status in the TUI.
+  toolOrchestrator.SetToolCompletionCallback(
+      [&](const std::string& toolName) {
+        if (!isInteractiveSession) return;
+        if (toolName == "TaskCreate" || toolName == "TaskUpdate" ||
+            toolName == "TaskStop" || toolName == "TodoWrite") {
+          tui.SetTaskPanelData(
+              agent::app::LoadTuiTaskPanelData(taskStorePath));
+        }
+      });
+
   if (isInteractiveSession) {
     tui.Init();
     permissionEngine.SetManualApprovalCallback(
@@ -1740,6 +1762,7 @@ int main() {
         break;
       case agent::core::QueryLoopEvent::Type::LoopCompleted:
         tui.SetTaskPanelData(agent::app::LoadTuiTaskPanelData(taskStorePath));
+        tui.SetStatusText("Completed [" + event.terminalReason + "]");
         break;
       default:
         break;

@@ -1,8 +1,9 @@
-#pragma once
+﻿#pragma once
 
 #include "core/AgentTypes.h"
 #include "infra/ProcessRunner.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,10 @@ struct ToolBatch {
 
 class ToolOrchestrator {
  public:
+  // Called after each individual tool completes inside Execute().
+  // Argument: the tool name (e.g. "Bash", "TaskUpdate").
+  using ToolCompletionCallback = std::function<void(const std::string&)>;
+
   ToolOrchestrator();
 
   void SetToolRegistry(const ToolRegistry* registry);
@@ -28,6 +33,7 @@ class ToolOrchestrator {
   void SetMcpClientManager(mcp::McpClientManager* mcpClientManager);
   void SetWorkspaceRoot(const std::string& workspaceRoot);
   const std::string& workspaceRoot() const { return workspaceRoot_; }
+  void SetToolCompletionCallback(ToolCompletionCallback cb);
 
   std::vector<ToolBatch> PartitionToolCalls(
       const std::vector<core::ContentBlock>& toolUseBlocks) const;
@@ -117,6 +123,7 @@ class ToolOrchestrator {
   mcp::McpClientManager* mcpClientManager_ = nullptr;
   infra::ProcessRunner processRunner_;
   std::string workspaceRoot_;
+  ToolCompletionCallback toolCompletionCallback_;
 };
 
 }  // namespace tools
