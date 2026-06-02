@@ -1,5 +1,6 @@
-#pragma once
+﻿#pragma once
 
+#include "memory/SessionMemory.h"
 #include "agents/SubAgentManager.h"
 #include "core/AgentTypes.h"
 #include "core/StateTypes.h"
@@ -71,6 +72,10 @@ class SessionManager {
       const std::string& error = std::string());
   void FlushTranscriptBuffer();
 
+
+  // P0-03: Session memory integration (aligned with local-ace)
+  void SetSessionMemory(memory::SessionMemory* sessionMemory);
+  std::string BuildMemoryInjection(int maxChars = 4000) const;
  private:
   SessionSnapshot BuildSnapshot() const;
   std::vector<std::string> DrainTranscriptBufferLocked();
@@ -83,6 +88,7 @@ class SessionManager {
   std::vector<agents::SubAgentExecutorSlot> subAgentExecutors_;
   core::SessionMetadata metadata_;
   std::vector<std::string> transcriptBuffer_;
+  memory::SessionMemory* sessionMemory_ = nullptr;  // P0-03
 };
 
 }  // namespace infra

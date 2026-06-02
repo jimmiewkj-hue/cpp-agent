@@ -1,4 +1,5 @@
 #include "app/RuntimePolicy.h"
+#include "third_party/nlohmann_json.hpp"
 
 #include <sstream>
 
@@ -18,8 +19,20 @@ bool ShouldExposeBaseTool(const tools::ToolSchema& tool,
 }  // namespace
 
 std::vector<tools::ToolSchema> GetSessionBaseTools(bool interactiveSession) {
-  const std::vector<tools::ToolSchema> baseTools =
-      tools::ToolRegistry::GetAllBaseTools();
+  auto baseToolPtrs = tools::ToolRegistry::GetAllBaseTools();
+  std::vector<tools::ToolSchema> baseTools;
+  baseTools.reserve(baseToolPtrs.size());
+  for (const auto& t : baseToolPtrs) {
+    tools::ToolSchema schema;
+    schema.name = t->Name();
+    schema.description = t->UserFacingDescription();
+    schema.inputSchemaJson = t->InputSchemaJson();
+    nlohmann::json emptyInput = nlohmann::json::object();
+    schema.readOnlyHint = t->IsReadOnly(emptyInput);
+    schema.destructiveHint = t->IsDestructive(emptyInput);
+    schema.maxResultSizeChars = t->MaxResultSizeChars();
+    baseTools.push_back(schema);
+  }
   std::vector<tools::ToolSchema> filtered;
   filtered.reserve(baseTools.size());
   for (const auto& tool : baseTools) {

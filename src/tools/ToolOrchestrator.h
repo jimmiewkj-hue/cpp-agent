@@ -9,6 +9,7 @@
 
 namespace agent {
 namespace agents { class SubAgentManager; }
+namespace hooks { class HookExecutor; }
 namespace mcp { class McpClientManager; }
 namespace tools {
 
@@ -34,6 +35,13 @@ class ToolOrchestrator {
   void SetWorkspaceRoot(const std::string& workspaceRoot);
   const std::string& workspaceRoot() const { return workspaceRoot_; }
   void SetToolCompletionCallback(ToolCompletionCallback cb);
+
+  void SetHookExecutor(hooks::HookExecutor* hookExecutor);
+
+  // P0-03: Configurable Bash timeout (aligned with local-ace).
+  // Default 120s. Override via env var AGENT_BASH_TIMEOUT_MS.
+  void SetBashTimeoutMs(int timeoutMs);
+  int GetBashTimeoutMs() const { return bashTimeoutMs_; }
 
   std::vector<ToolBatch> PartitionToolCalls(
       const std::vector<core::ContentBlock>& toolUseBlocks) const;
@@ -124,6 +132,8 @@ class ToolOrchestrator {
   infra::ProcessRunner processRunner_;
   std::string workspaceRoot_;
   ToolCompletionCallback toolCompletionCallback_;
+  hooks::HookExecutor* hookExecutor_ = nullptr;
+  int bashTimeoutMs_ = 120000;  // P0-03: configurable via AGENT_BASH_TIMEOUT_MS
 };
 
 }  // namespace tools

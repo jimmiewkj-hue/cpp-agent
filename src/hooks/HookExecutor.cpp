@@ -384,6 +384,26 @@ HookBatchResult HookExecutor::RunPostToolUseHooks(
                            toolName, timeoutMs);
 }
 
+// P0-03: PostToolUseFailure hooks ? aligned with local-ace runPostToolUseFailureHooks
+HookBatchResult HookExecutor::RunPostToolUseFailureHooks(
+    const std::string& toolName,
+    const std::string& toolInput,
+    const std::string& toolUseID,
+    const std::string& errorMessage,
+    int exitCode,
+    int timeoutMs) {
+  HookInput hi;
+  hi.eventType = HookEventType::PostToolUseFailure;
+  hi.hook_event_name = "PostToolUseFailure";
+  hi.postToolUse.tool_name = toolName;
+  hi.postToolUse.tool_input = toolInput;
+  hi.postToolUse.tool_use_id = toolUseID;
+  hi.postToolUse.tool_output = errorMessage;
+  hi.postToolUse.exit_code = exitCode;
+  return RunHooksForEvent(HookEventType::PostToolUseFailure, hi, toolUseID,
+                           toolName, timeoutMs);
+}
+
 HookBatchResult HookExecutor::RunStopHooks(const std::string& stopReason,
                                               int timeoutMs) {
   auto input = HookInput::MakeStop(stopReason);

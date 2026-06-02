@@ -1,5 +1,6 @@
-#include "infra/SessionManager.h"
+﻿#include "infra/SessionManager.h"
 #include "infra/ProtoLite.h"
+#include "memory/SessionMemory.h"
 #include "third_party/nlohmann_json.hpp"
 
 #include <algorithm>
@@ -2321,6 +2322,17 @@ void SessionManager::AppendModelIoRecord(
   std::lock_guard<std::mutex> lock(transcriptMutex_);
   EnsureDirectoryRecursive(sessionDir_);
   AppendFileContentUtf8(path, line);
+}
+
+
+// P0-03: Session memory integration
+void SessionManager::SetSessionMemory(memory::SessionMemory* sessionMemory) {
+  sessionMemory_ = sessionMemory;
+}
+
+std::string SessionManager::BuildMemoryInjection(int maxChars) const {
+  if (!sessionMemory_) return std::string();
+  return sessionMemory_->BuildMemoryContextInjection(maxChars);
 }
 
 }  // namespace infra

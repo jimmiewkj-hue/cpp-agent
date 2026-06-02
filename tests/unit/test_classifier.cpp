@@ -1,6 +1,7 @@
-#include "permissions/BashClassifier.h"
+﻿#include "permissions/BashClassifier.h"
 #include "permissions/PermissionEngine.h"
 #include "core/AgentTypes.h"
+#include "permissions/PathValidator.h"
 #include "core/StateTypes.h"
 
 #include <iostream>
@@ -312,6 +313,76 @@ void TestPermissionEngineManualApprovalCallbackDeniesAsk() {
 }
 
 }  // namespace
+
+void TestPathValidator() {
+  agent::permissions::PathValidator pv("G:\\downloads\\claude-code\\yuanma-poxi\\cpp-agent");
+
+  // Inside workspace
+  Check(pv.IsInsideWorkspace("G:\\downloads\\claude-code\\yuanma-poxi\\cpp-agent\\src\\main.cpp"),
+        "Path inside workspace should be valid");
+  Check(pv.IsInsideWorkspace("src\\main.cpp"),
+        "Relative path inside workspace should be valid");
+
+  // Outside workspace
+  Check(!pv.IsInsideWorkspace("C:\\Windows\\System32\\cmd.exe"),
+        "System path should be outside workspace");
+
+  // Dangerous patterns
+  Check(pv.ContainsDangerousPattern("..\\..\\..\\Windows\\System32\\cmd.exe"),
+        "Path traversal should be detected");
+  Check(pv.ContainsDangerousPattern("/etc/passwd"),
+        "Unix system file should be detected as dangerous");
+  Check(!pv.ContainsDangerousPattern("src\\main.cpp"),
+        "Normal file should not be dangerous");
+
+  // Path normalization
+  std::string normalized = agent::permissions::PathValidator::NormalizePath(
+      "G:\\downloads\\claude-code\\..\\claude-code\\cpp-agent\\src\\main.cpp");
+  Check(normalized.find("claude-code\\cpp-agent") != std::string::npos,
+        "Path normalization should collapse ..");
+
+  // ResolvePath
+  std::string resolved = pv.ResolvePath("src\\main.cpp");
+  Check(resolved.find("cpp-agent\\src\\main.cpp") != std::string::npos,
+        "ResolvePath should produce absolute path");
+
+  // IsPathSafe
+  Check(pv.IsPathSafe("src\\main.cpp"),
+        "Workspace file should be safe");
+  Check(!pv.IsPathSafe("C:\\Windows\\System32\\cmd.exe"),
+        "System file should not be safe");
+
+  // Trusted directories
+  pv.AddTrustedDirectory("C:\\tmp");
+  Check(pv.IsReadAllowed("C:\\tmp\\test.txt"),
+        "File in trusted directory should be readable");
+}
+
+void TestPathValidatorEdgeCases() {
+  agent::permissions::PathValidator pv("G:\\downloads\\claude-code\\yuanma-poxi\\cpp-agent");
+
+  // Empty path
+  Check(!pv.IsPathSafe(""),
+        "Empty path should not be safe");
+
+  // Root path
+  Check(!pv.IsInsideWorkspace("G:\\"),
+        "Root path should be outside workspace");
+
+  // Traversal attack
+  Check(!pv.IsPathSafe("..\\..\\..\\Windows\\System32"),
+        "Traversal to system should be unsafe");
+
+  // Symlink-like pattern
+  Check(pv.ContainsDangerousPattern(".ssh\\id_rsa"),
+        "SSH key path should be dangerous");
+
+  // Normal file extensions
+  Check(pv.IsPathSafe("src\\main.cpp"),
+        "Normal source file should be safe");
+  Check(pv.IsPathSafe("README.md"),
+        "README should be safe");
+}
 
 int main() {
   TestBashClassifierReadOnlyCommands();

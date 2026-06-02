@@ -382,6 +382,12 @@ std::string BuildRecentExecutionMemory(const QueryLoopContext& ctx,
       line += " Latest guidance: " + state.lastValidatorGuidance;
     }
     lines.push_back(line);
+    // Additional guidance when validator keeps demanding the same thing
+    lines.push_back(
+        "IMPORTANT: If you have already attempted what the validator requested "
+        "and it fails (e.g., pip list times out), DO NOT retry the same command. "
+        "Instead, use a different approach, skip the prerequisite, or provide a "
+        "final answer based on what you already know.");
   }
 
   std::string repeatedErrorFingerprint;
@@ -394,6 +400,19 @@ std::string BuildRecentExecutionMemory(const QueryLoopContext& ctx,
         + " consecutive times. Do not rerun the same failing action without a"
           " concrete change. Latest error: "
         + repeatedErrorFingerprint);
+  }
+
+  // Also detect repeated non-error tool results (e.g., reading same file, same Glob)
+  std::string repeatedOkFingerprint;
+  const int repeatedOkCount = CountConsecutiveRecentToolResults(
+      ctx.messages, false, &repeatedOkFingerprint);
+  if (repeatedOkCount >= 3 && !repeatedOkFingerprint.empty()) {
+    lines.push_back(
+        "The same successful tool result has appeared "
+        + std::to_string(repeatedOkCount)
+        + " consecutive times. You are repeating actions that have already "
+        "produced results. Do NOT repeat the same Glob or Read calls. "
+        "Move forward with the information you already have.");
   }
 
   if (lines.empty()) return std::string();
@@ -913,16 +932,46 @@ std::string BuildValidationContext(
   }
 
   json executionEvidence = json::array();
+  json recentFailureSummary = json::object();
+  std::set<std::string> timeoutPatterns;
+  std::set<std::string> errorPatterns;
+  int timeoutCount = 0;
   int evCount = 0;
-  for (auto it = messages.rbegin(); it != messages.rend() && evCount < 5; ++it) {
+  for (auto it = messages.rbegin(); it != messages.rend() && evCount < 8; ++it) {
     if (it->role != MessageRole::User) continue;
     for (const auto& b : it->content) {
       if (b.type != BlockType::ToolResult) continue;
       std::string c = b.asToolResult.content;
       if (c.size() > 500) c = c.substr(0, 500);
       executionEvidence.push_back(c);
+      // Track failure patterns for summary
+      if (b.asToolResult.isError) {
+        auto lower = c;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        if (lower.find("timed out") != std::string::npos ||
+            lower.find("timeout") != std::string::npos) {
+          timeoutCount++;
+          timeoutPatterns.insert(c.substr(0, std::min<size_t>(c.size(), 120)));
+        }
+        if (lower.find("error") != std::string::npos ||
+            lower.find("exit code") != std::string::npos) {
+          errorPatterns.insert(c.substr(0, std::min<size_t>(c.size(), 120)));
+        }
+      }
       ++evCount;
     }
+  }
+  if (timeoutCount > 0) {
+    recentFailureSummary["timeout_count"] = timeoutCount;
+    json timeoutArr = json::array();
+    for (const auto& tp : timeoutPatterns) timeoutArr.push_back(tp);
+    recentFailureSummary["timeout_samples"] = timeoutArr;
+  }
+  if (!errorPatterns.empty()) {
+    json errorArr = json::array();
+    for (const auto& ep : errorPatterns) errorArr.push_back(ep);
+    recentFailureSummary["error_samples"] = errorArr;
   }
 
   json relevantSchemas = json::array();
@@ -933,14 +982,15 @@ std::string BuildValidationContext(
     }
     const auto tools = toolRegistry->ListTools();
     for (const auto& tool : tools) {
-      if (referencedToolNames.find(tool.name) == referencedToolNames.end()) continue;
+      if (referencedToolNames.find(tool->Name()) == referencedToolNames.end()) continue;
       json schema;
-      schema["name"] = tool.name;
-      schema["description"] = tool.description;
+      schema["name"] = tool->Name();
+      schema["description"] = tool->UserFacingDescription();
       try {
-        schema["input_schema"] = tool.inputSchemaJson.empty()
+        std::string isj = tool->InputSchemaJson();
+        schema["input_schema"] = isj.empty()
             ? json::object()
-            : json::parse(tool.inputSchemaJson);
+            : json::parse(isj);
       } catch (...) {
         schema["input_schema"] = json::object();
       }
@@ -954,6 +1004,7 @@ std::string BuildValidationContext(
   ctxJson["assistant_tool_calls"] = actions;
   ctxJson["relevant_tool_schemas"] = relevantSchemas;
   ctxJson["execution_evidence"] = executionEvidence;
+  ctxJson["recent_failure_summary"] = recentFailureSummary;
   return ctxJson.dump(2, ' ', false, json::error_handler_t::replace);
 }
 
@@ -999,8 +1050,26 @@ If you corrected the assistant_text, also include the corrected text in:
 corrected text here
 </corrected_text>
 
+CRITICAL ENVIRONMENT FACTS (read before making any judgment):
+- The runtime OS is WINDOWS. The shell is PowerShell, NOT bash.
+- Unix tools (grep, head, tail, sed, awk, xargs) DO NOT EXIST. The tool engine auto-converts these to PowerShell equivalents (Select-String, Select-Object -First/-Last).
+- Commands like "pip list | head -100" will be auto-converted. Do NOT flag pipe syntax as invalid.
+- "python -c" is the correct way to run inline Python on this system. "python3" may not exist.
+- Paths use backslashes (C:\\foo\\bar) but forward slashes are also accepted.
+- "2>/dev/null" does not work; redirect to $null or use -ErrorAction SilentlyContinue.
+- If the assistant uses Unix syntax, the tool engine will normalize it. ONLY intervene if the assistant fundamentally misunderstands the user goal or is about to take a harmful action.
+
+TOOL FAILURE AWARENESS (critical for avoiding retry loops):
+- ALWAYS check "execution_evidence" for recent tool failures BEFORE issuing retry_from_tools.
+- If the SAME command (e.g., "pip list") has timed out (120s) or errored REPEATEDLY in execution_evidence, do NOT demand retrying it. The environment cannot execute it.
+- When a prerequisite command consistently fails (timeout, syntax error, command-not-found), ACCEPT alternative approaches: using importlib, checking individual packages, or skipping the prerequisite and proceeding with the main task.
+- The assistant is NOT at fault for environmental failures. Do NOT block or retry_from_tools for commands that failed due to: timeout, corrupted packages, missing system utilities, or platform incompatibility.
+- If execution_evidence contains error results with "[exit code: 1]" or "timed out after 120s", recognize these as environment problems, not assistant errors.
+- If a tool result shows a timeout or repeated error, and the assistant is trying a different tool or approach, this is CORRECT behavior. APPROVE it.
+
 Rules:
 - Only intervene when there is a real error or safety concern
+- NEVER issue retry_from_tools demanding the exact same command that just failed in execution_evidence
 - For tool_interventions, you can both rewrite some tools and block others
 - If the only issue is path formatting for files inside the current workspace,
   prefer a "rewrite" intervention over "block" or "retry_from_tools"
@@ -1017,10 +1086,10 @@ std::string BuildToolsJson(const tools::ToolRegistry* toolRegistry) {
   for (const auto& tool : tools) {
     json jtool;
     jtool["type"] = "function";
-    jtool["function"]["name"] = tool.name;
-    jtool["function"]["description"] = tool.description;
+    jtool["function"]["name"] = tool->Name();
+    jtool["function"]["description"] = tool->UserFacingDescription();
     try {
-      jtool["function"]["parameters"] = json::parse(tool.inputSchemaJson);
+      jtool["function"]["parameters"] = json::parse(tool->InputSchemaJson());
     } catch (...) {
       jtool["function"]["parameters"] = json::object();
     }
@@ -1179,6 +1248,62 @@ std::string QueryLoop::MakeToolFingerprint(const ContentBlock& block) const {
   return block.asToolUse.name + ":" + input;
 }
 
+bool QueryLoop::ShouldTerminateOnExcessiveExploration(
+    QueryLoopContext& ctx,
+    QueryLoopInternalState& state) const {
+  // Count consecutive turns where the model produces ONLY exploration/planning
+  // tools (Read, Glob, Grep, LS, TodoWrite) without any action tools
+  // (Write, FileWrite, NotebookEdit, Bash, TaskCreate).
+  if (state.toolUseBlocks.empty()) {
+    state.consecutiveExplorationOnlyTurns = 0;
+    return false;
+  }
+
+  bool hasActionTool = false;
+  for (const auto& block : state.toolUseBlocks) {
+    if (block.type != BlockType::ToolUse) continue;
+    const std::string& name = block.asToolUse.name;
+    if (IsWorkspaceWriteToolName(name) ||
+        name == "Bash" || name == "TaskCreate") {
+      hasActionTool = true;
+      break;
+    }
+  }
+
+  if (hasActionTool) {
+    state.consecutiveExplorationOnlyTurns = 0;
+    return false;
+  }
+
+  ++state.consecutiveExplorationOnlyTurns;
+
+  static const int kMaxExplorationOnlyTurns = 12;
+  if (state.consecutiveExplorationOnlyTurns < kMaxExplorationOnlyTurns) {
+    return false;
+  }
+
+  // Hard terminate: the model has spent too many turns only exploring.
+  // The runner can detect this termination and restart with the nudge.
+  Message terminationMsg;
+  terminationMsg.role = MessageRole::System;
+  terminationMsg.uuid = "exploration-limit-terminate";
+  terminationMsg.isMeta = true;
+  terminationMsg.content.push_back(ContentBlock::MakeText(
+      "[system] Terminating: " +
+      std::to_string(state.consecutiveExplorationOnlyTurns) +
+      " consecutive turns with only exploration/planning tools "
+      "(Read, Glob, Grep, TodoWrite, LS). "
+      "The agent must produce actionable output (Write, FileWrite, Bash, "
+      "TaskCreate) or provide a final answer. "
+      "If continuing, you MUST stop reading files and start writing code "
+      "or executing commands immediately."));
+  ctx.messages.push_back(terminationMsg);
+  if (ctx.sessionManager) {
+    ctx.sessionManager->AppendMessageToTranscript(terminationMsg);
+  }
+  return true;
+}
+
 bool QueryLoop::ShouldTerminateOnDuplicates(
     QueryLoopContext& ctx,
     QueryLoopInternalState& state) const {
@@ -1196,23 +1321,54 @@ bool QueryLoop::ShouldTerminateOnDuplicates(
   }
 
   if (!latestFingerprint.empty() &&
-      !state.recentToolFingerprints.empty() &&
-      state.recentToolFingerprints.back() == latestFingerprint) {
-    state.consecutiveDuplicateToolCalls++;
-    if (state.consecutiveDuplicateToolCalls >= 3) {
-      Message terminationMsg;
-      terminationMsg.role = MessageRole::System;
-      terminationMsg.uuid = "dup-terminate";
-      terminationMsg.isMeta = true;
-      terminationMsg.content.push_back(ContentBlock::MakeText(
-          "[system] Terminating: identical tool calls detected "
-          + std::to_string(state.consecutiveDuplicateToolCalls)
-          + " consecutive times. The agent appears to be in a loop."));
-      ctx.messages.push_back(terminationMsg);
-      EmitQueryLoopEvent(ctx, QueryLoopEvent::Type::LoopCompleted,
-                         QueryStage::Completed, nullptr,
-                         "duplicate_tool_loop");
-      return true;
+      !state.recentToolFingerprints.empty()) {
+    // Check for direct consecutive duplicates
+    bool isDuplicate = (state.recentToolFingerprints.back() == latestFingerprint);
+    // Also check for 2-alternating pattern: A, B, A, B, ...
+    if (!isDuplicate && state.recentToolFingerprints.size() >= 3) {
+      size_t sz = state.recentToolFingerprints.size();
+      if (state.recentToolFingerprints[sz - 1] == state.recentToolFingerprints[sz - 3] &&
+          latestFingerprint == state.recentToolFingerprints[sz - 2]) {
+        isDuplicate = true;
+      }
+    }
+    if (isDuplicate) {
+      state.consecutiveDuplicateToolCalls++;
+      // Read-only exploration tools (Glob, Read, Grep, LS) are expected to
+      // return stable results; calling them again is a sign of confusion
+      // but not as severe as duplicate write/execute tools. Require a higher
+      // threshold before terminating.
+      bool isExplorationFingerprint = false;
+      {
+        size_t colonPos = latestFingerprint.find(':');
+        if (colonPos != std::string::npos) {
+          std::string toolName = latestFingerprint.substr(0, colonPos);
+          isExplorationFingerprint = IsExplorationToolName(toolName);
+        }
+      }
+      int dupThreshold = isExplorationFingerprint ? 6 : 3;
+      if (state.consecutiveDuplicateToolCalls >= dupThreshold) {
+        Message terminationMsg;
+        terminationMsg.role = MessageRole::System;
+        terminationMsg.uuid = "dup-terminate";
+        terminationMsg.isMeta = true;
+        std::string termText =
+            "[system] Terminating: repetitive tool calls detected "
+            + std::to_string(state.consecutiveDuplicateToolCalls)
+            + " consecutive times. The agent appears to be in a loop. "
+            "Latest fingerprint: " + latestFingerprint;
+        if (isExplorationFingerprint) {
+          termText += " (exploration tool threshold: " + std::to_string(dupThreshold) + ")";
+        }
+        terminationMsg.content.push_back(ContentBlock::MakeText(termText));
+        ctx.messages.push_back(terminationMsg);
+        EmitQueryLoopEvent(ctx, QueryLoopEvent::Type::LoopCompleted,
+                           QueryStage::Completed, nullptr,
+                           "duplicate_tool_loop");
+        return true;
+      }
+    } else {
+      state.consecutiveDuplicateToolCalls = 1;
     }
   } else {
     state.consecutiveDuplicateToolCalls = 1;
@@ -1236,7 +1392,7 @@ std::vector<Message> QueryLoop::BuildMessagesForTurn(
     memory.uuid = "recent-execution-memory";
     memory.isMeta = true;
     memory.content.push_back(ContentBlock::MakeText(executionMemory));
-    messages.push_back(memory);
+    messages.insert(messages.begin(), memory);
   }
   return messages;
 }
@@ -1376,7 +1532,7 @@ std::vector<Message> QueryLoop::DoHistorySnip(
     }
   }
 
-  const std::size_t tailCount = 10;
+  const std::size_t tailCount = 30;  // P0-FIX: increased from 10 to preserve more context
   const std::size_t start = input.size() > tailCount ? input.size() - tailCount : 0;
   const bool preservedFirstUser =
       firstUserIndex < input.size() && firstUserIndex < start;
@@ -1453,7 +1609,7 @@ void QueryLoop::ApplyStepBudget(QueryLoopContext& ctx,
 
 void QueryLoop::ApplyStepSnip(QueryLoopContext& ctx,
                               QueryLoopInternalState& state) {
-  if (state.messagesForTurn.size() > 20) {
+  if (state.messagesForTurn.size() > 60) {  // P0-FIX: increased from 20
     const int beforeCount = static_cast<int>(state.messagesForTurn.size());
     if (ctx.hookExecutor != nullptr) {
       ctx.hookExecutor->RunPreCompactHooks(
@@ -1970,8 +2126,19 @@ bool QueryLoop::HandleMaxOutputTokens(QueryLoopContext& ctx,
     }
   }
   if (!isMaxTokens && !lastMsg.stopReason.empty() &&
-      lastMsg.stopReason.find("max_tokens") != std::string::npos)
+      (lastMsg.stopReason.find("max_tokens") != std::string::npos ||
+       lastMsg.stopReason.find("length") != std::string::npos))
     isMaxTokens = true;
+  // P0-FIX: Also detect max_output_tokens when model returns text-only
+  // without tools (Qwen may return stop_reason="stop" when truncated).
+  if (!isMaxTokens && state.toolUseBlocks.empty() &&
+      !lastMsg.isApiErrorMessage) {
+    std::string lastText = CollectText(state.assistantMessages);
+    // Heuristic: long text with no tools suggests token limit truncation
+    if (lastText.size() > 2000 && state.forcedContinuationCount >= 3) {
+      isMaxTokens = true;
+    }
+  }
   if (!isMaxTokens) return false;
 
   if (state.maxOutputTokensOverride == 0 &&
@@ -2176,7 +2343,23 @@ bool QueryLoop::ApplyStepRunTools(QueryLoopContext& ctx,
   state.stopHookActive = false;
   state.validatorRetryCount = 0;
   state.lastValidatorGuidance.clear();
-  state.forcedContinuationCount = 0;
+  // P0-FIX: Only reset forced-continuation count when the model
+  // takes productive action (Write/Bash/TaskCreate), not on exploration reads.
+  {
+    bool hasProductiveTool = false;
+    for (const auto& block : state.toolUseBlocks) {
+      if (block.type != BlockType::ToolUse) continue;
+      const std::string& name = block.asToolUse.name;
+      if (IsWorkspaceWriteToolName(name) ||
+          name == "Bash" || name == "TaskCreate") {
+        hasProductiveTool = true;
+        break;
+      }
+    }
+    if (hasProductiveTool) {
+      state.forcedContinuationCount = 0;
+    }
+  }
   state.toolUseBlocks.clear();
   return !execResult.userMessages.empty();
 }
@@ -2271,14 +2454,57 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
   if (state.validatorRequestedRetry || !state.pendingFollowupMessages.empty()) {
     ReportQueryLoopDebugEvent(
         "3", "QueryLoop.cpp:no-tool:validator-retry",
-        "[DEBUG] Continuing turn due to validator retry",
+        "[DEBUG] Continuing turn due to validator retry (incremental, skip pipeline)",
         {{"turnCount", state.turnCount},
          {"followupCount", static_cast<int>(state.pendingFollowupMessages.size())},
-         {"assistantCount", static_cast<int>(state.assistantMessages.size())}},
+         {"assistantCount", static_cast<int>(state.assistantMessages.size())},
+         {"messagesForTurnSize", static_cast<int>(state.messagesForTurn.size())}},
         MakeQueryLoopTraceId("continue"));
-    return ContinueWithFollowup(
-        ctx, state, state.pendingFollowupMessages,
-        TransitionReason::ValidatorRetry, false);
+
+    // Append turn artifacts to persistent transcript
+    for (const auto& am : state.assistantMessages) ctx.messages.push_back(am);
+    for (const auto& tr : state.toolResultMessages) ctx.messages.push_back(tr);
+    for (const auto& fu : state.pendingFollowupMessages) ctx.messages.push_back(fu);
+    if (ctx.sessionManager) {
+      for (const auto& am : state.assistantMessages)
+        ctx.sessionManager->AppendMessageToTranscript(am);
+      for (const auto& tr : state.toolResultMessages)
+        ctx.sessionManager->AppendMessageToTranscript(tr);
+      for (const auto& fu : state.pendingFollowupMessages)
+        ctx.sessionManager->AppendMessageToTranscript(fu);
+    }
+
+    // Build next turn messages incrementally from current turn + new data
+    // This avoids the expensive full pipeline (ToolResultBudget-Snip-Microcompact-Collapse)
+    std::vector<Message> nextMessages = state.messagesForTurn;
+    for (const auto& am : state.assistantMessages) nextMessages.push_back(am);
+    for (const auto& tr : state.toolResultMessages) nextMessages.push_back(tr);
+    for (const auto& fu : state.pendingFollowupMessages) nextMessages.push_back(fu);
+
+    state.messagesForTurn = std::move(nextMessages);
+    state.assistantMessages.clear();
+    state.toolResultMessages.clear();
+    state.pendingFollowupMessages.clear();
+    state.toolUseBlocks.clear();
+    state.forceContinuation = false;
+    state.forceContinuationReason.clear();
+
+    // Inject fresh execution memory at FRONT so the model sees error-loop
+    // warnings BEFORE re-processing any conversation history. This is the
+    // critical fix for the jianlai-graph restart-from-beginning bug.
+    const std::string execMem = BuildRecentExecutionMemory(ctx, state);
+    if (!execMem.empty()) {
+      Message memMsg;
+      memMsg.role = MessageRole::System;
+      memMsg.uuid = "recent-execution-memory";
+      memMsg.isMeta = true;
+      memMsg.content.push_back(ContentBlock::MakeText(execMem));
+      state.messagesForTurn.insert(state.messagesForTurn.begin(), memMsg);
+    }
+
+    state.transition = TransitionReason::ValidatorRetry;
+    state.stage = QueryStage::Autocompact;
+    return true;
   }
 
   StopHookResult hooksResult = ExecuteStopHooks(ctx, state);
@@ -2348,10 +2574,28 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
       followup.role = MessageRole::System;
       followup.uuid = "forced-continuation";
       followup.isMeta = true;
-      std::string content =
-          "Do not stop at planning. Start the next concrete action now. "
-          "If inspection, tool use, file edits, or tests are required, emit "
-          "the appropriate tool call immediately.";
+      std::string content;
+      if (state.forcedContinuationCount >= 6) {
+        content =
+            "You have been planning without executing any tool calls for "
+            "many turns. The task will be terminated if you do not emit a "
+            "concrete tool call NOW. Do NOT describe any more plans. "
+            "Use Write to create a file, Read to inspect code, "
+            "or Bash to run a command. Emit the tool call in your next "
+            "response.";
+      } else if (state.forcedContinuationCount >= 3) {
+        content =
+            "You have repeatedly described plans without taking action. "
+            "Stop describing. Emit a concrete tool call now: use Write to "
+            "create or modify files, Read to inspect code, Glob to explore "
+            "directories, or Bash to execute commands. Do not write another "
+            "plan - execute.";
+      } else {
+        content =
+            "Do not stop at planning. Start the next concrete action now. "
+            "If inspection, tool use, file edits, or tests are required, emit "
+            "the appropriate tool call immediately.";
+      }
       if (!state.forceContinuationReason.empty()) {
         content += " Reason: " + state.forceContinuationReason;
       }
@@ -2589,6 +2833,12 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
         continue;
       }
       case QueryStage::RunTools: {
+        // P0-FIX: Check for excessive exploration-only turns
+        if (ShouldTerminateOnExcessiveExploration(ctx, state)) {
+          state.completed = true;
+          state.terminalReason = "excessive_exploration";
+          continue;
+        }
         // P0-02: Check for duplicate tool call loops
         if (ShouldTerminateOnDuplicates(ctx, state)) {
           state.completed = true;
@@ -2603,7 +2853,6 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
         }
         PostToolTurnProcessing(ctx, state);
         state.stage = QueryStage::ToolResultBudget;
-        state.turnCount = 0;
         state.transition = TransitionReason::ToolResultContinuation;
         continue;
       }

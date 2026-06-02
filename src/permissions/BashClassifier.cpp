@@ -8,15 +8,31 @@ namespace agent {
 namespace permissions {
 
 const std::vector<std::string> BashClassifier::kReadOnlyCommands = {
-    "ls", "cat", "head", "tail", "wc", "stat", "file",
+    // File listing and inspection (aligned with local-ace BASH_READ_COMMANDS)
+    "ls", "dir", "cat", "head", "tail", "wc", "stat", "file",
+    "strings", "du", "tree",
+    // Search tools (aligned with local-ace BASH_SEARCH_COMMANDS)
+    "find", "grep", "egrep", "fgrep", "rg", "ag", "ack",
+    "locate", "which", "whereis", "type",
+    // Text processing (read-only)
+    "awk", "sed", "cut", "sort", "uniq", "tr", "jq",
+    // Info/output
     "echo", "printf", "date", "pwd", "whoami", "hostname",
-    "env", "printenv", "which", "whereis", "type",
-    "find", "grep", "egrep", "fgrep", "awk", "sed",
+    "env", "printenv", "uname", "id",
+    // Git read-only
     "git log", "git status", "git diff", "git show",
     "git branch", "git tag", "git remote", "git config",
     "git stash list", "git ls-files", "git ls-tree",
+    "git blame", "git grep", "git rev-parse", "git describe",
+    // Interpreters (when just checking version or running inline)
     "python3 -c", "python -c", "node -e",
+    // Package info
     "npm list", "npm view", "npm info",
+    "pip list", "pip show", "pip freeze",
+    // PowerShell read-only equivalents (aligned with local-ace Windows support)
+    "Get-ChildItem", "Get-Content", "Select-String",
+    "Measure-Object", "Where-Object", "ForEach-Object",
+    "Get-Process", "Get-Service",
 };
 
 const std::vector<std::string> BashClassifier::kDestructiveCommands = {
@@ -32,13 +48,19 @@ const std::vector<std::string> BashClassifier::kDestructiveCommands = {
 };
 
 const std::vector<std::string> BashClassifier::kReadOnlyPrefixes = {
-    "ls ", "cat ", "head ", "tail ", "wc ", "stat ",
+    "ls ", "dir ", "cat ", "head ", "tail ", "wc ", "stat ",
     "echo ", "printf ", "date ", "pwd", "whoami",
     "env ", "printenv ", "which ", "whereis ",
-    "find ", "grep ", "git log", "git status",
-    "git diff", "git show", "git branch",
+    "find ", "grep ", "rg ", "ag ", "ack ",
+    "jq ", "awk ", "sed ", "cut ", "sort ", "uniq ", "tr ",
+    "du ", "tree ", "strings ", "file ",
+    "git log", "git status", "git diff", "git show",
+    "git branch", "git blame", "git grep",
     "npm list", "npm view", "npm info",
-    "dir ", "type ", "tree ",
+    "pip list", "pip show", "pip freeze",
+    "Get-ChildItem", "Get-Content", "Select-String",
+    "Measure-Object", "Where-Object",
+    "python -c", "python3 -c", "python -m pip list",
 };
 
 BashClassifier::BashClassifier() = default;

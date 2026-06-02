@@ -55,6 +55,14 @@ class HookExecutor {
                                        int exitCode = 0,
                                        int timeoutMs = 600000);
 
+  // Post-tool-use-failure hooks: run AFTER a tool fails (aligned with local-ace)
+  HookBatchResult RunPostToolUseFailureHooks(const std::string& toolName,
+                                              const std::string& toolInput,
+                                              const std::string& toolUseID,
+                                              const std::string& errorMessage,
+                                              int exitCode = 1,
+                                              int timeoutMs = 600000);
+
   // Stop hooks: run when agent is about to stop
   HookBatchResult RunStopHooks(const std::string& stopReason,
                                 int timeoutMs = 60000);

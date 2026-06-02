@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+﻿cmake_minimum_required(VERSION 3.20)
 
 project(cpp_agent LANGUAGES CXX)
 
@@ -60,12 +60,14 @@ add_library(agent_core
   src/app/TuiTaskPanel.cpp
   src/agents/SubAgentManager.cpp
   src/agents/SubAgentWorkerProtocol.cpp
+  src/agents/CoordinatorMode.cpp
   src/api/CostTracker.cpp
   src/api/ModelClient.cpp
   src/api/SideQueryClient.cpp
   src/core/QueryEngine.cpp
   src/core/QueryLoop.cpp
   src/core/StateTypes.cpp
+  src/core/AppStateStore.cpp
   src/core/StreamingToolExecutor.cpp
   src/hooks/HookConfig.cpp
   src/hooks/HookExecutor.cpp
@@ -74,13 +76,46 @@ add_library(agent_core
   src/infra/SessionManager.cpp
   src/infra/StabilityWatchdog.cpp
   src/mcp/McpClientManager.cpp
+  src/mcp/ChannelPermissions.cpp
+  src/mcp/ChannelNotification.cpp
   src/memory/AutoDream.cpp
+  src/memory/ConsolidationLock.cpp
+  src/memory/ConsolidationPrompt.cpp
   src/memory/MemoryIndex.cpp
   src/memory/MemoryScanner.cpp
+  src/memory/SessionMemory.cpp
+  src/memory/ExtractMemories.cpp
   src/permissions/BashClassifier.cpp
   src/permissions/PermissionEngine.cpp
+  src/permissions/PathValidator.cpp
+  src/permissions/PolicyLimits.cpp
+  src/sandbox/SandboxEnforcer.cpp
+  src/compact/TimeBasedMCConfig.cpp
+  src/compact/SessionMemoryCompact.cpp
+  src/compact/ContextCollapse.cpp
+  src/compact/CompactEngine.cpp
+  src/compact/MicroCompact.cpp
+  src/compact/AutoCompact.cpp
+  src/compact/CompactPrompt.cpp
+  src/compact/MessageGrouping.cpp
+  src/compact/PostCompactCleanup.cpp
+  src/compact/SnipProjection.cpp
+  src/tools/BashTool.cpp
+  src/tools/FileReadTool.cpp
+  src/tools/FileWriteTool.cpp
+  src/tools/FileEditTool.cpp
+  src/tools/GlobTool.cpp
+  src/tools/GrepTool.cpp
+  src/tools/TodoWriteTool.cpp
+  src/tools/WebFetchTool.cpp
+  src/tools/WebSearchTool.cpp
+  src/tools/NotebookEditTool.cpp
+  src/tools/TaskCreateTool.cpp
   src/tools/ToolOrchestrator.cpp
   src/tools/ToolRegistry.cpp
+  src/tools/Tool.cpp
+  src/tools/ToolSearch.cpp
+  src/core/LocalValidator.cpp
 )
 
 target_include_directories(agent_core
@@ -163,22 +198,159 @@ if(AGENT_BUILD_TESTS)
   target_link_libraries(agent_test_classifier PRIVATE agent_core)
   add_test(NAME agent_test_classifier COMMAND agent_test_classifier)
 
+  # P0-03: Sandbox + Memory comprehensive tests
+  add_executable(agent_test_sandbox
+    tests/unit/test_sandbox.cpp
+  )
+  target_link_libraries(agent_test_sandbox PRIVATE agent_core)
+  add_test(NAME agent_test_sandbox COMMAND agent_test_sandbox)
+
+  # P0-03: New module tests (compact, channel permissions, app state, tool search)
+  add_executable(agent_test_compact
+    tests/unit/test_compact.cpp
+  )
+  target_link_libraries(agent_test_compact PRIVATE agent_core)
+  add_test(NAME agent_test_compact COMMAND agent_test_compact)
+
+  add_executable(agent_test_channel_permissions
+    tests/unit/test_channel_permissions.cpp
+  )
+  target_link_libraries(agent_test_channel_permissions PRIVATE agent_core)
+  add_test(NAME agent_test_channel_permissions COMMAND agent_test_channel_permissions)
+
+  add_executable(agent_test_app_state
+    tests/unit/test_app_state.cpp
+  )
+  target_link_libraries(agent_test_app_state PRIVATE agent_core)
+  add_test(NAME agent_test_app_state COMMAND agent_test_app_state)
+
+  add_executable(agent_test_coordinator
+    tests/unit/test_coordinator.cpp
+  )
+  target_link_libraries(agent_test_coordinator PRIVATE agent_core)
+  add_test(NAME agent_test_coordinator COMMAND agent_test_coordinator)
+
+  add_executable(agent_test_extract_memories
+    tests/unit/test_extract_memories.cpp
+  )
+  target_link_libraries(agent_test_extract_memories PRIVATE agent_core)
+  add_test(NAME agent_test_extract_memories COMMAND agent_test_extract_memories)
+
+  add_executable(agent_test_context_collapse
+    tests/unit/test_context_collapse.cpp
+  )
+  target_link_libraries(agent_test_context_collapse PRIVATE agent_core)
+  add_test(NAME agent_test_context_collapse COMMAND agent_test_context_collapse)
+
+  add_executable(agent_test_compact_engine
+    tests/unit/test_compact_engine.cpp
+  )
+  target_link_libraries(agent_test_compact_engine PRIVATE agent_core)
+  add_test(NAME agent_test_compact_engine COMMAND agent_test_compact_engine)
+
+  add_executable(agent_test_micro_compact
+    tests/unit/test_micro_compact.cpp
+  )
+  target_link_libraries(agent_test_micro_compact PRIVATE agent_core)
+  add_test(NAME agent_test_micro_compact COMMAND agent_test_micro_compact)
+
+  add_executable(agent_test_integration_realworld
+    tests/unit/test_integration_realworld.cpp
+  )
+  target_link_libraries(agent_test_integration_realworld PRIVATE agent_core)
+  add_test(NAME agent_test_integration_realworld COMMAND agent_test_integration_realworld)
+
+  add_executable(agent_test_channel_notification
+    tests/unit/test_channel_notification.cpp
+  )
+  target_link_libraries(agent_test_channel_notification PRIVATE agent_core)
+  add_test(NAME agent_test_channel_notification COMMAND agent_test_channel_notification)
+
+  add_executable(agent_test_policy_limits
+    tests/unit/test_policy_limits.cpp
+  )
+  target_link_libraries(agent_test_policy_limits PRIVATE agent_core)
+  add_test(NAME agent_test_policy_limits COMMAND agent_test_policy_limits)
+
+  add_executable(agent_test_tool_search
+    tests/unit/test_tool_search.cpp
+  )
+  target_link_libraries(agent_test_tool_search PRIVATE agent_core)
+  add_test(NAME agent_test_tool_search COMMAND agent_test_tool_search)
+
   add_executable(agent_test_comprehensive
     tests/unit/test_comprehensive.cpp
   )
   target_link_libraries(agent_test_comprehensive PRIVATE agent_core)
   add_test(NAME agent_test_comprehensive COMMAND agent_test_comprehensive)
 
+  add_executable(agent_test_queryloop_bash
+    tests/unit/test_queryloop_bash.cpp
+  )
+  target_link_libraries(agent_test_queryloop_bash PRIVATE agent_core)
+  add_test(NAME agent_test_queryloop_bash COMMAND agent_test_queryloop_bash)
+
+  add_executable(agent_test_validator
+    tests/unit/test_validator.cpp
+  )
+  target_link_libraries(agent_test_validator PRIVATE agent_core)
+  add_test(NAME agent_test_validator COMMAND agent_test_validator)
+
+  add_executable(agent_test_auto_compact
+    tests/unit/test_auto_compact.cpp
+  )
+  target_link_libraries(agent_test_auto_compact PRIVATE agent_core)
+  add_test(NAME agent_test_auto_compact COMMAND agent_test_auto_compact)
+
+  add_executable(agent_test_compact_prompt
+    tests/unit/test_compact_prompt.cpp
+  )
+  target_link_libraries(agent_test_compact_prompt PRIVATE agent_core)
+  add_test(NAME agent_test_compact_prompt COMMAND agent_test_compact_prompt)
+
+  add_executable(agent_test_compact_warning
+    tests/unit/test_compact_warning.cpp
+  )
+  target_link_libraries(agent_test_compact_warning PRIVATE agent_core)
+  add_test(NAME agent_test_compact_warning COMMAND agent_test_compact_warning)
+  add_executable(agent_test_consolidation
+    tests/unit/test_consolidation.cpp
+  )
+  target_link_libraries(agent_test_consolidation PRIVATE agent_core)
+  add_test(NAME agent_test_consolidation COMMAND agent_test_consolidation)
+
+  add_executable(agent_test_tool_modules
+    tests/unit/test_tool_modules.cpp
+  )
+  target_link_libraries(agent_test_tool_modules PRIVATE agent_core)
+  add_test(NAME agent_test_tool_modules COMMAND agent_test_tool_modules)
+
+  add_executable(agent_test_message_grouping
+    tests/unit/test_message_grouping.cpp
+  )
+  target_link_libraries(agent_test_message_grouping PRIVATE agent_core)
+  add_test(NAME agent_test_message_grouping COMMAND agent_test_message_grouping)
+
+  
+  add_executable(agent_test_postcompact_worker
+    tests/unit/test_postcompact_worker.cpp
+  )
+  target_link_libraries(agent_test_postcompact_worker PRIVATE agent_core)
+  add_test(NAME agent_test_postcompact_worker COMMAND agent_test_postcompact_worker)
+add_executable(agent_test_autodream
+    tests/unit/test_autodream.cpp
+  )
+  target_link_libraries(agent_test_autodream PRIVATE agent_core)
+  add_test(NAME agent_test_autodream COMMAND agent_test_autodream)
+
+
+
+
   add_executable(agent_test_e2e
     tests/integration/test_e2e.cpp
   )
   target_link_libraries(agent_test_e2e PRIVATE agent_core)
   add_test(NAME agent_test_e2e COMMAND agent_test_e2e)
-
-  add_executable(agent_benchmark_runner
-    tests/integration/benchmark_runner.cpp
-  )
-  target_link_libraries(agent_benchmark_runner PRIVATE agent_core)
 
   add_executable(agent_real_project_runner
     tests/integration/real_project_runner.cpp

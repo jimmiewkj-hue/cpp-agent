@@ -1,4 +1,4 @@
-#include "app/TuiTaskPanel.h"
+﻿#include "app/TuiTaskPanel.h"
 #include "tools/ToolOrchestrator.h"
 #include "tools/ToolRegistry.h"
 #include "agents/SubAgentManager.h"
@@ -1202,6 +1202,144 @@ void TestGlobSupportsRecursivePatterns() {
   RemoveDirectoryA("build\\glob_recursive_test\\src");
   RemoveDirectoryA("build\\glob_recursive_test");
 }
+// ==================== P1: Bash normalization expanded tests ====================
+
+void TestGrepNormalization() {
+  agent::tools::ToolOrchestrator orchestrator;
+  auto canUse = [](const agent::core::ContentBlock&,
+                   const std::vector<agent::core::Message>&) {
+    agent::core::PermissionDecision d;
+    d.behavior = agent::core::PermissionBehavior::Allow;
+    return d;
+  };
+
+  // P0-03: Test basic grep - now converted to Select-String (PowerShell conversion)
+  {
+    nlohmann::json bashJson;
+    bashJson["command"] = "grep TODO main.cpp";
+    auto result = orchestrator.Execute(
+        {agent::core::ContentBlock::MakeToolUse(
+            "grep-1", "Bash", bashJson.dump())},
+        canUse, {});
+    bool sawRewrite = false;
+    for (const auto& msg : result.userMessages) {
+      for (const auto& block : msg.content) {
+        if (block.type != agent::core::BlockType::ToolResult) continue;
+        // PowerShell conversion: grep should be rewritten to Select-String
+        if (block.asToolResult.content.find("Select-String") != std::string::npos) {
+          sawRewrite = true;
+        }
+      }
+    }
+    Check(sawRewrite, "grep SHOULD be rewritten to Select-String (PowerShell conversion)");
+  }
+
+  // P0-03: Test grep -i - now converted to Select-String -CaseSensitive:$false
+  {
+    nlohmann::json bashJson;
+    bashJson["command"] = "grep -i TODO main.cpp";
+    auto result = orchestrator.Execute(
+        {agent::core::ContentBlock::MakeToolUse(
+            "grep-i", "Bash", bashJson.dump())},
+        canUse, {});
+    bool sawRewriteI = false;
+    for (const auto& msg : result.userMessages) {
+      for (const auto& block : msg.content) {
+        if (block.type != agent::core::BlockType::ToolResult) continue;
+        // PowerShell conversion: grep -i should now be rewritten
+        if (block.asToolResult.content.find("Select-String") != std::string::npos) {
+          sawRewriteI = true;
+        }
+      }
+    }
+    Check(sawRewriteI, "grep -i SHOULD be rewritten to Select-String (PowerShell conversion)");
+  }
+}
+
+void TestDevNullNormalization() {
+  agent::tools::ToolOrchestrator orchestrator;
+  auto canUse = [](const agent::core::ContentBlock&,
+                   const std::vector<agent::core::Message>&) {
+    agent::core::PermissionDecision d;
+    d.behavior = agent::core::PermissionBehavior::Allow;
+    return d;
+  };
+
+  // P0-03: Test 2>/dev/null -> 2> (preserved from Unix-strip strategy)
+  {
+    nlohmann::json bashJson;
+    bashJson["command"] = "python test.py 2>/dev/null";
+    auto result = orchestrator.Execute(
+        {agent::core::ContentBlock::MakeToolUse(
+            "devnull-1", "Bash", bashJson.dump())},
+        canUse, {});
+    bool sawNormalized = false;
+    for (const auto& msg : result.userMessages) {
+      for (const auto& block : msg.content) {
+        if (block.type != agent::core::BlockType::ToolResult) continue;
+        if (block.asToolResult.content.find("[normalized command]") != std::string::npos &&
+            block.asToolResult.content.find("") != std::string::npos) {
+          sawNormalized = true;
+        }
+      }
+    }
+    Check(sawNormalized, "2>/dev/null should normalize to  on Windows");
+  }
+
+  // P0-03: Test >/dev/null -> > (preserved from Unix-strip strategy)
+  {
+    nlohmann::json bashJson;
+    bashJson["command"] = "echo test >/dev/null";
+    auto result = orchestrator.Execute(
+        {agent::core::ContentBlock::MakeToolUse(
+            "devnull-2", "Bash", bashJson.dump())},
+        canUse, {});
+    bool sawNormalized = false;
+    for (const auto& msg : result.userMessages) {
+      for (const auto& block : msg.content) {
+        if (block.type != agent::core::BlockType::ToolResult) continue;
+        if (block.asToolResult.content.find("[normalized command]") != std::string::npos &&
+            block.asToolResult.content.find("") != std::string::npos) {
+          sawNormalized = true;
+        }
+      }
+    }
+    Check(sawNormalized, ">/dev/null should normalize to  on Windows");
+  }
+}
+
+void TestPipedGrepNormalization() {
+  agent::tools::ToolOrchestrator orchestrator;
+  auto canUse = [](const agent::core::ContentBlock&,
+                   const std::vector<agent::core::Message>&) {
+    agent::core::PermissionDecision d;
+    d.behavior = agent::core::PermissionBehavior::Allow;
+    return d;
+  };
+
+  // P0-03: Test piped grep - now converted to Select-String
+  {
+    nlohmann::json bashJson;
+    bashJson["command"] = "python -m pip list 2>&1 | grep requests";
+    auto result = orchestrator.Execute(
+        {agent::core::ContentBlock::MakeToolUse(
+            "pipe-grep", "Bash", bashJson.dump())},
+        canUse, {});
+    bool sawRewritePipe = false;
+    for (const auto& msg : result.userMessages) {
+      for (const auto& block : msg.content) {
+        if (block.type != agent::core::BlockType::ToolResult) continue;
+        // PowerShell conversion: grep in pipe should now be rewritten
+        if (block.asToolResult.content.find("Select-String") != std::string::npos) {
+          sawRewritePipe = true;
+        }
+      }
+    }
+    Check(sawRewritePipe, "piped grep SHOULD be rewritten to Select-String (PowerShell conversion)");
+  }
+}
+
+
 
 int main() {
   TestToolRegistry();
@@ -1229,6 +1367,9 @@ int main() {
   TestSkillToolDispatchesAgent();
   TestMkdirNormalization();
   TestGlobSupportsRecursivePatterns();
+  TestGrepNormalization();
+  TestDevNullNormalization();
+  TestPipedGrepNormalization();
   std::cout << "[test_tools] Failures: " << failures << std::endl;
   return failures > 0 ? 1 : 0;
 }

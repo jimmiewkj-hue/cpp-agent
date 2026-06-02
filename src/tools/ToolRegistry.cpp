@@ -1,4 +1,5 @@
-#include "tools/ToolRegistry.h"
+﻿#include "tools/ToolRegistry.h"
+#include "third_party/nlohmann_json.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -6,358 +7,379 @@
 namespace agent {
 namespace tools {
 
-std::vector<ToolSchema> ToolRegistry::GetAllBaseTools() {
-  std::vector<ToolSchema> tools;
+using json = nlohmann::json;
 
-  {
-    ToolSchema t;
-    t.name = "Bash";
-    t.description = "Execute a shell command";
-    t.inputSchemaJson = R"({"type":"object","properties":{"command":{"type":"string","description":"The command to execute"}},"required":["command"]})";
-    t.category = ToolExecCategory::ShellCommand;
-    t.readOnlyHint = false;
-    t.destructiveHint = true;
-    t.maxResultSizeChars = 400000;
-    tools.push_back(t);
+// ============================================================================
+// P0-03: Case-insensitive comparison for tool name matching (aligned with local-ace)
+// ============================================================================
+namespace {
+bool CaseInsensitiveCompare(const std::string& a, const std::string& b) {
+  return a.size() == b.size() &&
+         std::equal(a.begin(), a.end(), b.begin(),
+                    [](char ca, char cb) {
+                      return std::tolower(static_cast<unsigned char>(ca)) ==
+                             std::tolower(static_cast<unsigned char>(cb));
+                    });
+}
+}  // namespace
+
+// ============================================================================
+// RegisterTool (unique_ptr<Tool>)
+// ============================================================================
+void ToolRegistry::RegisterTool(std::unique_ptr<Tool> tool) {
+  if (!tool) return;
+  std::lock_guard<std::mutex> lock(mutex_);
+  tools_.push_back(std::move(tool));
+}
+
+// ============================================================================
+// RegisterTool (ToolSchema — backward compatibility wrapper)
+// ============================================================================
+void ToolRegistry::RegisterTool(const ToolSchema& schema) {
+  ToolDef def;
+  def.name = schema.name;
+  def.description = schema.description;
+  def.inputSchemaJson = schema.inputSchemaJson;
+  def.readOnlyHint = schema.readOnlyHint;
+  def.destructiveHint = schema.destructiveHint;
+  def.maxResultSizeChars = schema.maxResultSizeChars;
+  def.isConcurrencySafe = [hint = schema.readOnlyHint](const json&) { return hint; };
+  def.call = [](const json&, const ToolUseContext&, ToolProgressCallback) -> ToolCallResult {
+    ToolCallResult result;
+    result.ok = true;
+    result.metadata["delegated"] = true;
+    return result;
+  };
+  RegisterTool(BuildTool(std::move(def)));
+}
+
+// ============================================================================
+// FindTool (case-insensitive, checks primary name + aliases)
+// ============================================================================
+const Tool* ToolRegistry::FindTool(const std::string& name) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // P0-03: Case-insensitive matching (aligned with local-ace)
+  for (const auto& tool : tools_) {
+    if (CaseInsensitiveCompare(tool->Name(), name)) return tool.get();
+    for (const auto& alias : tool->Aliases()) {
+      if (CaseInsensitiveCompare(alias, name)) return tool.get();
+    }
   }
-  {
-    ToolSchema t;
-    t.name = "Read";
-    t.description = "Read a file from the filesystem; relative paths resolve from the trusted workspace root. Use offset/limit to read a targeted line range from large files.";
-    t.inputSchemaJson = R"({"type":"object","properties":{"file_path":{"type":"string","description":"Path to the file. Use an absolute path for files outside the current workspace."},"offset":{"type":"integer","minimum":0,"description":"Optional 1-based start line for partial reads."},"limit":{"type":"integer","minimum":0,"description":"Optional number of lines to return starting at offset."}},"required":["file_path"]})";
-    t.category = ToolExecCategory::ReadOnly;
-    t.readOnlyHint = true;
-    t.destructiveHint = false;
-    t.maxResultSizeChars = 100000;
-    tools.push_back(t);
+  return nullptr;
+}
+
+Tool* ToolRegistry::FindTool(const std::string& name) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // P0-03: Case-insensitive matching (aligned with local-ace)
+  for (auto& tool : tools_) {
+    if (CaseInsensitiveCompare(tool->Name(), name)) return tool.get();
+    for (const auto& alias : tool->Aliases()) {
+      if (CaseInsensitiveCompare(alias, name)) return tool.get();
+    }
   }
-  {
-    ToolSchema t;
-    t.name = "FileRead";
-    t.description = "Read a file from the filesystem; relative paths resolve from the trusted workspace root. Use offset/limit to read a targeted line range from large files.";
-    t.inputSchemaJson = R"({"type":"object","properties":{"file_path":{"type":"string","description":"Path to the file. Use an absolute path for files outside the current workspace."},"offset":{"type":"integer","minimum":0,"description":"Optional 1-based start line for partial reads."},"limit":{"type":"integer","minimum":0,"description":"Optional number of lines to return starting at offset."}},"required":["file_path"]})";
-    t.category = ToolExecCategory::ReadOnly;
-    t.readOnlyHint = true;
-    t.destructiveHint = false;
-    t.maxResultSizeChars = 100000;
-    tools.push_back(t);
+  return nullptr;
+}
+
+// ============================================================================
+// HasTool
+// ============================================================================
+bool ToolRegistry::HasTool(const std::string& name) const {
+  return FindTool(name) != nullptr;
+}
+
+// ============================================================================
+// ListTools
+// ============================================================================
+std::vector<const Tool*> ToolRegistry::ListTools() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<const Tool*> result;
+  result.reserve(tools_.size());
+  for (const auto& tool : tools_) {
+    result.push_back(tool.get());
   }
-  {
-    ToolSchema t;
-    t.name = "Write";
-    t.description = "Write content to a file inside the trusted workspace; use relative paths for project files";
-    t.inputSchemaJson = R"({"type":"object","properties":{"file_path":{"type":"string","description":"Destination path inside the trusted workspace. Relative paths are preferred for project files."},"content":{"type":"string"}},"required":["file_path","content"]})";
-    t.category = ToolExecCategory::FileWrite;
-    t.readOnlyHint = false;
-    t.destructiveHint = true;
-    t.maxResultSizeChars = 100000;
-    tools.push_back(t);
+  return result;
+}
+
+// ============================================================================
+// ListToolSchemas
+// ============================================================================
+std::vector<ToolSchema> ToolRegistry::ListToolSchemas() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<ToolSchema> result;
+  result.reserve(tools_.size());
+  for (const auto& tool : tools_) {
+    ToolSchema schema;
+    schema.name = tool->Name();
+    schema.description = tool->UserFacingDescription();
+    schema.inputSchemaJson = tool->InputSchemaJson();
+    schema.readOnlyHint = tool->IsReadOnly({});
+    schema.destructiveHint = tool->IsDestructive({});
+    schema.maxResultSizeChars = tool->MaxResultSizeChars();
+    result.push_back(schema);
   }
+  return result;
+}
+
+// ============================================================================
+// GetAllBaseTools (static factory — aligned with local-ace getAllBaseTools)
+// ============================================================================
+std::vector<std::unique_ptr<Tool>> ToolRegistry::GetAllBaseTools() {
+  std::vector<std::unique_ptr<Tool>> tools;
+
+  // Bash tool
   {
-    ToolSchema t;
-    t.name = "FileWrite";
-    t.description = "Write content to a file inside the trusted workspace; use relative paths for project files";
-    t.inputSchemaJson = R"({"type":"object","properties":{"file_path":{"type":"string","description":"Destination path inside the trusted workspace. Relative paths are preferred for project files."},"content":{"type":"string"}},"required":["file_path","content"]})";
-    t.category = ToolExecCategory::FileWrite;
-    t.readOnlyHint = false;
-    t.destructiveHint = true;
-    t.maxResultSizeChars = 100000;
-    tools.push_back(t);
+    ToolDef def;
+    def.name = "Bash";
+    def.description = "Execute a shell command.";
+    def.inputSchemaJson = R"({
+      "type": "object",
+      "properties": {
+        "command": {"type": "string", "description": "The command to execute"}
+      },
+      "required": ["command"]
+    })";
+    def.destructiveHint = true;
+    def.maxResultSizeChars = 400000;
+    def.aliases = {"bash", "shell", "exec"};
+
+    def.call = [](const json&, const ToolUseContext&, ToolProgressCallback) -> ToolCallResult {
+      ToolCallResult result;
+      result.ok = true;
+      result.metadata["delegated"] = true;
+      return result;
+    };
+
+    tools.push_back(BuildTool(std::move(def)));
   }
+
+  // Read tool
   {
-    ToolSchema t;
-    t.name = "Grep";
-    t.description = "Search for a pattern in files; relative paths resolve from the trusted workspace root";
-    t.inputSchemaJson = R"({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"Optional file or directory path. Use an absolute path for locations outside the current workspace."}},"required":["pattern"]})";
-    t.category = ToolExecCategory::ReadOnly;
-    t.readOnlyHint = true;
-    t.destructiveHint = false;
-    t.maxResultSizeChars = 200000;
-    tools.push_back(t);
+    ToolDef def;
+    def.name = "Read";
+    def.description = "Reads a file from the local filesystem. You can access any file directly by using this tool.";
+    def.inputSchemaJson = R"({
+      "type": "object",
+      "properties": {
+        "file_path": {"type": "string", "description": "The path to the file to read"},
+        "offset": {"type": "integer", "minimum": 1, "description": "Optional 1-based start line for partial reads"},
+        "limit": {"type": "integer", "minimum": 1, "description": "Optional number of lines to return starting at offset"}
+      },
+      "required": ["file_path"]
+    })";
+    def.readOnlyHint = true;
+    def.isConcurrencySafe = [](const json&) { return true; };
+    def.maxResultSizeChars = 100000;
+    def.aliases = {"FileRead", "read_file", "file_read"};
+    def.searchHint = "read file content";
+
+    def.call = [](const json&, const ToolUseContext&, ToolProgressCallback) -> ToolCallResult {
+      ToolCallResult result;
+      result.ok = true;
+      result.metadata["delegated"] = true;
+      return result;
+    };
+
+    tools.push_back(BuildTool(std::move(def)));
   }
+
+  // Write tool
   {
-    ToolSchema t;
-    t.name = "Glob";
-    t.description = "Find files matching a glob pattern; relative paths resolve from the trusted workspace root";
-    t.inputSchemaJson = R"({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"Optional directory path. Use an absolute path for locations outside the current workspace."}},"required":["pattern"]})";
-    t.category = ToolExecCategory::ReadOnly;
-    t.readOnlyHint = true;
-    t.destructiveHint = false;
-    t.maxResultSizeChars = 100000;
-    tools.push_back(t);
+    ToolDef def;
+    def.name = "Write";
+    def.description = "Writes a file to the local filesystem.";
+    def.inputSchemaJson = R"({
+      "type": "object",
+      "properties": {
+        "file_path": {"type": "string", "description": "The path to the file to write"},
+        "content": {"type": "string", "description": "The content to write to the file"}
+      },
+      "required": ["file_path", "content"]
+    })";
+    def.destructiveHint = true;
+    def.maxResultSizeChars = 100000;
+    def.aliases = {"FileWrite", "write_file", "file_write"};
+    def.searchHint = "write create save file";
+
+    def.call = [](const json&, const ToolUseContext&, ToolProgressCallback) -> ToolCallResult {
+      ToolCallResult result;
+      result.ok = true;
+      result.metadata["delegated"] = true;
+      return result;
+    };
+
+    tools.push_back(BuildTool(std::move(def)));
   }
+
+  // Glob tool
   {
-    ToolSchema t;
-    t.name = "Agent";
-    t.description = "Spawn a sub-agent to handle complex multi-step tasks";
-    t.inputSchemaJson = R"({"type":"object","properties":{"prompt":{"type":"string"},"description":{"type":"string"},"subagent_type":{"type":"string"},"run_in_background":{"type":"boolean"}},"required":["prompt"]})";
-    t.category = ToolExecCategory::SubAgent;
-    t.readOnlyHint = false;
-    t.destructiveHint = true;
-    t.maxResultSizeChars = 400000;
-    tools.push_back(t);
+    ToolDef def;
+    def.name = "Glob";
+    def.description = "Find files matching a glob pattern.";
+    def.inputSchemaJson = R"({
+      "type": "object",
+      "properties": {
+        "pattern": {"type": "string", "description": "The glob pattern to match files against"}
+      },
+      "required": ["pattern"]
+    })";
+    def.readOnlyHint = true;
+    def.maxResultSizeChars = 50000;
+    def.aliases = {"glob", "ls"};
+    def.searchHint = "find list files directory";
+
+    def.call = [](const json&, const ToolUseContext&, ToolProgressCallback) -> ToolCallResult {
+      ToolCallResult result;
+      result.ok = true;
+      result.metadata["delegated"] = true;
+      return result;
+    };
+
+    tools.push_back(BuildTool(std::move(def)));
   }
+
+  // Grep tool
   {
-    ToolSchema t;
-    t.name = "TodoWrite";
-    t.description = "Create and manage a structured task list for this session";
-    t.inputSchemaJson = R"({"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]},"id":{"type":"string"},"priority":{"type":"string","enum":["high","medium","low"]}},"required":["content","status","id","priority"]}}},"required":["todos"]})";
-    t.category = ToolExecCategory::FileWrite;
-    t.readOnlyHint = false;
-    t.destructiveHint = true;
-    t.maxResultSizeChars = 100000;
-    tools.push_back(t);
+    ToolDef def;
+    def.name = "Grep";
+    def.description = "Search for a pattern in files.";
+    def.inputSchemaJson = R"({
+      "type": "object",
+      "properties": {
+        "pattern": {"type": "string", "description": "The regex pattern to search for"},
+        "path": {"type": "string", "description": "The path to search in"}
+      },
+      "required": ["pattern"]
+    })";
+    def.readOnlyHint = true;
+    def.maxResultSizeChars = 50000;
+    def.aliases = {"grep", "search"};
+    def.searchHint = "search grep find text pattern";
+
+    def.call = [](const json&, const ToolUseContext&, ToolProgressCallback) -> ToolCallResult {
+      ToolCallResult result;
+      result.ok = true;
+      result.metadata["delegated"] = true;
+      return result;
+    };
+
+    tools.push_back(BuildTool(std::move(def)));
   }
+
+  // TodoWrite tool
   {
-    ToolSchema t;
-    t.name = "TaskCreate";
-    t.description = "Create a structured task for the current session task list";
-    t.inputSchemaJson = R"({"type":"object","properties":{"subject":{"type":"string"},"description":{"type":"string"},"activeForm":{"type":"string"},"metadata":{"type":"object"}},"required":["subject","description"]})";
-    t.category = ToolExecCategory::FileWrite;
-    t.readOnlyHint = false;
-    t.destructiveHint = true;
-    t.maxResultSizeChars = 100000;
-    tools.push_back(t);
+    ToolDef def;
+    def.name = "TodoWrite";
+    def.description = "Create and manage a task list for your current coding session.";
+    def.inputSchemaJson = R"({
+      "type": "object",
+      "properties": {
+        "todos": {"type": "array", "description": "The list of todo items"}
+      },
+      "required": ["todos"]
+    })";
+    def.readOnlyHint = false;
+    def.maxResultSizeChars = 10000;
+    def.aliases = {"TodoWrite", "todo_write"};
+
+    def.call = [](const json&, const ToolUseContext&, ToolProgressCallback) -> ToolCallResult {
+      ToolCallResult result;
+      result.ok = true;
+      result.metadata["delegated"] = true;
+      return result;
+    };
+
+    tools.push_back(BuildTool(std::move(def)));
   }
+
+  // AskUserQuestion tool
   {
-    ToolSchema t;
-    t.name = "TaskGet";
-    t.description = "Get one task from the current session task list by id";
-    t.inputSchemaJson = R"({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})";
-    t.category = ToolExecCategory::ReadOnly;
-    t.readOnlyHint = true;
-    t.destructiveHint = false;
-    t.maxResultSizeChars = 100000;
-    tools.push_back(t);
-  }
-  {
-    ToolSchema t;
-    t.name = "TaskUpdate";
-    t.description = "Update one task in the current session task list";
-    t.inputSchemaJson = R"({"type":"object","properties":{"id":{"type":"string"},"subject":{"type":"string"},"description":{"type":"string"},"activeForm":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed","blocked","cancelled"]},"owner":{"type":"string"},"blockedBy":{"type":"array","items":{"type":"string"}},"metadata":{"type":"object"}},"required":["id"]})";
-    t.category = ToolExecCategory::FileWrite;
-    t.readOnlyHint = false;
-    t.destructiveHint = true;
-    t.maxResultSizeChars = 100000;
-    tools.push_back(t);
-  }
-  {
-    ToolSchema t;
-    t.name = "TaskList";
-    t.description = "List all tasks for the current session task list";
-    t.inputSchemaJson = R"({"type":"object","properties":{}})";
-    t.category = ToolExecCategory::ReadOnly;
-    t.readOnlyHint = true;
-    t.destructiveHint = false;
-    t.maxResultSizeChars = 100000;
-    tools.push_back(t);
-  }
-  {
-    ToolSchema t;
-    t.name = "TaskStop";
-    t.description = "Stop or cancel a task in the current session task list";
-    t.inputSchemaJson = R"({"type":"object","properties":{"id":{"type":"string"},"reason":{"type":"string"}},"required":["id"]})";
-    t.category = ToolExecCategory::FileWrite;
-    t.readOnlyHint = false;
-    t.destructiveHint = true;
-    t.maxResultSizeChars = 100000;
-    tools.push_back(t);
-  }
-  {
-    ToolSchema t;
-    t.name = "AskUserQuestion";
-    t.description = "Ask the user clarifying questions when more information is needed";
-    t.inputSchemaJson = R"({"type":"object","properties":{"questions":{"type":"array","items":{"type":"object","properties":{"question":{"type":"string"},"header":{"type":"string"},"options":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}},"required":["label","description"]}},"multiSelect":{"type":"boolean"}},"required":["question","header","options","multiSelect"]}}},"required":["questions"]})";
-    t.category = ToolExecCategory::ReadOnly;
-    t.readOnlyHint = true;
-    t.destructiveHint = false;
-    t.maxResultSizeChars = 50000;
-    tools.push_back(t);
-  }
-  {
-    ToolSchema t;
-    t.name = "FileEdit";
-    t.description = "Make precise edits to an existing file inside the trusted workspace";
-    t.inputSchemaJson = R"({"type":"object","properties":{"file_path":{"type":"string","description":"Path to an existing file inside the trusted workspace."},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["file_path","old_string","new_string"]})";
-    t.category = ToolExecCategory::FileWrite;
-    t.readOnlyHint = false;
-    t.destructiveHint = true;
-    t.maxResultSizeChars = 100000;
-    tools.push_back(t);
-  }
-  {
-    ToolSchema t;
-    t.name = "NotebookEdit";
-    t.description = "Edit a Jupyter notebook cell by replacing, inserting, or deleting a cell";
-    t.inputSchemaJson = R"({"type":"object","properties":{"notebook_path":{"type":"string"},"cell_id":{"type":"string"},"new_source":{"type":"string"},"cell_type":{"type":"string","enum":["code","markdown"]},"edit_mode":{"type":"string","enum":["replace","insert","delete"]}},"required":["notebook_path"]})";
-    t.category = ToolExecCategory::FileWrite;
-    t.readOnlyHint = false;
-    t.destructiveHint = true;
-    t.maxResultSizeChars = 100000;
-    tools.push_back(t);
-  }
-  {
-    ToolSchema t;
-    t.name = "Skill";
-    t.description = "Execute a built-in skill in a forked sub-agent context";
-    t.inputSchemaJson = R"({"type":"object","properties":{"command":{"type":"string"},"args":{"type":"string"}},"required":["command"]})";
-    t.category = ToolExecCategory::SubAgent;
-    t.readOnlyHint = false;
-    t.destructiveHint = true;
-    t.maxResultSizeChars = 400000;
-    tools.push_back(t);
-  }
-  {
-    ToolSchema t;
-    t.name = "ListMcpResources";
-    t.description = "List resources exposed by connected MCP servers";
-    t.inputSchemaJson = R"({"type":"object","properties":{"server":{"type":"string"}}})";
-    t.category = ToolExecCategory::ReadOnly;
-    t.readOnlyHint = true;
-    t.destructiveHint = false;
-    t.maxResultSizeChars = 100000;
-    tools.push_back(t);
-  }
-  {
-    ToolSchema t;
-    t.name = "ReadMcpResource";
-    t.description = "Read one MCP resource by server name and resource URI";
-    t.inputSchemaJson = R"({"type":"object","properties":{"server":{"type":"string"},"uri":{"type":"string"}},"required":["server","uri"]})";
-    t.category = ToolExecCategory::ReadOnly;
-    t.readOnlyHint = true;
-    t.destructiveHint = false;
-    t.maxResultSizeChars = 100000;
-    tools.push_back(t);
-  }
-  {
-    ToolSchema t;
-    t.name = "WebFetch";
-    t.description = "Fetch the contents of a URL and convert HTML to markdown";
-    t.inputSchemaJson = R"({"type":"object","properties":{"url":{"type":"string","description":"The URL to fetch"}},"required":["url"]})";
-    t.category = ToolExecCategory::ReadOnly;
-    t.readOnlyHint = true;
-    t.destructiveHint = false;
-    t.maxResultSizeChars = 200000;
-    tools.push_back(t);
-  }
-  {
-    ToolSchema t;
-    t.name = "WebSearch";
-    t.description = "Search the web for information";
-    t.inputSchemaJson = R"({"type":"object","properties":{"query":{"type":"string","description":"The search query"},"num":{"type":"integer","description":"Max results"}},"required":["query"]})";
-    t.category = ToolExecCategory::ReadOnly;
-    t.readOnlyHint = true;
-    t.destructiveHint = false;
-    t.maxResultSizeChars = 100000;
-    tools.push_back(t);
+    ToolDef def;
+    def.name = "AskUserQuestion";
+    def.description = "Ask the user a question to gather additional information.";
+    def.inputSchemaJson = R"({
+      "type": "object",
+      "properties": {
+        "questions": {"type": "array", "description": "List of questions"}
+      },
+      "required": ["questions"]
+    })";
+    def.readOnlyHint = false;
+    def.isConcurrencySafe = [](const json&) { return false; };
+    def.maxResultSizeChars = 10000;
+    def.aliases = {"ask_user_question", "AskUser"};
+
+    def.call = [](const json&, const ToolUseContext&, ToolProgressCallback) -> ToolCallResult {
+      ToolCallResult result;
+      result.ok = true;
+      result.metadata["delegated"] = true;
+      return result;
+    };
+
+    tools.push_back(BuildTool(std::move(def)));
   }
 
   return tools;
 }
 
-std::vector<ToolSchema> ToolRegistry::AssembleToolPool(
+// ============================================================================
+// AssembleToolPool
+// ============================================================================
+std::vector<std::unique_ptr<Tool>> ToolRegistry::AssembleToolPool(
     const std::vector<std::string>& mcpToolNames,
     const std::vector<std::string>& mcpToolDescriptions,
     const std::vector<std::string>& mcpToolSchemasJson,
     const std::vector<bool>& mcpReadOnlyHints,
-    const std::vector<bool>& mcpDestructiveHints) const {
-  std::vector<ToolSchema> pool;
+    const std::vector<bool>& mcpDestructiveHints) {
 
-  {
-    const auto list = ListTools();
-    pool.insert(pool.end(), list.begin(), list.end());
+  auto tools = GetAllBaseTools();
+
+  for (size_t i = 0; i < mcpToolNames.size(); ++i) {
+    ToolDef def;
+    def.name = "mcp__" + mcpToolNames[i];
+    def.description = i < mcpToolDescriptions.size() ? mcpToolDescriptions[i] : "";
+    def.inputSchemaJson = i < mcpToolSchemasJson.size() ? mcpToolSchemasJson[i] : "{}";
+    def.readOnlyHint = i < mcpReadOnlyHints.size() ? mcpReadOnlyHints[i] : false;
+    def.destructiveHint = i < mcpDestructiveHints.size() ? mcpDestructiveHints[i] : false;
+    def.maxResultSizeChars = 100000;
+
+    def.call = [](const json&, const ToolUseContext&, ToolProgressCallback) -> ToolCallResult {
+      ToolCallResult result;
+      result.ok = true;
+      result.metadata["delegated"] = true;
+      result.metadata["mcp"] = true;
+      return result;
+    };
+
+    tools.push_back(BuildTool(std::move(def)));
   }
 
-  {
-    auto base = GetAllBaseTools();
-    for (const auto& b : base) {
-      bool exists = false;
-      for (const auto& p : pool) {
-        if (p.name == b.name) { exists = true; break; }
-      }
-      if (!exists) pool.push_back(b);
-    }
-  }
-
-  for (std::size_t i = 0; i < mcpToolNames.size(); ++i) {
-    ToolSchema mcp;
-    mcp.name = mcpToolNames[i];
-    mcp.description = i < mcpToolDescriptions.size()
-                          ? mcpToolDescriptions[i] : "";
-    mcp.inputSchemaJson = i < mcpToolSchemasJson.size()
-                              ? mcpToolSchemasJson[i] : "{}";
-    mcp.readOnlyHint = i < mcpReadOnlyHints.size() && mcpReadOnlyHints[i];
-    mcp.destructiveHint =
-        i < mcpDestructiveHints.size() && mcpDestructiveHints[i];
-    mcp.category = ToolExecCategory::McpTool;
-
-    bool exists = false;
-    for (const auto& p : pool) {
-      if (p.name == mcp.name) { exists = true; break; }
-    }
-    if (!exists) {
-      pool.push_back(mcp);
-    }
-  }
-
-  std::sort(pool.begin(), pool.end(),
-            [](const ToolSchema& a, const ToolSchema& b) {
-              return a.name < b.name;
-            });
-
-  return pool;
+  return tools;
 }
 
-void ToolRegistry::RegisterTool(const ToolSchema& schema) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  for (auto& existing : tools_) {
-    if (existing.name == schema.name) {
-      existing = schema;
-      return;
-    }
-  }
-  tools_.push_back(schema);
-}
-
-bool ToolRegistry::HasTool(const std::string& name) const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  for (const auto& tool : tools_) {
-    if (tool.name == name) return true;
-  }
-  return false;
-}
-
-const ToolSchema* ToolRegistry::FindTool(const std::string& name) const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  for (const auto& tool : tools_) {
-    if (tool.name == name) return &tool;
-  }
-  return nullptr;
-}
-
-std::vector<ToolSchema> ToolRegistry::ListTools() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return tools_;
-}
-
+// ============================================================================
+// IsConcurrencySafe / IsReadOnly / MaxResultSizeChars
+// ============================================================================
 bool ToolRegistry::IsConcurrencySafe(const std::string& name) const {
-  const ToolSchema* tool = FindTool(name);
+  const Tool* tool = FindTool(name);
   if (!tool) return false;
-  return tool->readOnlyHint;
+  return tool->IsConcurrencySafe({});
 }
 
 bool ToolRegistry::IsReadOnly(const std::string& name) const {
-  const ToolSchema* tool = FindTool(name);
+  const Tool* tool = FindTool(name);
   if (!tool) return false;
-  return tool->category == ToolExecCategory::ReadOnly;
+  return tool->IsReadOnly({});
 }
 
 int ToolRegistry::MaxResultSizeChars(const std::string& name) const {
-  const ToolSchema* tool = FindTool(name);
+  const Tool* tool = FindTool(name);
   if (!tool) return 0;
-  return tool->maxResultSizeChars;
+  return tool->MaxResultSizeChars();
 }
 
+// ============================================================================
+// Safe allowlist
+// ============================================================================
 bool ToolRegistry::IsInSafeAllowlist(const std::string& name) const {
   std::lock_guard<std::mutex> lock(mutex_);
   return std::find(safeAllowlist_.begin(), safeAllowlist_.end(), name) !=
@@ -369,6 +391,27 @@ void ToolRegistry::AddToSafeAllowlist(const std::string& name) {
   if (!IsInSafeAllowlist(name)) {
     safeAllowlist_.push_back(name);
   }
+}
+
+
+// ============================================================================
+// GetAllBaseToolSchemas (backward compatibility)
+// ============================================================================
+std::vector<ToolSchema> ToolRegistry::GetAllBaseToolSchemas() {
+  auto tools = GetAllBaseTools();
+  std::vector<ToolSchema> schemas;
+  schemas.reserve(tools.size());
+  for (auto& tool : tools) {
+    ToolSchema schema;
+    schema.name = tool->Name();
+    schema.description = tool->UserFacingDescription();
+    schema.inputSchemaJson = tool->InputSchemaJson();
+    schema.readOnlyHint = tool->IsReadOnly({});
+    schema.destructiveHint = tool->IsDestructive({});
+    schema.maxResultSizeChars = tool->MaxResultSizeChars();
+    schemas.push_back(schema);
+  }
+  return schemas;
 }
 
 }  // namespace tools

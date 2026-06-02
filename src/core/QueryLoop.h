@@ -37,6 +37,7 @@ struct QueryLoopInternalState {
   bool completed = false;
   bool validatorRequestedRetry = false;
   int validatorRetryCount = 0;
+  int totalValidatorRetryCount = 0;  // Session-wide, never reset
   int validatorNudgeCount = 0;
   std::string lastValidatorGuidance;
   int missingToolUsePromptCount = 0;
@@ -61,6 +62,9 @@ struct QueryLoopInternalState {
   // P0-02: Duplicate tool call detection
   std::vector<std::string> recentToolFingerprints;
   int consecutiveDuplicateToolCalls = 0;
+  int consecutiveExplorationOnlyTurns = 0;
+  // P0-03: Track last assistant message time for time-based microcompact
+  long long lastAssistantTimestampMs = 0;
 };
 
 struct StopHookResult {
@@ -140,6 +144,9 @@ class QueryLoop {
   static bool IsPromptTooLong(const Message& msg);
   // P0-02: Duplicate tool call fingerprinting
   std::string MakeToolFingerprint(const ContentBlock& block) const;
+  bool ShouldTerminateOnExcessiveExploration(
+      QueryLoopContext& ctx,
+      QueryLoopInternalState& state) const;
   bool ShouldTerminateOnDuplicates(
       QueryLoopContext& ctx,
       QueryLoopInternalState& state) const;

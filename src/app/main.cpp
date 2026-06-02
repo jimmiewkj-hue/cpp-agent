@@ -418,11 +418,11 @@ std::vector<std::string> SplitLines(const std::string& text) {
   return lines;
 }
 
-std::string JoinToolNames(const std::vector<agent::tools::ToolSchema>& tools) {
+std::string JoinToolNames(const std::vector<const agent::tools::Tool*>& tools) {
   std::string result;
   for (std::size_t i = 0; i < tools.size(); ++i) {
     if (i != 0) result += ", ";
-    result += tools[i].name;
+    result += tools[i]->Name();
   }
   return result;
 }
@@ -1563,7 +1563,7 @@ int main() {
   llmCfg.mainModel = GetEnvOrDefault(
       "CPP_AGENT_MAIN_MODEL", "Qwen3.6-35B-A3B-Q8_0.gguf");
   llmCfg.validatorModel = GetEnvOrDefault(
-      "CPP_AGENT_VALIDATOR_MODEL", "gemma-4-31B-it-Q8_0");
+      "CPP_AGENT_VALIDATOR_MODEL", "");
   llmCfg.fallbackModel = GetEnvOrDefault(
       "CPP_AGENT_FALLBACK_MODEL", "gemma-4-31B-it-Q8_0");
   llmCfg.connectTimeoutMs = 30000;
@@ -2005,9 +2005,9 @@ int main() {
     if (line == "/tools") {
       for (const auto& tool : toolRegistry.ListTools()) {
         std::ostringstream ss;
-        ss << "- " << tool.name
-           << "  ro=" << (tool.readOnlyHint ? "Y" : "N")
-           << "  " << tool.description;
+        ss << "- " << tool->Name()
+           << "  ro=" << (tool->IsReadOnly(nlohmann::json::object()) ? "Y" : "N")
+           << "  " << tool->UserFacingDescription();
         tui.AppendMessage(ss.str());
       }
       continue;

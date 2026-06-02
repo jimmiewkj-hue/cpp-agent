@@ -32,6 +32,17 @@ struct TopicFileContent {
   bool exists = false;
 };
 
+// Memory type taxonomy (aligned with local-ace memoryTypes.ts)
+enum class MemoryType {
+  User,       // Personal preferences, role, goals, knowledge
+  Feedback,   // Corrections, behaviors to repeat/avoid
+  Project,    // Context not in code: deadlines, decisions, rationale
+  Reference,  // Pointers to external systems, dashboards, docs
+};
+
+MemoryType ParseMemoryType(const std::string& raw);
+std::string MemoryTypeToString(MemoryType type);
+
 class MemoryIndex {
  public:
   static constexpr const char* kEntrypointName = "MEMORY.md";

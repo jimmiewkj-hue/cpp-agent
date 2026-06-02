@@ -12,6 +12,28 @@
 namespace agent {
 namespace memory {
 
+// ============================================================================
+// Memory type taxonomy (aligned with local-ace memoryTypes.ts)
+// ============================================================================
+
+MemoryType ParseMemoryType(const std::string& raw) {
+  if (raw == "user") return MemoryType::User;
+  if (raw == "feedback") return MemoryType::Feedback;
+  if (raw == "project") return MemoryType::Project;
+  if (raw == "reference") return MemoryType::Reference;
+  return MemoryType::Reference;  // default fallback
+}
+
+std::string MemoryTypeToString(MemoryType type) {
+  switch (type) {
+    case MemoryType::User: return "user";
+    case MemoryType::Feedback: return "feedback";
+    case MemoryType::Project: return "project";
+    case MemoryType::Reference: return "reference";
+  }
+  return "reference";
+}
+
 namespace {
 
 std::string Trim(const std::string& value) {

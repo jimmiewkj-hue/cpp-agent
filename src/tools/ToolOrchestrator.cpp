@@ -1,4 +1,7 @@
 ﻿#include "tools/ToolOrchestrator.h"
+#include "hooks/HookExecutor.h"
+
+#include <cstdlib>  // std::getenv, std::atoi
 
 #include "agents/SubAgentManager.h"
 #include "mcp/McpClientManager.h"
@@ -163,6 +166,127 @@ std::string NormalizeWindowsShellCommand(const std::string& command) {
   const std::string trimmed = Trim(command);
   if (trimmed.empty()) return trimmed;
 
+  // P0-03: Handle piped Unix commands (| grep, | head, | tail) FIRST,
+  // before command-specific dispatch. This fixes the bug where commands
+  // like "python -m pip list | head -100" would bypass pipe conversion
+  // because "python" doesn't match any command-specific handler.
+  // Now pipes are converted regardless of the base command name.
+  {
+    std::string result = trimmed;
+    bool modified = false;
+
+    // | grep pattern -> | Select-String -Pattern 'pattern'
+    // Also handles grep flags: -i (case insensitive), -E (extended regex),
+    // -v (invert match), -w (word match), -F (fixed strings)
+    std::size_t grepPos = result.find("| grep ");
+    if (grepPos != std::string::npos) {
+      // Extract everything after "| grep "
+      std::size_t contentStart = grepPos + 7;  // len("| grep ")
+      std::size_t patternEnd = result.find(" |", contentStart);
+      if (patternEnd == std::string::npos) patternEnd = result.size();
+      std::string grepContent = result.substr(contentStart, patternEnd - contentStart);
+      
+      // Strip grep flags: -i, -E, -v, -w, -F, -iE, -Ei, etc.
+      bool caseInsensitive = false;
+      bool invertMatch = false;
+      std::string cleanedPattern;
+      
+      // Tokenize the grep content to separate flags from pattern
+      std::istringstream iss(grepContent);
+      std::string token;
+      bool inPattern = false;
+      std::string accumulatedPattern;
+      while (iss >> token) {
+        if (token.size() >= 2 && token[0] == '-' && !inPattern) {
+          // It's a flag
+          for (size_t ci = 1; ci < token.size(); ++ci) {
+            if (token[ci] == 'i' || token[ci] == 'I') caseInsensitive = true;
+            if (token[ci] == 'v' || token[ci] == 'V') invertMatch = true;
+            // -E, -F, -w are informational; Select-String uses different flags
+          }
+        } else {
+          // It's the search pattern (or start of quoted pattern)
+          inPattern = true;
+          if (!accumulatedPattern.empty()) accumulatedPattern += " ";
+          accumulatedPattern += token;
+        }
+      }
+      
+      // If the grep content was quoted (e.g., -iE "pattern|here"),
+      // accumulatedPattern may contain the quotes. Strip them.
+      cleanedPattern = accumulatedPattern;
+      while (!cleanedPattern.empty() && cleanedPattern.back() == ' ') cleanedPattern.pop_back();
+      while (!cleanedPattern.empty() && cleanedPattern.front() == ' ') cleanedPattern.erase(0, 1);
+      // Remove surrounding quotes if present
+      if (cleanedPattern.size() >= 2 &&
+          cleanedPattern.front() == '"' && cleanedPattern.back() == '"') {
+        cleanedPattern = cleanedPattern.substr(1, cleanedPattern.size() - 2);
+      }
+      
+      if (!cleanedPattern.empty()) {
+        std::ostringstream psArgs;
+        psArgs << "| Select-String -Pattern "
+               << QuoteForPowerShellSingleQuoted(cleanedPattern);
+        if (caseInsensitive) {
+          psArgs << " -CaseSensitive:$false";
+        }
+        if (invertMatch) {
+          psArgs << " -NotMatch";
+        }
+        result = result.substr(0, grepPos) + psArgs.str() +
+                 result.substr(patternEnd);
+        modified = true;
+      }
+    }
+
+    // | head -N -> | Select-Object -First N
+    std::size_t headPos = result.find("| head ");
+    if (headPos != std::string::npos) {
+      std::size_t numStart = headPos + 7;  // len("| head ")
+      // Check if there's a -N flag
+      if (numStart < result.size() && result[numStart] == '-') {
+        ++numStart;  // skip '-'
+        std::size_t numEnd = numStart;
+        while (numEnd < result.size() && std::isdigit(static_cast<unsigned char>(result[numEnd]))) ++numEnd;
+        if (numEnd > numStart) {
+          std::string count = result.substr(numStart, numEnd - numStart);
+          result = result.substr(0, headPos) + "| Select-Object -First " + count +
+                   result.substr(numEnd);
+          modified = true;
+        }
+      } else {
+        // head without -N defaults to 10
+        result = result.substr(0, headPos) + "| Select-Object -First 10" +
+                 result.substr(numStart);
+        modified = true;
+      }
+    }
+
+    // | tail -N -> | Select-Object -Last N
+    std::size_t tailPos = result.find("| tail ");
+    if (tailPos != std::string::npos) {
+      std::size_t numStart = tailPos + 7;  // len("| tail ")
+      if (numStart < result.size() && result[numStart] == '-') {
+        ++numStart;
+        std::size_t numEnd = numStart;
+        while (numEnd < result.size() && std::isdigit(static_cast<unsigned char>(result[numEnd]))) ++numEnd;
+        if (numEnd > numStart) {
+          std::string count = result.substr(numStart, numEnd - numStart);
+          result = result.substr(0, tailPos) + "| Select-Object -Last " + count +
+                   result.substr(numEnd);
+          modified = true;
+        }
+      } else {
+        result = result.substr(0, tailPos) + "| Select-Object -Last 10" +
+                 result.substr(numStart);
+        modified = true;
+      }
+    }
+
+    if (modified) return result;
+  }
+
+
   const std::vector<ShellToken> tokens = TokenizeShellCommand(trimmed);
   if (tokens.empty()) return trimmed;
   const std::string commandName = ToLowerAscii(tokens[0].text);
@@ -267,39 +391,46 @@ std::string NormalizeWindowsShellCommand(const std::string& command) {
   }
 
   if (commandName == "head" && tokens.size() >= 2) {
-    std::string count = "10";
-    std::string target;
+    // P0-03: Convert Unix head to PowerShell Select-Object -First N.
+    // The head command is commonly used in pipes to limit output.
+    int count = 10;  // default head shows first 10 lines
+    std::string filePath;
     for (std::size_t i = 1; i < tokens.size(); ++i) {
-      if ((tokens[i].text == "-n" || tokens[i].text == "--lines") &&
-          i + 1 < tokens.size()) {
-        count = tokens[i + 1].text;
-        ++i;
+      const std::string& tok = tokens[i].text;
+      if (tok.size() >= 2 && tok[0] == '-' && std::isdigit(static_cast<unsigned char>(tok[1]))) {
+        count = std::atoi(tok.substr(1).c_str());
+      } else if (tok == "-n" && i + 1 < tokens.size()) {
+        count = std::atoi(tokens[++i].text.c_str());
       } else {
-        target = tokens[i].text;
+        filePath = tok;
       }
     }
-    if (!target.empty()) {
-      return "Get-Content " + QuoteForPowerShellSingleQuoted(target) +
-             " -TotalCount " + count;
+    if (!filePath.empty()) {
+      return "Get-Content " + QuoteForPowerShellSingleQuoted(filePath) +
+             " -First " + std::to_string(count);
     }
+    return "Select-Object -First " + std::to_string(count);
   }
 
   if (commandName == "tail" && tokens.size() >= 2) {
-    std::string count = "10";
-    std::string target;
+    // P0-03: Convert Unix tail to PowerShell Select-Object -Last N.
+    int count = 10;  // default tail shows last 10 lines
+    std::string filePath;
     for (std::size_t i = 1; i < tokens.size(); ++i) {
-      if ((tokens[i].text == "-n" || tokens[i].text == "--lines") &&
-          i + 1 < tokens.size()) {
-        count = tokens[i + 1].text;
-        ++i;
+      const std::string& tok = tokens[i].text;
+      if (tok.size() >= 2 && tok[0] == '-' && std::isdigit(static_cast<unsigned char>(tok[1]))) {
+        count = std::atoi(tok.substr(1).c_str());
+      } else if (tok == "-n" && i + 1 < tokens.size()) {
+        count = std::atoi(tokens[++i].text.c_str());
       } else {
-        target = tokens[i].text;
+        filePath = tok;
       }
     }
-    if (!target.empty()) {
-      return "Get-Content " + QuoteForPowerShellSingleQuoted(target) +
-             " -Tail " + count;
+    if (!filePath.empty()) {
+      return "Get-Content " + QuoteForPowerShellSingleQuoted(filePath) +
+             " -Last " + std::to_string(count);
     }
+    return "Select-Object -Last " + std::to_string(count);
   }
 
   if (commandName == "wc" && tokens.size() >= 2) {
@@ -375,10 +506,65 @@ std::string NormalizeWindowsShellCommand(const std::string& command) {
            QuoteForPowerShellSingleQuoted(tokens[1].text);
   }
 
-  if (commandName == "grep" && tokens.size() >= 3) {
-    return "Select-String -Pattern " +
-           QuoteForPowerShellSingleQuoted(tokens[1].text) + " -Path " +
-           QuoteForPowerShellSingleQuoted(tokens[2].text);
+  if (commandName == "grep" && tokens.size() >= 2) {
+    // P0-03: Convert Unix grep to PowerShell Select-String (jianlai-graph fix).
+    // Previously this was left to fail natively, which caused the model to
+    // get stuck in a retry loop. Now we convert grep to its PowerShell equivalent.
+    std::ostringstream normalized;
+    // grep [flags] pattern [file...]
+    // -> Select-String -Pattern pattern [-Path file]
+    bool caseInsensitive = false;
+    bool invertMatch = false;
+    std::string pattern;
+    std::vector<std::string> paths;
+    bool inFlags = true;
+    for (std::size_t i = 1; i < tokens.size(); ++i) {
+      const std::string& tok = tokens[i].text;
+      if (inFlags) {
+        // Check for standalone flags
+        if (tok == "-i" || tok == "--ignore-case") {
+          caseInsensitive = true; continue;
+        }
+        if (tok == "-v" || tok == "--invert-match") {
+          invertMatch = true; continue;
+        }
+        // Check for combined short flags: -iE, -vi, -Ei, etc.
+        if (tok.size() >= 2 && tok[0] == '-' && tok.find_first_not_of("-iIvVeEwWFf") == std::string::npos) {
+          for (size_t ci = 1; ci < tok.size(); ++ci) {
+            if (tok[ci] == 'i' || tok[ci] == 'I') caseInsensitive = true;
+            if (tok[ci] == 'v' || tok[ci] == 'V') invertMatch = true;
+            // -E, -F, -w, -f are accepted (Select-String uses .NET regex by default)
+          }
+          continue;
+        }
+        // Not a flag - treat everything from here as pattern and paths
+        inFlags = false;
+      }
+      if (pattern.empty()) {
+        pattern = tok;
+      } else {
+        paths.push_back(tok);
+      }
+    }
+    if (pattern.empty()) return trimmed;
+    normalized << "Select-String -Pattern " << QuoteForPowerShellSingleQuoted(pattern);
+    if (caseInsensitive) normalized << " -CaseSensitive:$false";
+    if (invertMatch) normalized << " -NotMatch";
+    if (!paths.empty()) {
+      for (const auto& p : paths) {
+        normalized << " -Path " << QuoteForPowerShellSingleQuoted(p);
+      }
+    }
+    return normalized.str();
+  }
+
+  // P0-03: /dev/null ->  rewrite (simple text substitution for PowerShell)
+  if (command.find("/dev/null") != std::string::npos) {
+    std::string rewritten = command;
+    for (size_t pos = 0; (pos = rewritten.find("/dev/null", pos)) != std::string::npos; pos += 5) {
+      rewritten.replace(pos, 9, "");
+    }
+    return rewritten;
   }
 
   return trimmed;
@@ -1064,15 +1250,6 @@ std::string RenderTaskSummary(const json& tasks) {
   return out.str();
 }
 
-bool CaseInsensitiveCompare(const std::string& a, const std::string& b) {
-  if (a.size() != b.size()) return false;
-  for (std::size_t i = 0; i < a.size(); ++i) {
-    if (std::tolower(static_cast<unsigned char>(a[i])) !=
-        std::tolower(static_cast<unsigned char>(b[i])))
-      return false;
-  }
-  return true;
-}
 
 std::string ReadFileContent(const std::string& path, std::string* error) {
   HANDLE handle = CreateFileW(ToWide(path).c_str(), GENERIC_READ,
@@ -1443,7 +1620,30 @@ void GrepDirectory(const std::string& dirPath,
 
 }  // namespace
 
-ToolOrchestrator::ToolOrchestrator() {}
+// P0-03: Case-insensitive comparison for tool name matching (moved to agent::tools scope)
+static bool CaseInsensitiveCompare(const std::string& a, const std::string& b) {
+  if (a.size() != b.size()) return false;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(a[i])) !=
+        std::tolower(static_cast<unsigned char>(b[i])))
+      return false;
+  }
+  return true;
+}
+
+
+ToolOrchestrator::ToolOrchestrator() {
+  // P0-03: Read Bash timeout from environment variable (aligned with local-ace).
+  const char* envTimeout = std::getenv("AGENT_BASH_TIMEOUT_MS");
+  if (envTimeout) {
+    int val = std::atoi(envTimeout);
+    if (val > 0) bashTimeoutMs_ = val;
+  }
+}
+
+void ToolOrchestrator::SetBashTimeoutMs(int timeoutMs) {
+  if (timeoutMs > 0) bashTimeoutMs_ = timeoutMs;
+}
 
 void ToolOrchestrator::SetToolRegistry(const ToolRegistry* registry) {
   toolRegistry_ = registry;
@@ -1461,6 +1661,10 @@ void ToolOrchestrator::SetMcpClientManager(
 
 void ToolOrchestrator::SetWorkspaceRoot(const std::string& workspaceRoot) {
   workspaceRoot_ = GetFullPathString(workspaceRoot);
+}
+
+void ToolOrchestrator::SetHookExecutor(hooks::HookExecutor* hookExecutor) {
+  hookExecutor_ = hookExecutor;
 }
 
 void ToolOrchestrator::SetToolCompletionCallback(ToolCompletionCallback cb) {
@@ -1618,7 +1822,7 @@ std::string ToolOrchestrator::ExecuteBash(const std::string& inputJson,
   if (!workspaceRoot_.empty()) {
     options.workingDirectory = workspaceRoot_;
   }
-  options.timeoutMs = 120000;
+  options.timeoutMs = bashTimeoutMs_;
 
   infra::ProcessRunResult result = processRunner_.Run(options);
 
@@ -1630,8 +1834,8 @@ std::string ToolOrchestrator::ExecuteBash(const std::string& inputJson,
     if (error) *error = result.errorMessage;
     output << "Error: " << result.errorMessage;
   } else if (result.timedOut) {
-    if (error) *error = "command timed out after 120s";
-    output << "Error: command timed out after 120s\n";
+    if (error) *error = "command timed out after " + std::to_string(bashTimeoutMs_ / 1000) + "s";
+    output << "Error: command timed out after " << (bashTimeoutMs_ / 1000) << "s\n";
     output << result.stdoutText;
   } else {
     output << result.stdoutText;
@@ -2018,6 +2222,17 @@ ToolOrchestrator::ExecuteResult ToolOrchestrator::Execute(
       result.userMessages.push_back(toolMsg);
       if (isError) {
         result.errorCount++;
+        // P0-03: Post-tool-use failure hooks (aligned with local-ace)
+        // Run hooks when a tool fails so that corrective actions can be taken.
+        if (hookExecutor_) {
+          hookExecutor_->RunPostToolUseFailureHooks(
+              block.asToolUse.name,
+              block.asToolUse.inputJson,
+              block.asToolUse.id,
+              execError,
+              1,
+              10000);  // 10s timeout for hooks
+        }
       }
       accumulatedMessages.push_back(toolMsg);
     }
