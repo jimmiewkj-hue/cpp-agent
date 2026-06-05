@@ -113,8 +113,6 @@ class QueryLoop {
                             const std::vector<Message>& followups,
                             TransitionReason reason,
                             bool resetTurnCount);
-  bool ShouldForceContinuation(const QueryLoopContext& ctx,
-                               const QueryLoopInternalState& state) const;
   std::vector<Message> BuildMessagesForTurn(
       const QueryLoopContext& ctx,
       const QueryLoopInternalState& state) const;
@@ -137,8 +135,6 @@ class QueryLoop {
   static std::vector<Message> DoCollapseCompact(
       const std::vector<Message>& input, int keepRecent);
   static std::vector<Message> DoReactiveCompact(
-      const std::vector<Message>& input);
-  static std::vector<Message> DoHistorySnip(
       const std::vector<Message>& input);
   static int CountToolResultBytes(const Message& msg);
   static bool IsPromptTooLong(const Message& msg);

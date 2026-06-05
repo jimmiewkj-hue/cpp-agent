@@ -126,18 +126,28 @@ std::vector<ToolSchema> ToolRegistry::ListToolSchemas() const {
 std::vector<std::unique_ptr<Tool>> ToolRegistry::GetAllBaseTools() {
   std::vector<std::unique_ptr<Tool>> tools;
 
-  // Bash tool
+  // Bash tool (aligned with local-ace BashTool/PowerShellTool)
   {
     ToolDef def;
     def.name = "Bash";
-    def.description = "Execute a shell command.";
-    def.inputSchemaJson = R"({
-      "type": "object",
-      "properties": {
-        "command": {"type": "string", "description": "The command to execute"}
-      },
-      "required": ["command"]
-    })";
+    def.description =
+        "Executes a given command in a PowerShell shell.\n"
+        "- The shell is stateful: environment variables, current directory, "
+        "and other state persist across commands.\n"
+        "- Commands execute in the workspace root by default.\n"
+        "- Long-running commands can be configured with a timeout (default 120s).\n"
+        "- Use PowerShell commands (Select-String, Get-ChildItem) instead of "
+        "Unix equivalents (grep, ls).\n"
+        "- For Python, use python or python -c for inline scripts.";
+    def.inputSchemaJson = "{\n"
+      "  \"type\": \"object\",\n"
+      "  \"properties\": {\n"
+      "    \"command\": {\"type\": \"string\", \"description\": \"The shell command to execute\"},\n"
+      "    \"description\": {\"type\": \"string\", \"description\": \"A short description of what this command does\"},\n"
+      "    \"timeout\": {\"type\": \"number\", \"description\": \"Optional timeout in milliseconds (default 120000)\"}\n"
+      "  },\n"
+      "  \"required\": [\"command\"]\n"
+      "}";
     def.destructiveHint = true;
     def.maxResultSizeChars = 400000;
     def.aliases = {"bash", "shell", "exec"};

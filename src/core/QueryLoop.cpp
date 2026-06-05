@@ -35,7 +35,7 @@ static const int kAutoCompactBufferTokens = 13000;
 static const int kPerMessageBudgetLimit = 600000;
 static const int kMicroCompactOldMarkerBytes = 64;
 static const int kEscalatedMaxTokens = 65536;
-static const int kMaxOutputTokensDefault = 4096;
+static const int kMaxOutputTokensDefault = 8192;  // aligned with local-ace CAPPED_DEFAULT_MAX_TOKENS
 static const int kMicroCompactAgeMs = 5 * 60 * 1000;
 
 namespace {
@@ -373,22 +373,9 @@ int CountConsecutiveRecentToolResults(const std::vector<Message>& messages,
 std::string BuildRecentExecutionMemory(const QueryLoopContext& ctx,
                                        const QueryLoopInternalState& state) {
   std::vector<std::string> lines;
-  if (state.validatorRetryCount >= 2) {
-    std::string line =
-        "Validator has already requested a retry_from_tools "
-        + std::to_string(state.validatorRetryCount)
-        + " consecutive times.";
-    if (!state.lastValidatorGuidance.empty()) {
-      line += " Latest guidance: " + state.lastValidatorGuidance;
-    }
-    lines.push_back(line);
-    // Additional guidance when validator keeps demanding the same thing
-    lines.push_back(
-        "IMPORTANT: If you have already attempted what the validator requested "
-        "and it fails (e.g., pip list times out), DO NOT retry the same command. "
-        "Instead, use a different approach, skip the prerequisite, or provide a "
-        "final answer based on what you already know.");
-  }
+  // Note: validator retry guidance removed — align with local-ace which does
+  // not inject execution-memory system messages. The validator retry path
+  // in HandleNoToolContinuation already handles retries directly.
 
   std::string repeatedErrorFingerprint;
   const int repeatedErrorCount = CountConsecutiveRecentToolResults(
@@ -498,33 +485,6 @@ void MergeHookMessages(const hooks::HookBatchResult& batch,
   }
 }
 
-bool AssistantIntendsWorkspaceWrite(const std::vector<Message>& assistantMessages) {
-  const std::string original = CollectText(assistantMessages);
-  const std::string lower = ToLowerAscii(original);
-
-  return ContainsToken(lower, "let me create") ||
-         ContainsToken(lower, "i will create") ||
-         ContainsToken(lower, "i'll create") ||
-         ContainsToken(lower, "need to create") ||
-         ContainsToken(lower, "create the remaining") ||
-         ContainsToken(lower, "create the next") ||
-         ContainsToken(lower, "first create") ||
-         ContainsToken(lower, "now create") ||
-         ContainsToken(lower, "write this to") ||
-         ContainsToken(lower, "save this as") ||
-         ContainsToken(lower, "standalone html file") ||
-         ContainsToken(original, "我来创建") ||
-         ContainsToken(original, "我将创建") ||
-         ContainsToken(original, "创建这个") ||
-         ContainsToken(original, "写入文件") ||
-         ContainsToken(original, "需要创建") ||
-         ContainsToken(original, "现在创建") ||
-         ContainsToken(original, "首先创建") ||
-         ContainsToken(original, "继续创建") ||
-         ContainsToken(original, "还需要创建") ||
-         ContainsToken(original, "创建剩余");
-}
-
 bool IsExplorationToolName(const std::string& toolName) {
   return toolName == "Read" || toolName == "FileRead" ||
          toolName == "Grep" || toolName == "Glob" || toolName == "LS";
@@ -593,90 +553,6 @@ bool UserRequestedDirectCreation(const std::vector<Message>& messages) {
            ContainsToken(prompt, "直接新建");
   }
   return false;
-}
-
-bool AssistantIntendsFurtherExecution(
-    const std::vector<Message>& assistantMessages) {
-  const std::string original = CollectText(assistantMessages);
-  const std::string lower = ToLowerAscii(original);
-
-  return ContainsToken(lower, "let me check") ||
-         ContainsToken(lower, "let me create") ||
-         ContainsToken(lower, "let me write") ||
-         ContainsToken(lower, "let me build") ||
-         ContainsToken(lower, "let me try") ||
-         ContainsToken(lower, "let me read") ||
-         ContainsToken(lower, "let me look") ||
-         ContainsToken(lower, "let me see") ||
-         ContainsToken(lower, "let me use") ||
-         ContainsToken(lower, "let me run") ||
-         ContainsToken(lower, "let me start") ||
-         ContainsToken(lower, "let me first") ||
-         ContainsToken(lower, "let me continue") ||
-         ContainsToken(lower, "let me explore") ||
-         ContainsToken(lower, "let me examine") ||
-         ContainsToken(lower, "let me proceed") ||
-         ContainsToken(lower, "let me execute") ||
-         ContainsToken(lower, "i need to") ||
-         ContainsToken(lower, "i will now") ||
-         ContainsToken(lower, "i am going to") ||
-         ContainsToken(lower, "i should create") ||
-         ContainsToken(lower, "i should write") ||
-         ContainsToken(lower, "i should build") ||
-         ContainsToken(lower, "i should check") ||
-         ContainsToken(lower, "i should read") ||
-         ContainsToken(lower, "i should try") ||
-         ContainsToken(lower, "i should look") ||
-         ContainsToken(lower, "going to create") ||
-         ContainsToken(lower, "going to write") ||
-         ContainsToken(lower, "going to build") ||
-         ContainsToken(lower, "need to create") ||
-         ContainsToken(lower, "need to write") ||
-         ContainsToken(lower, "need to build") ||
-         ContainsToken(lower, "still need to") ||
-         ContainsToken(lower, "continue creating") ||
-         ContainsToken(lower, "continue building") ||
-         ContainsToken(lower, "continue writing") ||
-         ContainsToken(lower, "first create") ||
-         ContainsToken(lower, "now create") ||
-         ContainsToken(lower, "next step") ||
-         ContainsToken(lower, "proceed to") ||
-         ContainsToken(lower, "next, i will") ||
-         ContainsToken(lower, "i will ") ||
-         ContainsToken(lower, "i'll ") ||
-         ContainsToken(lower, "first, ") ||
-         ContainsToken(lower, "i should ") ||
-         ContainsToken(lower, "check the project") ||
-         ContainsToken(lower, "inspect the project") ||
-         ContainsToken(original, "让我先") ||
-         ContainsToken(original, "我先规划") ||
-         ContainsToken(original, "我先继续") ||
-         ContainsToken(original, "接下来") ||
-         ContainsToken(original, "然后继续") ||
-         ContainsToken(original, "现在需要") ||
-         ContainsToken(original, "现在需要创建") ||
-         ContainsToken(original, "让我继续创建") ||
-         ContainsToken(original, "继续创建") ||
-         ContainsToken(original, "继续实现") ||
-         ContainsToken(original, "继续处理") ||
-         ContainsToken(original, "继续修复") ||
-         ContainsToken(original, "继续检查") ||
-         ContainsToken(original, "继续执行") ||
-         ContainsToken(original, "我继续处理") ||
-         ContainsToken(original, "我继续修复") ||
-         ContainsToken(original, "我继续检查") ||
-         ContainsToken(original, "我继续执行") ||
-         ContainsToken(original, "先从") ||
-         ContainsToken(original, "首先创建") ||
-         ContainsToken(original, "还需要创建") ||
-         ContainsToken(original, "继续完成") ||
-         ContainsToken(original, "继续当前任务") ||
-         ContainsToken(original, "下一步") ||
-         ContainsToken(original, "我先查看") ||
-         ContainsToken(original, "我先检查") ||
-         ContainsToken(original, "我先读取") ||
-         ContainsToken(original, "先查看项目") ||
-         ContainsToken(original, "先检查项目");
 }
 
 std::string GetEnvString(const char* name) {
@@ -1121,44 +997,6 @@ void PersistMessagesToTranscript(infra::SessionManager* sm,
   for (const auto& m : msgs) sm->AppendMessageToTranscript(m);
 }
 
-bool HandleMissingExpectedToolUse(QueryLoopContext& ctx,
-                                  QueryLoopInternalState& state) {
-  static const int kMaxMissingToolUseNudges = 3;
-  if (state.missingToolUsePromptCount >= kMaxMissingToolUseNudges) return false;
-  if (!state.toolUseBlocks.empty()) return false;
-  if (state.assistantMessages.empty()) return false;
-  if (!AssistantIntendsWorkspaceWrite(state.assistantMessages)) return false;
-
-  for (const auto& msg : state.assistantMessages)
-    ctx.messages.push_back(msg);
-  PersistMessagesToTranscript(ctx.sessionManager, state.assistantMessages);
-
-  Message nudge;
-  nudge.role = MessageRole::System;
-  nudge.uuid = "missing-tool-use-nudge";
-  nudge.isMeta = true;
-  std::string nudgeText =
-      "You said you would create or write a file, but no tool call was emitted. "
-      "If the deliverable should exist in the workspace, use the Write/FileWrite "
-      "tool now instead of describing the plan. After the tool result, provide "
-      "a concise completion message.";
-  if (state.missingToolUsePromptCount > 0) {
-    nudgeText =
-        "You are still planning to create files without emitting a tool call. "
-        "Do not describe the next file in plain text. If you are unsure which "
-        "files already exist, inspect the workspace with Glob first, then emit "
-        "a concrete Write/FileWrite call for the next missing deliverable.";
-  }
-  nudge.content.push_back(ContentBlock::MakeText(nudgeText));
-  ctx.messages.push_back(nudge);
-  PersistMessagesToTranscript(ctx.sessionManager, {nudge});
-
-  state.assistantMessages.clear();
-  state.toolUseBlocks.clear();
-  ++state.missingToolUsePromptCount;
-  return true;
-}
-
 bool HandleMissingWorkspaceExploration(QueryLoopContext& ctx,
                                        QueryLoopInternalState& state) {
   if (state.hasPromptedForWorkspaceExploration) return false;
@@ -1440,19 +1278,41 @@ bool QueryLoop::ContinueWithFollowup(QueryLoopContext& ctx,
   return true;
 }
 
-bool QueryLoop::ShouldForceContinuation(const QueryLoopContext&,
-                                        const QueryLoopInternalState& state) const {
-  if (state.forcedContinuationCount >= 8) return false;
-  if (state.forceContinuation) return true;
-  if (!state.toolResultMessages.empty()) return true;
-  if (!state.toolUseBlocks.empty()) return false;
-  if (state.assistantMessages.empty()) return false;
-  return AssistantIntendsWorkspaceWrite(state.assistantMessages) ||
-         AssistantIntendsFurtherExecution(state.assistantMessages);
-}
-
 int QueryLoop::EstimateTokens(const std::string& text) {
-  return static_cast<int>(text.size()) / 4;
+  // Unicode-aware token estimation aligned with local-ace's
+  // tokenCountWithEstimation. ASCII ~4 chars/token, CJK ~1.5 chars/token
+  // (each CJK char is 3 UTF-8 bytes but ~1-2 tokens).
+  int tokens = 0;
+  std::size_t i = 0;
+  const std::size_t len = text.size();
+  int asciiRun = 0;
+  while (i < len) {
+    unsigned char ch = static_cast<unsigned char>(text[i]);
+    if (ch < 0x80) {
+      // ASCII byte
+      ++asciiRun;
+      ++i;
+    } else {
+      // Flush ASCII run
+      if (asciiRun > 0) {
+        tokens += asciiRun / 4;
+        if (asciiRun % 4 > 0) ++tokens;
+        asciiRun = 0;
+      }
+      // Multi-byte UTF-8: count the character as ~1.5 tokens
+      tokens += 2;  // approximate: 1-2 tokens per CJK/non-ASCII char
+      // Skip continuation bytes
+      if ((ch & 0xE0) == 0xC0) { i += 2; }
+      else if ((ch & 0xF0) == 0xE0) { i += 3; }
+      else if ((ch & 0xF8) == 0xF0) { i += 4; }
+      else { ++i; }  // invalid byte, skip
+    }
+  }
+  if (asciiRun > 0) {
+    tokens += asciiRun / 4;
+    if (asciiRun % 4 > 0) ++tokens;
+  }
+  return std::max(1, tokens);
 }
 
 int QueryLoop::EstimateMessageTokens(const std::vector<Message>& msgs) {
@@ -1517,45 +1377,6 @@ std::vector<Message> QueryLoop::DoReactiveCompact(
   return DoCollapseCompact(input, 5);
 }
 
-std::vector<Message> QueryLoop::DoHistorySnip(
-    const std::vector<Message>& input) {
-  if (input.size() <= 12) return input;
-
-  std::vector<Message> result;
-  result.reserve(12);
-
-  std::size_t firstUserIndex = input.size();
-  for (std::size_t i = 0; i < input.size(); ++i) {
-    if (input[i].role == MessageRole::User && !input[i].isMeta) {
-      firstUserIndex = i;
-      break;
-    }
-  }
-
-  const std::size_t tailCount = 30;  // P0-FIX: increased from 10 to preserve more context
-  const std::size_t start = input.size() > tailCount ? input.size() - tailCount : 0;
-  const bool preservedFirstUser =
-      firstUserIndex < input.size() && firstUserIndex < start;
-
-  if (!preservedFirstUser && start == 0) return input;
-
-  Message snipBoundary;
-  snipBoundary.role = MessageRole::System;
-  snipBoundary.uuid = "snip-boundary";
-  snipBoundary.isMeta = true;
-  snipBoundary.content.push_back(
-      ContentBlock::MakeText(
-          "<snip_boundary>Conversation truncated. Preserved the original "
-          "user request and recent execution context.</snip_boundary>"));
-  result.push_back(snipBoundary);
-
-  if (preservedFirstUser) {
-    result.push_back(input[firstUserIndex]);
-  }
-  result.insert(result.end(), input.begin() + start, input.end());
-  return result;
-}
-
 bool QueryLoop::IsPromptTooLong(const Message& msg) {
   if (!msg.isApiErrorMessage) return false;
   for (const auto& block : msg.content) {
@@ -1609,33 +1430,23 @@ void QueryLoop::ApplyStepBudget(QueryLoopContext& ctx,
 
 void QueryLoop::ApplyStepSnip(QueryLoopContext& ctx,
                               QueryLoopInternalState& state) {
-  if (state.messagesForTurn.size() > 60) {  // P0-FIX: increased from 20
-    const int beforeCount = static_cast<int>(state.messagesForTurn.size());
-    if (ctx.hookExecutor != nullptr) {
-      ctx.hookExecutor->RunPreCompactHooks(
-          "snip", beforeCount, 10000);
-    }
-    state.messagesForTurn = DoHistorySnip(state.messagesForTurn);
-    if (ctx.hookExecutor != nullptr) {
-      ctx.hookExecutor->RunPostCompactHooks(
-          beforeCount,
-          static_cast<int>(state.messagesForTurn.size()),
-          std::max(0, beforeCount - static_cast<int>(state.messagesForTurn.size())),
-          10000);
-    }
-    if (!state.messagesForTurn.empty() &&
-        state.messagesForTurn.front().uuid == "snip-boundary") {
-      EmitQueryLoopEvent(
-          ctx, QueryLoopEvent::Type::CompactionBoundary, QueryStage::Snip,
-          &state.messagesForTurn.front());
-    }
-  }
+  // Disabled: align with local-ace's snipCompact which is a no-op/disabled
+  // feature. History snip aggressively truncates middle context, causing
+  // information loss that required compensatory mechanisms like
+  // BuildRecentExecutionMemory. Context management is handled by
+  // autoCompact (LLM summarization) + microcompact (tool result clearing).
+  (void)ctx;
+  (void)state;
 }
 
 // ===== P2-01 Fix: Microcompact preserves tool name, result summary, and error status =====
 void QueryLoop::ApplyStepMicrocompact(QueryLoopContext& ctx,
                                       QueryLoopInternalState& state) {
   (void)ctx;
+  // Guard: skip when too few messages to have meaningful old tool results.
+  // Aligned with local-ace's microcompact which returns early when no
+  // compactable tool results exist.
+  if (state.messagesForTurn.size() < 4) return;
   const long long now = CurrentTimeMs();
 
   // Build a map from tool_use_id to tool name by scanning all messages
@@ -1712,36 +1523,60 @@ void QueryLoop::ApplyStepMicrocompact(QueryLoopContext& ctx,
 
 void QueryLoop::ApplyStepCollapse(QueryLoopContext& ctx,
                                   QueryLoopInternalState& state) {
+  // Alignment with local-ace: isContextCollapseEnabled() always returns false
+  // in local-ace (disabled feature flag). Context management is handled by
+  // microcompact (tool result clearing) and autoCompact (LLM summarization).
+  // Collapse should only fire as a LAST-RESORT safety valve when autoCompact
+  // has failed and context is about to overflow.
+  //
+  // Changes from previous version:
+  // - min messages raised from 10 to 30 (need substantial history)
+  // - threshold raised to 95% of context window (last resort only)
+  // - Added model-aware context window calculation
+  if (state.messagesForTurn.size() < 30) return;
   const int estimatedTokens = EstimateMessageTokens(state.messagesForTurn);
-  const int threshold =
-      kContextWindow - kMaxOutputTokensForSummary - kAutoCompactBufferTokens;
-  if (estimatedTokens > threshold) {
-    const int beforeCount = static_cast<int>(state.messagesForTurn.size());
-    if (ctx.hookExecutor != nullptr) {
-      ctx.hookExecutor->RunPreCompactHooks(
-          "collapse", beforeCount, 10000);
-    }
-    int keepRecent = 20;
-    if (static_cast<int>(state.messagesForTurn.size()) <= keepRecent) {
-      keepRecent =
-          std::max(5, static_cast<int>(state.messagesForTurn.size()) / 2);
-    }
-    state.messagesForTurn = DoCollapseCompact(state.messagesForTurn, keepRecent);
-    if (ctx.hookExecutor != nullptr) {
-      ctx.hookExecutor->RunPostCompactHooks(
-          beforeCount,
-          static_cast<int>(state.messagesForTurn.size()),
-          std::max(0, beforeCount - static_cast<int>(state.messagesForTurn.size())),
-          10000);
-    }
+  const int contextWindow = GetContextWindowForFamily(ctx.model);
+  // Last-resort threshold: 95% of effective context window.
+  // This ensures collapse only fires when autoCompact hasn't kept up.
+  const int effectiveWindow = contextWindow - kMaxOutputTokensForSummary;
+  const int threshold = static_cast<int>(effectiveWindow * 0.95);
+  if (estimatedTokens <= threshold) return;
+  const int beforeCount = static_cast<int>(state.messagesForTurn.size());
+  if (ctx.hookExecutor != nullptr) {
+    ctx.hookExecutor->RunPreCompactHooks(
+        "collapse", beforeCount, 10000);
+  }
+  int keepRecent = 20;
+  if (static_cast<int>(state.messagesForTurn.size()) <= keepRecent) {
+    keepRecent =
+        std::max(5, static_cast<int>(state.messagesForTurn.size()) / 2);
+  }
+  state.messagesForTurn = DoCollapseCompact(state.messagesForTurn, keepRecent);
+  if (ctx.hookExecutor != nullptr) {
+    ctx.hookExecutor->RunPostCompactHooks(
+        beforeCount,
+        static_cast<int>(state.messagesForTurn.size()),
+        std::max(0, beforeCount - static_cast<int>(state.messagesForTurn.size())),
+        10000);
   }
 }
 
 bool QueryLoop::ApplyStepAutocompact(QueryLoopContext& ctx,
                                      QueryLoopInternalState& state) {
+  // Guard: skip autocompact when too few messages. Aligned with local-ace's
+  // autoCompactIfNeeded() which checks isAboveAutoCompactThreshold and
+  // returns false when token count is well below threshold.
+  if (state.messagesForTurn.size() < 10) return false;
+  // Recursion guard: skip for compact/session_memory queries
+  if (!ctx.querySource.empty() &&
+      (ctx.querySource == "compact" || ctx.querySource == "session_memory")) {
+    return false;
+  }
   const int estimatedTokens = EstimateMessageTokens(state.messagesForTurn);
+  // Use model-aware context window instead of hardcoded 200k
+  const int contextWindow = GetContextWindowForFamily(ctx.model);
   const int threshold =
-      kContextWindow - kMaxOutputTokensForSummary - kAutoCompactBufferTokens;
+      contextWindow - kMaxOutputTokensForSummary - kAutoCompactBufferTokens;
   if (estimatedTokens <= threshold) return false;
   if (state.consecutiveAutoCompactFailures >= kAutoCompactMaxFailures)
     return false;
@@ -2383,6 +2218,21 @@ bool QueryLoop::ApplyStepTerminate(QueryLoopContext& ctx,
   return true;
 }
 
+// Check if the conversation history contains recent tool_result blocks,
+// indicating the model was actively using tools before this no-tool response.
+static bool HasRecentToolActivity(const QueryLoopContext& ctx) {
+  // Scan the last N messages for tool_result content blocks
+  const int msgCount = static_cast<int>(ctx.messages.size());
+  const int scanWindow = (msgCount < 20) ? msgCount : 20;
+  const int start = msgCount - scanWindow;
+  for (int i = start; i < msgCount; ++i) {
+    for (const auto& block : ctx.messages[i].content) {
+      if (block.type == BlockType::ToolResult) return true;
+    }
+  }
+  return false;
+}
+
 bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
                                          QueryLoopInternalState& state) {
   static const int kMaxValidatorRetryContinuations = 3;
@@ -2524,95 +2374,62 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
         TransitionReason::StopHookBlocking, false);
   }
 
+  // --- Bounded continuation nudge (aligned with local-ace max_output_tokens
+  // recovery). When the model was actively using tools and then stops with
+  // text-only output (no tool_use), it likely hit a generation limit rather
+  // than genuinely finishing. Inject a short "resume" nudge, capped at 3
+  // attempts to prevent death spirals.
+  static const int kMaxNoToolNudges = 3;
+  const bool hasPriorToolActivity = HasRecentToolActivity(ctx);
+  const bool modelProducedText = !CollectText(state.assistantMessages).empty();
+
+  if (hasPriorToolActivity && modelProducedText &&
+      state.missingToolUsePromptCount < kMaxNoToolNudges) {
+    ++state.missingToolUsePromptCount;
+    ReportQueryLoopDebugEvent(
+        "4", "QueryLoop.cpp:no-tool:bounded-nudge",
+        "[DEBUG] Injecting bounded continuation nudge",
+        {{"nudgeCount", state.missingToolUsePromptCount},
+         {"modelCallCount", state.modelCallCount},
+         {"turnCount", state.turnCount}},
+        MakeQueryLoopTraceId("nudge"));
+
+    Message nudge;
+    nudge.role = MessageRole::User;
+    nudge.uuid = "bounded-continuation-nudge-"
+                 + std::to_string(state.missingToolUsePromptCount);
+    nudge.isMeta = true;
+    // Escalating nudge messages (aligned with local-ace max_output_tokens
+    // recovery). Later nudges are more directive to break the model out of
+    // text-only planning loops.
+    std::string nudgeText;
+    if (state.missingToolUsePromptCount <= 1) {
+      nudgeText =
+          "[system] Your previous response ended without a tool call. "
+          "Resume directly - no apology, no recap of what you were doing. "
+          "Pick up mid-thought if that is where the cut happened. "
+          "Break remaining work into smaller pieces.";
+    } else {
+      // Stronger directive for repeated failures
+      nudgeText =
+          "[system] You keep describing what you will do instead of doing it. "
+          "STOP planning. Emit a Write tool call NOW for the next file. "
+          "If the file is large, create a skeleton first with class/function "
+          "stubs, then use Write to add implementation in separate calls. "
+          "Do NOT describe the file content in text - just write it.";
+    }
+    nudge.content.push_back(ContentBlock::MakeText(nudgeText));
+    std::vector<Message> nudgeFollowups = {nudge};
+    return ContinueWithFollowup(
+        ctx, state, nudgeFollowups,
+        TransitionReason::ForcedContinuation, false);
+  }
+
+  // Align with local-ace: when model produces no tool_use and no validator
+  // retry is needed, check token budget then terminate.
   if (HandleTokenBudget(ctx, state)) {
     state.stage = QueryStage::ToolResultBudget;
     return true;
-  }
-
-  if (HandleMissingExpectedToolUse(ctx, state)) {
-    state.transition = TransitionReason::ForcedContinuation;
-    state.stage = QueryStage::ToolResultBudget;
-    return true;
-  }
-
-  std::string repeatedErrorFingerprint;
-  const int repeatedErrorCount = CountConsecutiveRecentToolResults(
-      ctx.messages, true, &repeatedErrorFingerprint);
-  const bool intendsMoreExecution =
-      state.forceContinuation ||
-      AssistantIntendsWorkspaceWrite(state.assistantMessages) ||
-      AssistantIntendsFurtherExecution(state.assistantMessages);
-  if (intendsMoreExecution &&
-      repeatedErrorCount >= kMaxRepeatedErrorToolResults &&
-      !repeatedErrorFingerprint.empty()) {
-    Message note;
-    note.role = MessageRole::System;
-    note.uuid = "repeated-tool-error-limit";
-    note.isMeta = true;
-    note.content.push_back(ContentBlock::MakeText(
-        "[system] Terminating: the same failing tool result repeated "
-        + std::to_string(repeatedErrorCount)
-        + " consecutive times. Do not keep rerunning the same failing action "
-          "without a concrete code or dependency change. Latest error: "
-        + repeatedErrorFingerprint));
-    AppendTurnArtifacts(
-        ctx, state.assistantMessages, state.toolResultMessages, {note});
-    state.assistantMessages.clear();
-    state.toolResultMessages.clear();
-    state.pendingFollowupMessages.clear();
-    state.toolUseBlocks.clear();
-    state.completed = true;
-    state.terminalReason = "repeated_tool_result_loop";
-    return false;
-  }
-
-  if (ShouldForceContinuation(ctx, state)) {
-    ++state.forcedContinuationCount;
-    std::vector<Message> followups = state.pendingFollowupMessages;
-    if (followups.empty()) {
-      Message followup;
-      followup.role = MessageRole::System;
-      followup.uuid = "forced-continuation";
-      followup.isMeta = true;
-      std::string content;
-      if (state.forcedContinuationCount >= 6) {
-        content =
-            "You have been planning without executing any tool calls for "
-            "many turns. The task will be terminated if you do not emit a "
-            "concrete tool call NOW. Do NOT describe any more plans. "
-            "Use Write to create a file, Read to inspect code, "
-            "or Bash to run a command. Emit the tool call in your next "
-            "response.";
-      } else if (state.forcedContinuationCount >= 3) {
-        content =
-            "You have repeatedly described plans without taking action. "
-            "Stop describing. Emit a concrete tool call now: use Write to "
-            "create or modify files, Read to inspect code, Glob to explore "
-            "directories, or Bash to execute commands. Do not write another "
-            "plan - execute.";
-      } else {
-        content =
-            "Do not stop at planning. Start the next concrete action now. "
-            "If inspection, tool use, file edits, or tests are required, emit "
-            "the appropriate tool call immediately.";
-      }
-      if (!state.forceContinuationReason.empty()) {
-        content += " Reason: " + state.forceContinuationReason;
-      }
-      followup.content.push_back(ContentBlock::MakeText(content));
-      followups.push_back(followup);
-    }
-    ReportQueryLoopDebugEvent(
-        "3", "QueryLoop.cpp:no-tool:forced",
-        "[DEBUG] Continuing turn due to forced continuation",
-        {{"turnCount", state.turnCount},
-         {"reason", state.forceContinuationReason},
-         {"followupCount", static_cast<int>(followups.size())},
-         {"assistantPreview",
-          TruncateDebugText(CollectText(state.assistantMessages))}},
-        MakeQueryLoopTraceId("continue"));
-    return ContinueWithFollowup(
-        ctx, state, followups, TransitionReason::ForcedContinuation, false);
   }
 
   ReportQueryLoopDebugEvent(
@@ -2620,7 +2437,8 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
       "[DEBUG] Completing turn without additional continuation",
       {{"turnCount", state.turnCount},
        {"assistantCount", static_cast<int>(state.assistantMessages.size())},
-       {"toolResultCount", static_cast<int>(state.toolResultMessages.size())}},
+       {"toolResultCount", static_cast<int>(state.toolResultMessages.size())},
+       {"nudgeCount", state.missingToolUsePromptCount}},
       MakeQueryLoopTraceId("terminate"));
   ApplyStepTerminate(ctx, state);
   return false;
@@ -2670,6 +2488,17 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
           continue;
         }
         ApplyStepBudget(ctx, state);
+        // First-iteration fast path: skip compact stages when context is
+        // trivially small. Aligned with local-ace where snip/microcompact/
+        // collapse/autocompact all no-op on first turn because their
+        // threshold checks (token count, message count) are not met.
+        const int msgCount = static_cast<int>(state.messagesForTurn.size());
+        const bool isFirstIteration = (state.modelCallCount == 0);
+        const bool contextIsSmall = (msgCount < 10);
+        if (isFirstIteration && contextIsSmall) {
+          state.stage = QueryStage::ModelCall;
+          continue;
+        }
         state.stage = QueryStage::Snip;
         continue;
       }

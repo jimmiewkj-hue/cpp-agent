@@ -158,6 +158,11 @@ void QueryEngine::RunTurn() {
   loopCtx_.lastTerminalReason.clear();
   loopCtx_.eventCallback = eventCallback_;
   loopCtx_.hookExecutor = hookExecutor_;
+  // Aligned with local-ace: set querySource to identify this as the main
+  // REPL loop. Compact/session_memory forks use different sources.
+  if (loopCtx_.querySource.empty()) {
+    loopCtx_.querySource = "repl_main_thread";
+  }
 
   QueryLoop loop(toolOrchestrator_, permissionEngine_, modelClient_,
                  sideQueryClient_);
@@ -232,7 +237,8 @@ const QueryLoopContext& QueryEngine::loopContext() const {
 std::string QueryEngine::BuildEffectiveSystemPrompt() const {
   std::string effectivePrompt = systemPrompt_;
   if (effectivePrompt.empty()) {
-    effectivePrompt = config_.systemPrompt;
+    // Use model-aware system prompt for Qwen/Gemma adaptation
+    effectivePrompt = config_.GetEffectiveSystemPrompt(model_);
   }
 
   std::string memoryPrompt;

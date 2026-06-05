@@ -860,8 +860,16 @@ void ParseOpenAISseDelta(const std::string& rawBody,
             const json& fn = toolCall["function"];
             if (fn.contains("name") && fn["name"].is_string())
               pendingToolName = fn["name"].get<std::string>();
-            if (fn.contains("arguments") && fn["arguments"].is_string())
-              pendingToolArgs += fn["arguments"].get<std::string>();
+            if (fn.contains("arguments")) {
+              // Robust argument parsing: handle both string and object formats.
+              // Local Qwen/Gemma models may emit arguments as a JSON object
+              // directly instead of a serialized string.
+              if (fn["arguments"].is_string()) {
+                pendingToolArgs += fn["arguments"].get<std::string>();
+              } else if (fn["arguments"].is_object() || fn["arguments"].is_array()) {
+                pendingToolArgs = fn["arguments"].dump();
+              }
+            }
           }
         }
       }
@@ -1008,6 +1016,23 @@ std::string HttpLlmClient::BuildOpenAIBody(
     body["temperature"] = temperature;
   }
 
+  // Model-specific adaptations for Qwen/Gemma local models
+  core::ModelFamily family = core::DetectModelFamily(model);
+  if (family == core::ModelFamily::Qwen) {
+    // Qwen models benefit from slightly lower temperature for tool calls
+    if (temperature < 0.0) body["temperature"] = 0.7;
+    // Ensure stream_options for vLLM/Ollama compatibility
+    if (stream) {
+      body["stream_options"] = {{"include_usage", true}};
+    }
+  } else if (family == core::ModelFamily::Gemma) {
+    // Gemma: use lower temperature for more deterministic output
+    if (temperature < 0.0) body["temperature"] = 0.6;
+    if (stream) {
+      body["stream_options"] = {{"include_usage", true}};
+    }
+  }
+
   if (!toolsJson.empty()) {
     json tools = json::parse(toolsJson, nullptr, false);
     if (!tools.is_discarded() && tools.is_array() && !tools.empty()) {
@@ -1095,6 +1120,14 @@ std::string HttpLlmClient::SendHttpPost(const std::string& body,
     requestPath = ToWide(*pathOverride);
   } else if (isNativeAnthropic_) {
     requestPath = L"/v1/messages";
+  } else {
+    // OpenAI-compatible: ensure path ends with /chat/completions
+    std::string pathStr = ToUtf8(path);
+    if (pathStr.find("/chat/completions") == std::string::npos) {
+      if (!pathStr.empty() && pathStr.back() == '/')
+        pathStr.pop_back();
+      requestPath = ToWide(pathStr + "/chat/completions");
+    }
   }
 
   // #region debug-point A:http-request-start
@@ -1285,7 +1318,10 @@ void HttpLlmClient::StreamResponse(
         if (onEvent) onEvent(event, data);
       };
   std::string actualModel = model.empty() ? config_.mainModel : model;
-  const int maxTokens = maxTokensOverride > 0 ? maxTokensOverride : 4096;
+  // Aligned with local-ace CAPPED_DEFAULT_MAX_TOKENS (8000). The previous
+  // value of 4096 was too small for generating large file-creation tool_use
+  // blocks, causing the model to stop mid-task without emitting tools.
+  const int maxTokens = maxTokensOverride > 0 ? maxTokensOverride : 8192;
   // #region debug-point A:stream-enter
   ReportDebugEvent("pre-fix", "A", "ModelClient.cpp:stream:enter",
                    "[DEBUG] StreamResponse enter",

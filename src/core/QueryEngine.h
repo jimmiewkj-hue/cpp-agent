@@ -60,6 +60,10 @@ struct QueryLoopContext {
   std::string model;
   std::string fallbackModel;
   std::string validatorModel;
+  // Aligned with local-ace's querySource: identifies the caller context
+  // (e.g. "repl_main_thread", "compact", "session_memory", "auto_dream").
+  // Used to prevent recursive compaction and model-call loops.
+  std::string querySource;
   ContentReplacementState replacementState;
   AutoCompactTrackingState autoCompactTracking;
   int maxOutputTokensRecoveryCount = 0;

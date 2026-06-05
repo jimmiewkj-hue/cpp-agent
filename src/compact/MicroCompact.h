@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <map>
@@ -44,11 +45,34 @@ struct MicroCompactResult {
 // Token estimation (aligned with local-ace estimateMessageTokens)
 // ============================================================================
 
-// Rough token count: 4 characters ? 1 token, padded by 4/3
+// Rough token count: Unicode-aware estimation aligned with QueryLoop::EstimateTokens.
+// ASCII ~4 chars/token, CJK/multi-byte ~1.5 tokens/char.
 inline int RoughTokenCount(const std::string& text) {
   if (text.empty()) return 0;
-  int raw = static_cast<int>(text.size()) / 4;
-  return (raw * 4 + 2) / 3;  // Ceil division by 4/3
+  int tokens = 0;
+  int asciiRun = 0;
+  for (std::size_t i = 0; i < text.size(); ) {
+    unsigned char ch = static_cast<unsigned char>(text[i]);
+    if (ch < 0x80) {
+      ++asciiRun; ++i;
+    } else {
+      if (asciiRun > 0) {
+        tokens += asciiRun / 4;
+        if (asciiRun % 4 > 0) ++tokens;
+        asciiRun = 0;
+      }
+      tokens += 2;  // ~1-2 tokens per CJK/non-ASCII char
+      if ((ch & 0xE0) == 0xC0) { i += 2; }
+      else if ((ch & 0xF0) == 0xE0) { i += 3; }
+      else if ((ch & 0xF8) == 0xF0) { i += 4; }
+      else { ++i; }
+    }
+  }
+  if (asciiRun > 0) {
+    tokens += asciiRun / 4;
+    if (asciiRun % 4 > 0) ++tokens;
+  }
+  return std::max(1, tokens);
 }
 
 // Estimate tokens for a tool result block

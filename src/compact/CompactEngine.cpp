@@ -126,9 +126,25 @@ PTLTruncateResult TruncateHeadForPTLRetry(
     return result;
   }
 
-  // Estimate tokens (rough: 4 chars ? 1 token)
+  // Estimate tokens (Unicode-aware, aligned with QueryLoop::EstimateTokens)
   auto estimateTokens = [](const std::string& text) -> int {
-    return static_cast<int>(text.size()) / 4;
+    if (text.empty()) return 0;
+    int tokens = 0;
+    int asciiRun = 0;
+    for (std::size_t i = 0; i < text.size(); ) {
+      unsigned char ch = static_cast<unsigned char>(text[i]);
+      if (ch < 0x80) { ++asciiRun; ++i; }
+      else {
+        if (asciiRun > 0) { tokens += asciiRun / 4; if (asciiRun % 4 > 0) ++tokens; asciiRun = 0; }
+        tokens += 2;
+        if ((ch & 0xE0) == 0xC0) { i += 2; }
+        else if ((ch & 0xF0) == 0xE0) { i += 3; }
+        else if ((ch & 0xF8) == 0xF0) { i += 4; }
+        else { ++i; }
+      }
+    }
+    if (asciiRun > 0) { tokens += asciiRun / 4; if (asciiRun % 4 > 0) ++tokens; }
+    return std::max(1, tokens);
   };
 
   int sysTokens = estimateTokens(systemPrompt);

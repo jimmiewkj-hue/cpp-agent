@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/AgentTypes.h"
+
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -25,6 +27,9 @@ struct LlmConfig {
   std::string fallbackModel;
   int connectTimeoutMs = 30000;
   int requestTimeoutMs = 120000;
+  // Model-specific overrides (0 = use model-family defaults)
+  int contextWindowOverride = 0;
+  int maxOutputTokensOverride = 0;
 };
 
 struct DenialTrackingState {
@@ -64,6 +69,21 @@ struct AgentConfig {
       "Do not reveal chain-of-thought or write 'thinking process' in the "
       "final answer. Be concise, action-oriented, and continue the turn after "
       "tool results until the requested file or change is actually completed.";
+  // Qwen/Gemma-adapted system prompt (Chinese-friendly, simpler structure)
+  std::string systemPromptQwen =
+      "你是一个在本地项目工作区中运行的编程助手。"
+      "使用可用工具来检查文件、创建文件和修改工作区。"
+      "优先使用 Read/Write 工具调用来操作文件，而不是在聊天中粘贴大段代码。"
+      "不要在最终回答中暴露思考过程。保持简洁、面向行动，"
+      "在工具结果返回后继续完成任务，直到所请求的文件或更改实际完成。"
+      "使用工具时，确保 JSON 参数格式正确。";
+  std::string systemPromptGemma =
+      "You are a coding assistant in a local project workspace. "
+      "Use the provided tools (Read, Write, Grep, Glob, Bash) to inspect and modify files. "
+      "Always use tool calls instead of pasting code in chat. "
+      "Do not show your thinking process. Be concise and action-oriented. "
+      "After receiving tool results, continue working until the task is complete. "
+      "Ensure all tool call JSON arguments are valid.";
   int maxToolUseConcurrency = 10;
   int perMessageBudgetLimit = 600000;
   int contextWindow = 200000;
@@ -79,6 +99,17 @@ struct AgentConfig {
   bool failClosedGate = true;
   bool autoModeEnabled = false;
   PermissionMode permissionMode = PermissionMode::Default;
+
+  // Get the effective system prompt for a given model
+  std::string GetEffectiveSystemPrompt(const std::string& model) const {
+    if (!systemPrompt.empty() && systemPrompt != AgentConfig().systemPrompt) {
+      return systemPrompt;  // User-overridden
+    }
+    ModelFamily fam = DetectModelFamily(model);
+    if (fam == ModelFamily::Qwen) return systemPromptQwen;
+    if (fam == ModelFamily::Gemma) return systemPromptGemma;
+    return systemPrompt;
+  }
 
   static AgentConfig FromDefaults();
 };
