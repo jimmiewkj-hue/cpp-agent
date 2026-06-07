@@ -1,4 +1,4 @@
-﻿#include "tools/TaskCreateTool.h"
+#include "tools/TaskCreateTool.h"
 #include <sstream>
 namespace agent { namespace tools {
 const char* kTaskCreateToolName = "TaskCreate";
@@ -17,8 +17,14 @@ const char* kTaskCreateToolDescription =
   "- The agent will return one final message; summarize the result for the user as needed\n"
   "- Clearly tell the agent whether it should write code or only perform search/read operations\n"
   "- If an agent is suitable for the user's request, prefer using it proactively\n\n"
+  "IMPORTANT: When creating tasks that involve code generation or file modification,\n"
+  "always instruct the agent to VERIFY its work:\n"
+  "- Include 'run the code and verify the output' in the task prompt\n"
+  "- Include 'run tests if available' in the task prompt\n"
+  "- Include 'check for compilation/import errors' in the task prompt\n"
+  "This ensures the sub-agent follows the write-run-verify closed loop.\n\n"
   "Example usage:\n"
-  "- task='Write a Python script to process CSV data'\n"
+  "- task='Write a Python script to process CSV data, then run it to verify it works'\n"
   "- task='Search the codebase for all authentication-related logic'\n"
   "- task='Read and summarize the top 5 files matching a pattern'";
 std::string GetTaskCreateToolInputSchema() {

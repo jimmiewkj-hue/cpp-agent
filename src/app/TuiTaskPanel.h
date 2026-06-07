@@ -9,6 +9,9 @@ namespace app {
 struct TuiTaskItem {
   std::string id;
   std::string subject;
+  std::string content;          // Task description/content (from TodoWrite)
+  std::string activeForm;       // Active form shown for in_progress tasks
+  std::string acceptance_criteria;  // Criteria for completion
   std::string status;
   std::string owner;
   std::vector<std::string> blockedBy;

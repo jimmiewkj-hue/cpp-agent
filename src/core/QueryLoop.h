@@ -65,6 +65,20 @@ struct QueryLoopInternalState {
   int consecutiveExplorationOnlyTurns = 0;
   // P0-03: Track last assistant message time for time-based microcompact
   long long lastAssistantTimestampMs = 0;
+  // P0-2: Track file write operations for mandatory run verification
+  bool lastTurnHadFileWrite = false;
+  int consecutiveWriteWithoutVerifyCount = 0;
+  int verificationNudgeCount = 0;
+  // P1-2: Track tool execution errors for error-driven repair loop
+  int lastTurnErrorCount = 0;
+  int consecutiveErrorTurns = 0;
+  std::string lastErrorSummary;
+  // P0-3: Track completion nudges to prevent silent termination
+  int completionNudgeCount = 0;
+  // P0-3: Track result-check nudges for suspicious output after Bash runs
+  int resultCheckNudgeCount = 0;
+  // P0-4: Give one forced-action nudge before hard-stopping exploration loops
+  int explorationActionNudgeCount = 0;
 };
 
 struct StopHookResult {
@@ -140,9 +154,9 @@ class QueryLoop {
   static bool IsPromptTooLong(const Message& msg);
   // P0-02: Duplicate tool call fingerprinting
   std::string MakeToolFingerprint(const ContentBlock& block) const;
-  bool ShouldTerminateOnExcessiveExploration(
+  bool HandleExcessiveExploration(
       QueryLoopContext& ctx,
-      QueryLoopInternalState& state) const;
+      QueryLoopInternalState& state);
   bool ShouldTerminateOnDuplicates(
       QueryLoopContext& ctx,
       QueryLoopInternalState& state) const;

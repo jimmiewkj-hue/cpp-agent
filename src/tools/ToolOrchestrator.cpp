@@ -1,4 +1,4 @@
-﻿#include "tools/ToolOrchestrator.h"
+#include "tools/ToolOrchestrator.h"
 #include "hooks/HookExecutor.h"
 
 #include <cstdlib>  // std::getenv, std::atoi
@@ -13,8 +13,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstring>   // std::memcmp
 #include <fstream>
+#include <set>
 #include <sstream>
+#include <vector>
 
 using json = nlohmann::json;
 
@@ -1238,9 +1242,40 @@ std::string RenderTaskSummary(const json& tasks) {
   std::ostringstream out;
   for (std::size_t i = 0; i < tasks.size(); ++i) {
     const json& task = tasks[i];
-    out << "#" << task.value("id", std::string("?")) << " ["
-        << task.value("status", std::string("pending")) << "] "
-        << task.value("subject", task.value("content", std::string("(untitled)")));
+    const std::string id = task.value("id", std::string("?"));
+    const std::string status = task.value("status", std::string("pending"));
+    const std::string content = task.value("content",
+        task.value("subject", std::string("(untitled)")));
+    const std::string activeForm = task.value("activeForm", std::string());
+
+    // Status indicator
+    std::string statusIcon;
+    if (status == "completed") statusIcon = "[x]";
+    else if (status == "in_progress") statusIcon = "[~]";
+    else if (status == "failed") statusIcon = "[!]";
+    else if (status == "retrying") statusIcon = "[↻]";
+    else statusIcon = "[ ]";
+
+    out << "#" << id << " " << statusIcon << " " << content;
+    if (!activeForm.empty() && (status == "in_progress" || status == "retrying")) {
+      out << " (doing: " << activeForm << ")";
+    }
+    if (status == "failed") {
+      const std::string errMsg = task.value("error_message", std::string());
+      if (!errMsg.empty()) {
+        out << "\n    error: " << errMsg;
+      }
+      int retryCount = task.value("retry_count", 0);
+      if (retryCount > 0) {
+        out << " (retried " << retryCount << " time(s))";
+      }
+    }
+    if (status == "in_progress" || status == "pending" || status == "retrying") {
+      const std::string criteria = task.value("acceptance_criteria", std::string());
+      if (!criteria.empty()) {
+        out << "\n    acceptance: " << criteria;
+      }
+    }
     if (task.contains("owner") && task["owner"].is_string() &&
         !task["owner"].get<std::string>().empty()) {
       out << " (" << task["owner"].get<std::string>() << ")";
@@ -1616,6 +1651,273 @@ void GrepDirectory(const std::string& dirPath,
   } while (FindNextFileW(findHandle, &findData));
 
   FindClose(findHandle);
+}
+
+// ---- Fuzzy matching helpers (aligned with local-ace FileEditTool/utils.ts) ----
+
+// Flags for MapNormalizedMatchToOriginal to indicate which transformations
+// were applied to the normalized string.
+enum NormalizeFlags {
+  NORM_CRLF   = 1 << 0,  // \r\n → \n applied
+  NORM_QUOTES = 1 << 1,  // curly → straight quotes applied
+  NORM_WS     = 1 << 2,  // trailing whitespace stripped
+};
+
+// Reverse XML entity escaping that weaker LLMs (e.g. Qwen) may produce
+// in tool_call arguments. Aligned with local-ace de-sanitize pass.
+void DesanitizeXmlEntities(std::string& s) {
+  // Order matters: &amp; must be last to avoid double-decode.
+  static const struct { const char* from; const char* to; } kEntities[] = {
+    {"&lt;",   "<"},
+    {"&gt;",   ">"},
+    {"&quot;", "\""},
+    {"&apos;", "'"},
+    {"&amp;",  "&"},
+  };
+  for (const auto& ent : kEntities) {
+    std::string from(ent.from);
+    std::string to(ent.to);
+    std::size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+      s.replace(pos, from.size(), to);
+      pos += to.size();
+    }
+  }
+}
+
+// Check if a file path is a Markdown file (skip stripTrailingWhitespace for .md/.mdx).
+bool IsMarkdownFile(const std::string& path) {
+  std::size_t len = path.size();
+  if (len >= 4 &&
+      (path[len - 4] == '.') &&
+      (path[len - 3] == 'm' || path[len - 3] == 'M') &&
+      (path[len - 2] == 'd' || path[len - 2] == 'D') &&
+      (path[len - 1] == 'x' || path[len - 1] == 'X')) {
+    return true;  // .mdx
+  }
+  if (len >= 3 &&
+      path[len - 3] == '.' &&
+      (path[len - 2] == 'm' || path[len - 2] == 'M') &&
+      (path[len - 1] == 'd' || path[len - 1] == 'D')) {
+    return true;  // .md
+  }
+  return false;
+}
+
+// Replace all \r\n with \n in-place.
+void NormalizeCRLF(std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  for (std::size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '\r' && i + 1 < s.size() && s[i + 1] == '\n') {
+      out += '\n';
+      ++i;  // skip the \n of \r\n
+    } else if (s[i] == '\r') {
+      // Bare CR → LF
+      out += '\n';
+    } else {
+      out += s[i];
+    }
+  }
+  s = std::move(out);
+}
+
+// Replace curly quotes with straight quotes (aligned with local-ace normalizeQuotes).
+void NormalizeQuotes(std::string& s) {
+  // UTF-8 byte sequences for curly quotes:
+  //   '\u2018' (') = E2 80 98    '\u2019' (') = E2 80 99
+  //   '\u201C' (") = E2 80 9C    '\u201D' (") = E2 80 9D
+  static const struct { const char* utf8; int len; char replacement; } kQuotes[] = {
+    {"\xE2\x80\x98", 3, '\''},  // left single curly '
+    {"\xE2\x80\x99", 3, '\''},  // right single curly '
+    {"\xE2\x80\x9C", 3, '"'},   // left double curly "
+    {"\xE2\x80\x9D", 3, '"'},   // right double curly "
+  };
+  std::string out;
+  out.reserve(s.size());
+  for (std::size_t i = 0; i < s.size();) {
+    bool replaced = false;
+    for (const auto& q : kQuotes) {
+      if (i + q.len <= s.size() &&
+          std::memcmp(s.data() + i, q.utf8, q.len) == 0) {
+        out += q.replacement;
+        i += q.len;
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced) {
+      out += s[i];
+      ++i;
+    }
+  }
+  s = std::move(out);
+}
+
+// Strip trailing whitespace from each line (aligned with local-ace stripTrailingWhitespace).
+std::string StripTrailingWhitespace(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  std::size_t i = 0;
+  while (i < s.size()) {
+    // Collect line content (up to line ending)
+    std::size_t lineStart = i;
+    while (i < s.size() && s[i] != '\r' && s[i] != '\n') ++i;
+    // Trim trailing whitespace from line content
+    std::size_t lineEnd = i;
+    while (lineEnd > lineStart &&
+           (s[lineEnd - 1] == ' ' || s[lineEnd - 1] == '\t')) {
+      --lineEnd;
+    }
+    out.append(s, lineStart, lineEnd - lineStart);
+    // Preserve line ending(s)
+    if (i < s.size()) {
+      if (s[i] == '\r' && i + 1 < s.size() && s[i + 1] == '\n') {
+        out += "\r\n";
+        i += 2;
+      } else {
+        out += s[i];
+        ++i;
+      }
+    }
+  }
+  return out;
+}
+
+// Map a match found in normalized content back to the original content.
+// Returns the substring of `original` that corresponds to the match at
+// [normPos, normPos+normLen) in `normalized`.
+std::string MapNormalizedMatchToOriginal(
+    const std::string& original,
+    const std::string& normalized,
+    std::size_t normPos,
+    std::size_t normLen,
+    int flags = NORM_CRLF) {
+  // Build a character-level mapping from normalized → original positions.
+  // The mapping accounts for the transformations indicated by |flags|.
+  std::vector<std::size_t> origMap;  // origMap[i] = position in original for normalized[i]
+  origMap.reserve(normalized.size() + 1);
+
+  std::size_t oi = 0, ni = 0;
+  while (ni <= normalized.size() && oi <= original.size()) {
+    if (ni == origMap.size()) {
+      origMap.push_back(oi);
+    }
+    if (ni >= normalized.size()) break;
+    if (oi >= original.size()) break;
+
+    // CRLF in original → single LF in normalized
+    if ((flags & NORM_CRLF) &&
+        original[oi] == '\r' && oi + 1 < original.size() && original[oi + 1] == '\n') {
+      oi += 2;
+      ni += 1;
+    }
+    // Curly quote in original (3 bytes) → straight quote in normalized (1 byte)
+    else if ((flags & NORM_QUOTES) &&
+             oi + 2 < original.size() &&
+             (unsigned char)original[oi] == 0xE2 &&
+             (unsigned char)original[oi + 1] == 0x80) {
+      unsigned char b3 = (unsigned char)original[oi + 2];
+      if (b3 == 0x98 || b3 == 0x99 || b3 == 0x9C || b3 == 0x9D) {
+        oi += 3;
+        ni += 1;
+      } else {
+        oi += 1;
+        ni += 1;
+      }
+    }
+    // Trailing whitespace in original → stripped in normalized
+    else if ((flags & NORM_WS) &&
+             (original[oi] == ' ' || original[oi] == '\t')) {
+      // Peek ahead to see if this whitespace is followed by a newline (trailing ws)
+      std::size_t peek = oi + 1;
+      while (peek < original.size() &&
+             (original[peek] == ' ' || original[peek] == '\t')) {
+        ++peek;
+      }
+      if (peek < original.size() &&
+          (original[peek] == '\n' || original[peek] == '\r')) {
+        // Trailing whitespace — skip it in original, don't advance normalized
+        oi = peek;
+        continue;
+      }
+      // Non-trailing whitespace — advance both normally
+      oi += 1;
+      ni += 1;
+    }
+    else {
+      oi += 1;
+      ni += 1;
+    }
+  }
+  // Ensure origMap covers the full normalized length
+  while (origMap.size() <= normalized.size()) {
+    origMap.push_back(oi);
+  }
+
+  std::size_t origStart = origMap[normPos];
+  std::size_t origEnd = origMap[std::min(normPos + normLen, normalized.size())];
+  return original.substr(origStart, origEnd - origStart);
+}
+
+// Preserve curly quote style from the file when the model used straight quotes.
+// Aligned with local-ace preserveQuoteStyle.
+std::string PreserveQuoteStyle(
+    const std::string& modelOldStr,
+    const std::string& actualOldStr,
+    const std::string& modelNewStr) {
+  if (modelOldStr == actualOldStr) return modelNewStr;
+
+  // Detect which curly quote types were in the file's actual string
+  bool hasDoubleCurly = actualOldStr.find("\xE2\x80\x9C") != std::string::npos ||
+                        actualOldStr.find("\xE2\x80\x9D") != std::string::npos;
+  bool hasSingleCurly = actualOldStr.find("\xE2\x80\x98") != std::string::npos ||
+                        actualOldStr.find("\xE2\x80\x99") != std::string::npos;
+
+  if (!hasDoubleCurly && !hasSingleCurly) return modelNewStr;
+
+  std::string result = modelNewStr;
+  // Simple heuristic: replace straight quotes with curly quotes
+  // using open/close context detection
+  if (hasDoubleCurly) {
+    std::string out;
+    out.reserve(result.size());
+    for (std::size_t i = 0; i < result.size(); ++i) {
+      if (result[i] == '"') {
+        bool isOpening = (i == 0 || result[i - 1] == ' ' ||
+                          result[i - 1] == '\t' || result[i - 1] == '\n' ||
+                          result[i - 1] == '(' || result[i - 1] == '[' ||
+                          result[i - 1] == '{');
+        out += isOpening ? "\xE2\x80\x9C" : "\xE2\x80\x9D";
+      } else {
+        out += result[i];
+      }
+    }
+    result = std::move(out);
+  }
+  if (hasSingleCurly) {
+    std::string out;
+    out.reserve(result.size());
+    for (std::size_t i = 0; i < result.size(); ++i) {
+      if (result[i] == '\'') {
+        // Check for contraction (apostrophe between letters)
+        bool prevIsLetter = (i > 0 && std::isalpha(static_cast<unsigned char>(result[i - 1])));
+        bool nextIsLetter = (i + 1 < result.size() && std::isalpha(static_cast<unsigned char>(result[i + 1])));
+        if (prevIsLetter && nextIsLetter) {
+          out += "\xE2\x80\x99";  // right single curly for apostrophe
+        } else {
+          bool isOpening = (i == 0 || result[i - 1] == ' ' ||
+                            result[i - 1] == '\t' || result[i - 1] == '\n' ||
+                            result[i - 1] == '(');
+          out += isOpening ? "\xE2\x80\x98" : "\xE2\x80\x99";
+        }
+      } else {
+        out += result[i];
+      }
+    }
+    result = std::move(out);
+  }
+  return result;
 }
 
 }  // namespace
@@ -2280,9 +2582,91 @@ std::string ToolOrchestrator::ExecuteTodoWrite(
   }
 
   const std::string summary = payload.value("summary", std::string());
+
+  // P0-1: Check for tasks being marked completed without verification.
+  // If a task is being marked as completed and has acceptance_criteria,
+  // append a reminder about the criteria to the tool result.
+  std::string criteriaReminder;
+  if (!payload.value("merge", false)) {
+    // Full replace mode: check all tasks being set to completed
+    for (const auto& item : tasks.is_array() ? tasks : json::array()) {
+      if (item.value("status", std::string()) == "completed") {
+        const std::string criteria = item.value("acceptance_criteria", std::string());
+        const std::string content = item.value("content",
+            item.value("subject", std::string()));
+        if (!criteria.empty()) {
+          criteriaReminder += "\n  - Task '" + content + "': " + criteria;
+        }
+      }
+    }
+  } else {
+    // Merge mode: check only tasks being updated to completed
+    for (const auto& item : incoming.is_array() ? incoming : json::array()) {
+      if (item.value("status", std::string()) == "completed") {
+        const std::string criteria = item.value("acceptance_criteria", std::string());
+        const std::string content = item.value("content",
+            item.value("subject", std::string()));
+        if (!criteria.empty()) {
+          criteriaReminder += "\n  - Task '" + content + "': " + criteria;
+        }
+      }
+    }
+  }
+
+  // P1-3: Verification nudge - when all tasks are completed but none was
+  // a verification step, remind the model to verify before finishing.
+  // Aligned with local-ace's verificationNudgeNeeded mechanism.
+  bool allDone = true;
+  bool hasVerificationStep = false;
+  int completedCount = 0;
+  if (tasks.is_array()) {
+    for (const auto& item : tasks) {
+      const std::string status = item.value("status", std::string());
+      const std::string content = item.value("content",
+          item.value("subject", std::string()));
+      if (status != "completed") {
+        allDone = false;
+      } else {
+        ++completedCount;
+      }
+      // Check if any task looks like a verification step
+      std::string lowerContent = content;
+      std::transform(lowerContent.begin(), lowerContent.end(),
+                     lowerContent.begin(),
+                     [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      if (lowerContent.find("verif") != std::string::npos ||
+          lowerContent.find("test") != std::string::npos ||
+          lowerContent.find("run") != std::string::npos ||
+          lowerContent.find("check") != std::string::npos ||
+          lowerContent.find("build") != std::string::npos) {
+        hasVerificationStep = true;
+      }
+    }
+  }
+
+  std::string verificationNudge;
+  if (allDone && completedCount >= 3 && !hasVerificationStep) {
+    verificationNudge =
+        "\n\nNOTE: You just closed out " + std::to_string(completedCount) +
+        "+ tasks and none of them was a verification step (run/test/check/build). "
+        "Before writing your final summary, you should verify the implementation "
+        "by running the code, executing tests, or checking the output. "
+        "Do NOT self-assign completion without evidence - run a verification command.";
+  }
+
   std::string result = summary.empty()
       ? "Todo list updated.\n" + RenderTaskSummary(tasks)
       : summary + "\n" + RenderTaskSummary(tasks);
+
+  if (!criteriaReminder.empty()) {
+    result += "\n\nREMINDER: You marked task(s) as completed. Please verify the following acceptance criteria were met:"
+        + criteriaReminder
+        + "\nIf any criteria were NOT verified (e.g., code not run, tests not executed),"
+        " run the appropriate verification commands before considering the task done.";
+  }
+
+  result += verificationNudge;
+
   return TruncateResult(result, maxResultSize);
 }
 
@@ -2367,6 +2751,7 @@ std::string ToolOrchestrator::ExecuteTaskUpdate(const std::string& inputJson,
   }
 
   json& task = tasks[static_cast<std::size_t>(index)];
+  const std::string oldStatus = task.value("status", std::string("pending"));
   const char* keys[] = {"subject", "description", "activeForm", "status",
                         "owner"};
   for (const char* key : keys) {
@@ -2377,6 +2762,55 @@ std::string ToolOrchestrator::ExecuteTaskUpdate(const std::string& inputJson,
   }
   if (payload.contains("metadata") && payload["metadata"].is_object()) {
     task["metadata"] = payload["metadata"];
+  }
+  // P1-1: Support acceptance_criteria and error_message fields
+  if (payload.contains("acceptance_criteria") && payload["acceptance_criteria"].is_string()) {
+    task["acceptance_criteria"] = payload["acceptance_criteria"];
+  }
+  if (payload.contains("error_message") && payload["error_message"].is_string()) {
+    task["error_message"] = payload["error_message"];
+  }
+
+  // P1-1: State transition validation
+  const std::string newStatus = task.value("status", oldStatus);
+  if (newStatus != oldStatus) {
+    // Valid transitions:
+    // pending -> in_progress (start work)
+    // in_progress -> completed (finish successfully)
+    // in_progress -> failed (encounter error)
+    // failed -> retrying (retry after error)
+    // retrying -> in_progress (retry accepted)
+    // retrying -> failed (retry failed)
+    // failed -> completed (manual override after verification)
+    // Any status -> pending (reset)
+    static const std::map<std::string, std::set<std::string>> validTransitions = {
+      {"pending", {"in_progress"}},
+      {"in_progress", {"completed", "failed", "pending"}},
+      {"failed", {"retrying", "completed", "pending"}},
+      {"retrying", {"in_progress", "failed", "pending"}},
+      {"completed", {"pending"}},  // Allow reopening completed tasks
+    };
+    auto it = validTransitions.find(oldStatus);
+    if (it != validTransitions.end() &&
+        it->second.find(newStatus) == it->second.end()) {
+      // Invalid transition - still allow it but log a warning
+      task["status_warning"] = "Transition from " + oldStatus + " to " +
+          newStatus + " is unusual";
+    }
+
+    // Track retry count for failed -> retrying transitions
+    if (newStatus == "retrying") {
+      int retryCount = task.value("retry_count", 0);
+      task["retry_count"] = retryCount + 1;
+      task["last_retry_time"] = std::to_string(
+          static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch()).count()));
+    }
+
+    // Clear error_message when transitioning away from failed
+    if (oldStatus == "failed" && newStatus != "failed") {
+      task.erase("error_message");
+    }
   }
 
   std::string writeError;
@@ -2481,19 +2915,421 @@ std::string ToolOrchestrator::ExecuteFileEdit(
   buffer << input.rdbuf();
   std::string content = buffer.str();
 
-  std::string result;
+  // Markdown files use two trailing spaces as hard line breaks — stripping
+  // would silently change semantics. Skip stripTrailingWhitespace for .md/.mdx.
+  const bool isMarkdown = IsMarkdownFile(filePath);
+
+  // ---- Pre-processing: XML de-sanitization (Task 2) ----
+  // Weaker LLMs (Qwen 3.6 35b) sometimes emit XML-escaped entities in
+  // tool_call arguments. Reverse them before any matching.
+  DesanitizeXmlEntities(oldStr);
+  DesanitizeXmlEntities(newStr);
+
+  // ---- Fuzzy matching engine (aligned with local-ace findActualString) ----
+  // Multi-level fallback: exact → CRLF → quote+CRLF → whitespace+CRLF
+  std::string actualOldStr = oldStr;
+  std::string actualNewStr = newStr;
+  bool fuzzyUsed = false;
+  std::string fuzzyMethod;
+
+  // ---- Diagnostic log: record each step's result ----
+  std::ostringstream diagLog;
+  diagLog << "[FileEdit] file=" << filePath
+          << " old_string_len=" << oldStr.size()
+          << " new_string_len=" << newStr.size()
+          << " file_len=" << content.size()
+          << " replace_all=" << (replaceAll ? "true" : "false")
+          << " is_markdown=" << (isMarkdown ? "true" : "false") << "\n";
+
+  // Step 1: Try exact byte-level match (fast path)
+  {
+    std::size_t pos = content.find(oldStr);
+    if (pos != std::string::npos) {
+      diagLog << "[FileEdit] Step 1 (exact match): SUCCESS at offset " << pos << "\n";
+      // actualOldStr is already oldStr
+    } else {
+      diagLog << "[FileEdit] Step 1 (exact match): FAILED - old_string not found byte-for-byte in file\n";
+
+      // Step 2: Normalize CRLF → LF
+      if (!fuzzyUsed) {
+        std::string normContent = content;
+        std::string normOld = oldStr;
+        NormalizeCRLF(normContent);
+        NormalizeCRLF(normOld);
+        int fileCrCount = 0, oldCrCount = 0;
+        for (char c : content) if (c == '\r') ++fileCrCount;
+        for (char c : oldStr) if (c == '\r') ++oldCrCount;
+        diagLog << "[FileEdit] Step 2 (CRLF normalization): file_cr_count=" << fileCrCount
+                << " old_string_cr_count=" << oldCrCount;
+
+        std::size_t pos2 = normContent.find(normOld);
+        if (pos2 != std::string::npos) {
+          actualOldStr = MapNormalizedMatchToOriginal(
+              content, normContent, pos2, normOld.size(), NORM_CRLF);
+          actualNewStr = newStr;
+          NormalizeCRLF(actualNewStr);
+          fuzzyUsed = true;
+          fuzzyMethod = "CRLF-normalization";
+          diagLog << " -> SUCCESS at norm_offset=" << pos2 << "\n";
+        } else {
+          diagLog << " -> FAILED (normalized strings still don't match)\n";
+        }
+      }
+
+      // Step 3: Normalize quotes (curly → straight) + CRLF
+      if (!fuzzyUsed) {
+        std::string normContent = content;
+        std::string normOld = oldStr;
+        NormalizeQuotes(normContent);
+        NormalizeQuotes(normOld);
+        NormalizeCRLF(normContent);
+        NormalizeCRLF(normOld);
+
+        bool fileHasCurly = content.find("\xE2\x80\x9C") != std::string::npos ||
+                            content.find("\xE2\x80\x9D") != std::string::npos ||
+                            content.find("\xE2\x80\x98") != std::string::npos ||
+                            content.find("\xE2\x80\x99") != std::string::npos;
+        bool oldHasStraight = oldStr.find('"') != std::string::npos ||
+                              oldStr.find('\'') != std::string::npos;
+        diagLog << "[FileEdit] Step 3 (quote+CRLF): file_has_curly="
+                << (fileHasCurly ? "true" : "false")
+                << " old_string_has_straight="
+                << (oldHasStraight ? "true" : "false");
+
+        std::size_t pos3 = normContent.find(normOld);
+        if (pos3 != std::string::npos) {
+          actualOldStr = MapNormalizedMatchToOriginal(
+              content, normContent, pos3, normOld.size(),
+              NORM_CRLF | NORM_QUOTES);
+          actualNewStr = PreserveQuoteStyle(oldStr, actualOldStr, newStr);
+          fuzzyUsed = true;
+          fuzzyMethod = "quote+CRLF-normalization";
+          diagLog << " -> SUCCESS\n";
+        } else {
+          diagLog << " -> FAILED\n";
+        }
+      }
+
+      // Step 4: Strip trailing whitespace + CRLF (skip for Markdown files)
+      if (!fuzzyUsed && !isMarkdown) {
+        std::string strippedOld = StripTrailingWhitespace(oldStr);
+        std::string strippedContent = StripTrailingWhitespace(content);
+        NormalizeCRLF(strippedContent);
+        NormalizeCRLF(strippedOld);
+
+        bool oldHadTrailing = (strippedOld.size() != oldStr.size());
+        diagLog << "[FileEdit] Step 4 (whitespace+CRLF): old_string_had_trailing_ws="
+                << (oldHadTrailing ? "true" : "false")
+                << " size_before=" << oldStr.size()
+                << " size_after=" << strippedOld.size();
+
+        std::size_t pos4 = strippedContent.find(strippedOld);
+        if (pos4 != std::string::npos) {
+          actualOldStr = MapNormalizedMatchToOriginal(
+              content, strippedContent, pos4, strippedOld.size(),
+              NORM_CRLF | NORM_WS);
+          actualNewStr = newStr;
+          NormalizeCRLF(actualNewStr);
+          fuzzyUsed = true;
+          fuzzyMethod = "whitespace+CRLF-normalization";
+          diagLog << " -> SUCCESS\n";
+        } else {
+          diagLog << " -> FAILED\n";
+        }
+      } else if (!fuzzyUsed && isMarkdown) {
+        diagLog << "[FileEdit] Step 4 (whitespace+CRLF): SKIPPED (.md/.mdx file)\n";
+      }
+
+      // Step 5: Full combination — quote + CRLF + whitespace
+      if (!fuzzyUsed) {
+        std::string normOld = oldStr;
+        std::string normContent = content;
+
+        NormalizeQuotes(normContent);
+        NormalizeQuotes(normOld);
+
+        if (!isMarkdown) {
+          normOld = StripTrailingWhitespace(normOld);
+          normContent = StripTrailingWhitespace(normContent);
+        }
+
+        NormalizeCRLF(normContent);
+        NormalizeCRLF(normOld);
+
+        diagLog << "[FileEdit] Step 5 (full normalization): norm_old_len="
+                << normOld.size()
+                << " norm_content_len=" << normContent.size();
+
+        int fullFlags = NORM_CRLF | NORM_QUOTES;
+        if (!isMarkdown) fullFlags |= NORM_WS;
+
+        std::size_t pos5 = normContent.find(normOld);
+        if (pos5 != std::string::npos) {
+          actualOldStr = MapNormalizedMatchToOriginal(
+              content, normContent, pos5, normOld.size(), fullFlags);
+          actualNewStr = PreserveQuoteStyle(oldStr, actualOldStr, newStr);
+          NormalizeCRLF(actualNewStr);
+          fuzzyUsed = true;
+          fuzzyMethod = "full-normalization";
+          diagLog << " -> SUCCESS\n";
+        } else {
+          diagLog << " -> FAILED\n";
+        }
+      }
+
+      // Step 6: Line-anchor-based fallback (Task 1)
+      // When all fuzzy strategies fail, use the first and last non-empty
+      // lines of old_string as anchors to locate the block in the file.
+      // This handles cases where the LLM gets the structure right but has
+      // minor whitespace/indentation discrepancies within the block.
+      if (!fuzzyUsed) {
+        auto splitLines = [](const std::string& s) -> std::vector<std::string> {
+          std::vector<std::string> lines;
+          std::istringstream iss(s);
+          std::string line;
+          while (std::getline(iss, line)) {
+            // Normalize CRLF
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            lines.push_back(line);
+          }
+          return lines;
+        };
+        auto trimLine = [](const std::string& s) -> std::string {
+          std::size_t start = 0;
+          while (start < s.size() && (s[start] == ' ' || s[start] == '\t')) ++start;
+          std::size_t end = s.size();
+          while (end > start && (s[end-1] == ' ' || s[end-1] == '\t')) --end;
+          return s.substr(start, end - start);
+        };
+
+        std::vector<std::string> oldLines = splitLines(oldStr);
+        std::vector<std::string> fileLines = splitLines(content);
+
+        // Collect non-empty trimmed old lines for anchor matching
+        std::vector<std::pair<int, std::string>> trimmedOldLines;
+        for (int i = 0; i < static_cast<int>(oldLines.size()); ++i) {
+          std::string trimmed = trimLine(oldLines[i]);
+          if (!trimmed.empty()) {
+            trimmedOldLines.push_back({i, trimmed});
+          }
+        }
+
+        if (trimmedOldLines.size() >= 2 && fileLines.size() >= oldLines.size()) {
+          // Use first and last non-empty lines as anchors
+          const std::string& firstAnchor = trimmedOldLines.front().second;
+          const std::string& lastAnchor = trimmedOldLines.back().second;
+          int oldLineCount = static_cast<int>(oldLines.size());
+
+          diagLog << "[FileEdit] Step 6 (line-anchor fallback): first_anchor_len="
+                  << firstAnchor.size() << " last_anchor_len=" << lastAnchor.size()
+                  << " old_line_count=" << oldLineCount;
+
+          bool found = false;
+          for (int fi = 0; fi <= static_cast<int>(fileLines.size()) - oldLineCount; ++fi) {
+            std::string fileFirstTrimmed = trimLine(fileLines[fi]);
+            if (fileFirstTrimmed != firstAnchor) continue;
+
+            // Check last anchor
+            int lastIdx = fi + oldLineCount - 1;
+            if (lastIdx >= static_cast<int>(fileLines.size())) break;
+            std::string fileLastTrimmed = trimLine(fileLines[lastIdx]);
+            if (fileLastTrimmed != lastAnchor) continue;
+
+            // Verify at least 50% of interior lines match (trimmed)
+            int matchCount = 2; // first + last already matched
+            for (std::size_t oi = 1; oi < trimmedOldLines.size() - 1; ++oi) {
+              int mappedFileLine = fi + trimmedOldLines[oi].first;
+              if (mappedFileLine < static_cast<int>(fileLines.size()) &&
+                  trimLine(fileLines[mappedFileLine]) == trimmedOldLines[oi].second) {
+                ++matchCount;
+              }
+            }
+            int requiredMatches = std::max(2, static_cast<int>(trimmedOldLines.size()) / 2);
+            if (matchCount >= requiredMatches) {
+              // Found a match! Build actualOldStr from file content lines
+              std::string matchedBlock;
+              for (int li = fi; li <= lastIdx; ++li) {
+                if (li > fi) matchedBlock += '\n';
+                matchedBlock += fileLines[li];
+              }
+              actualOldStr = matchedBlock;
+              actualNewStr = newStr;
+              NormalizeCRLF(actualNewStr);
+              fuzzyUsed = true;
+              fuzzyMethod = "line-anchor-fallback";
+              found = true;
+              diagLog << " -> SUCCESS at file_line=" << fi
+                      << " match_count=" << matchCount << "\n";
+              break;
+            }
+          }
+          if (!found) {
+            diagLog << " -> FAILED (no anchor match found)\n";
+          }
+        } else {
+          diagLog << "[FileEdit] Step 6 (line-anchor fallback): SKIPPED (too few lines)\n";
+        }
+      }
+    }
+  }
+
+  // Perform the replacement using actualOldStr (which is an exact substring
+  // of the original file content, found via fuzzy matching above).
   std::size_t pos = 0;
   int count = 0;
-  while ((pos = content.find(oldStr, pos)) != std::string::npos) {
-    content.replace(pos, oldStr.size(), newStr);
-    pos += newStr.size();
+  while ((pos = content.find(actualOldStr, pos)) != std::string::npos) {
+    content.replace(pos, actualOldStr.size(), actualNewStr);
+    pos += actualNewStr.size();
     ++count;
     if (!replaceAll) break;
   }
 
   if (count == 0) {
-    if (error) *error = "old_string not found in file";
-    return "Error: search string not found in " + filePath;
+    // ---- Task 3: Auto-recovery with file re-read ----
+    // Re-read the file in case it was modified since the initial read.
+    // Then retry exact matching with fresh content.
+    std::ifstream reread(filePath, std::ios::binary);
+    if (reread) {
+      std::ostringstream freshBuf;
+      freshBuf << reread.rdbuf();
+      std::string freshContent = freshBuf.str();
+      if (freshContent != content) {
+        diagLog << "[FileEdit] Auto-recovery: file changed on disk, re-trying with fresh content\n";
+        // Retry exact match with fresh content
+        std::size_t retryPos = freshContent.find(oldStr);
+        if (retryPos != std::string::npos) {
+          // Found in fresh content! Apply replacement and write.
+          if (replaceAll) {
+            std::size_t rp = 0;
+            int rc = 0;
+            while ((rp = freshContent.find(oldStr, rp)) != std::string::npos) {
+              freshContent.replace(rp, oldStr.size(), newStr);
+              rp += newStr.size();
+              ++rc;
+            }
+            std::ofstream retryOut(filePath, std::ios::binary | std::ios::trunc);
+            if (retryOut) {
+              retryOut << freshContent;
+              std::string msg = "File edited (auto-recovery): " + filePath +
+                  " (" + std::to_string(rc) + " occurrences replaced after re-read)";
+              return TruncateResult(msg, maxResultSize);
+            }
+          } else {
+            freshContent.replace(retryPos, oldStr.size(), newStr);
+            std::ofstream retryOut(filePath, std::ios::binary | std::ios::trunc);
+            if (retryOut) {
+              retryOut << freshContent;
+              std::string msg = "File edited (auto-recovery): " + filePath +
+                  " (1 occurrence replaced after re-read)";
+              return TruncateResult(msg, maxResultSize);
+            }
+          }
+        }
+        // Update content for error message snippet generation
+        content = freshContent;
+      }
+    }
+
+    // ---- Task 5: Improved error messages for LLM self-correction ----
+    // Find the closest line-based match to give the LLM a useful snippet.
+    std::string closestSnippet;
+    {
+      auto trimWs = [](const std::string& s) -> std::string {
+        std::size_t a = 0;
+        while (a < s.size() && (s[a] == ' ' || s[a] == '\t')) ++a;
+        std::size_t b = s.size();
+        while (b > a && (s[b-1] == ' ' || s[b-1] == '\t')) --b;
+        return s.substr(a, b - a);
+      };
+      // Use the first non-empty line of old_string to find closest match
+      std::istringstream oldIss(oldStr);
+      std::string firstNonEmpty;
+      {
+        std::string line;
+        while (std::getline(oldIss, line)) {
+          if (!line.empty() && line.back() == '\r') line.pop_back();
+          std::string trimmed = trimWs(line);
+          if (!trimmed.empty()) { firstNonEmpty = trimmed; break; }
+        }
+      }
+      if (!firstNonEmpty.empty()) {
+        std::istringstream fileIss(content);
+        std::string fline;
+        int lineNum = 0;
+        int bestLine = -1;
+        int bestDist = INT_MAX;
+        while (std::getline(fileIss, fline)) {
+          ++lineNum;
+          if (!fline.empty() && fline.back() == '\r') fline.pop_back();
+          std::string trimmed = trimWs(fline);
+          // Simple distance: count of differing characters (bounded)
+          int dist = 0;
+          std::size_t minLen = std::min(trimmed.size(), firstNonEmpty.size());
+          for (std::size_t ci = 0; ci < minLen; ++ci) {
+            if (trimmed[ci] != firstNonEmpty[ci]) ++dist;
+          }
+          dist += static_cast<int>(std::abs(
+              static_cast<int>(trimmed.size()) - static_cast<int>(firstNonEmpty.size())));
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestLine = lineNum;
+          }
+        }
+        if (bestLine > 0) {
+          // Extract a snippet around the best matching line
+          std::istringstream fileIss2(content);
+          std::string snippetLine;
+          int curLine = 0;
+          int contextBefore = 3;
+          int contextAfter = 3;
+          int startLine = std::max(1, bestLine - contextBefore);
+          int endLine = bestLine + contextAfter;
+          std::ostringstream snippetStream;
+          while (std::getline(fileIss2, snippetLine)) {
+            ++curLine;
+            if (!snippetLine.empty() && snippetLine.back() == '\r') snippetLine.pop_back();
+            if (curLine >= startLine && curLine <= endLine) {
+              snippetStream << "  " << curLine << ": " << snippetLine << "\n";
+            }
+            if (curLine > endLine) break;
+          }
+          closestSnippet = snippetStream.str();
+        }
+      }
+    }
+
+    std::ostringstream hint;
+    hint << "search string not found in " << filePath << "\n";
+    hint << "\n--- Diagnostic Log ---\n";
+    hint << diagLog.str();
+    hint << "\n--- Attempted matching strategies ---\n";
+    hint << "  1. Exact match (failed)\n";
+    hint << "  2. CRLF normalization (failed)\n";
+    hint << "  3. Quote + CRLF normalization (failed)\n";
+    if (!isMarkdown) {
+      hint << "  4. Whitespace + CRLF normalization (failed)\n";
+    } else {
+      hint << "  4. Whitespace + CRLF normalization (skipped: .md/.mdx file)\n";
+    }
+    hint << "  5. Full normalization (failed)\n";
+    hint << "  6. Line-anchor fallback (failed)\n";
+    hint << "\n--- Possible causes ---\n";
+    hint << "  - old_string does not match any part of the file\n";
+    hint << "  - Indentation mismatch (tabs vs spaces)\n";
+    hint << "  - The file may have been modified since it was last read\n";
+    hint << "  - old_string length: " << oldStr.size() << " bytes\n";
+    hint << "  - file content length: " << content.size() << " bytes\n";
+    if (!closestSnippet.empty()) {
+      hint << "\n--- Closest matching region in file ---\n";
+      hint << closestSnippet;
+    }
+    hint << "\n--- How to fix ---\n";
+    hint << "  1. Use Read to get the CURRENT content of " << filePath << "\n";
+    hint << "  2. Copy the EXACT text you want to replace from the Read output\n";
+    hint << "  3. Retry Edit with the correct old_string matching the file exactly\n";
+    hint << "  4. For large changes, consider using Write to overwrite the entire file\n";
+    if (error) *error = hint.str();
+    return "Error: " + hint.str();
   }
 
   std::ofstream output(filePath, std::ios::binary | std::ios::trunc);
@@ -2503,15 +3339,20 @@ std::string ToolOrchestrator::ExecuteFileEdit(
   }
   output << content;
 
+  std::string resultMsg;
   if (replaceAll) {
-    return TruncateResult(
-        "File edited: " + filePath + " (" + std::to_string(count) +
-            " occurrences replaced)",
-        maxResultSize);
+    resultMsg = "File edited: " + filePath + " (" +
+        std::to_string(count) + " occurrences replaced)";
+  } else {
+    resultMsg = "File edited: " + filePath + " (1 occurrence replaced)";
   }
-  return TruncateResult(
-      "File edited: " + filePath + " (1 occurrence replaced)",
-      maxResultSize);
+  if (fuzzyUsed) {
+    resultMsg += " [fuzzy-match: " + fuzzyMethod + "]";
+    // Only include diagnostic log when fuzzy matching was used (avoid noise)
+    resultMsg += "\n" + diagLog.str();
+  }
+
+  return TruncateResult(resultMsg, maxResultSize);
 }
 
 std::string ToolOrchestrator::ExecuteNotebookEdit(const std::string& inputJson,

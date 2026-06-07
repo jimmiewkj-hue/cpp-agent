@@ -662,11 +662,64 @@ std::vector<std::string> WrapLineVisually(const std::string& s, int maxWidth) {
   return wrapped;
 }
 
+// ===== TUI Log Line Category for Color Differentiation =====
+enum class LogLineCategory {
+  kPlain,          // Default / startup / misc
+  kThinking,       // Model thinking (dim + italic)
+  kAssistantReply, // Model text reply (bright white)
+  kToolCall,       // Tool invocation (cyan)
+  kToolResult,     // Tool result (dim)
+  kFileWrite,      // File creation (green)
+  kFileEdit,       // File modification (yellow)
+  kError,          // Error messages (red)
+  kValidation,     // Validator messages (magenta)
+  kPermission,     // Permission messages (blue)
+  kStage,          // Stage changes (blue)
+  kCompact,        // Compact/context (dim cyan)
+  kTask,           // Task updates (magenta)
+  kUserInput,      // User input (white)
+};
+
+// Returns the ANSI color prefix for a given category.
+const char* CategoryAnsiPrefix(LogLineCategory cat) {
+  switch (cat) {
+    case LogLineCategory::kThinking:       return "\x1b[2;3m";    // dim + italic
+    case LogLineCategory::kAssistantReply: return "\x1b[1;37m";   // bold white
+    case LogLineCategory::kToolCall:       return "\x1b[36m";     // cyan
+    case LogLineCategory::kToolResult:     return "\x1b[2m";      // dim
+    case LogLineCategory::kFileWrite:      return "\x1b[1;32m";   // bold green
+    case LogLineCategory::kFileEdit:       return "\x1b[1;33m";   // bold yellow
+    case LogLineCategory::kError:          return "\x1b[1;31m";   // bold red
+    case LogLineCategory::kValidation:     return "\x1b[35m";     // magenta
+    case LogLineCategory::kPermission:     return "\x1b[34m";     // blue
+    case LogLineCategory::kStage:          return "\x1b[34m";     // blue
+    case LogLineCategory::kCompact:        return "\x1b[2;36m";   // dim cyan
+    case LogLineCategory::kTask:           return "\x1b[35m";     // magenta
+    case LogLineCategory::kUserInput:      return "\x1b[37m";     // white
+    case LogLineCategory::kPlain:
+    default:                               return "";              // no color
+  }
+}
+
+struct LogLine {
+  std::string text;
+  LogLineCategory category = LogLineCategory::kPlain;
+};
+
 std::vector<std::string> BuildDisplayLines(
-    const std::deque<std::string>& logLines, int contentWidth) {
+    const std::deque<LogLine>& logLines, int contentWidth) {
   std::vector<std::string> displayLines;
-  for (const auto& rawLine : logLines) {
-    const auto wrapped = WrapLineVisually(rawLine, std::max(1, contentWidth));
+  for (const auto& logLine : logLines) {
+    // Apply color prefix based on category
+    const char* colorPrefix = CategoryAnsiPrefix(logLine.category);
+    const bool hasColor = (colorPrefix[0] != '\0');
+    std::string coloredText;
+    if (hasColor) {
+      coloredText = std::string(colorPrefix) + logLine.text + "\x1b[0m";
+    } else {
+      coloredText = logLine.text;
+    }
+    const auto wrapped = WrapLineVisually(coloredText, std::max(1, contentWidth));
     displayLines.insert(displayLines.end(), wrapped.begin(), wrapped.end());
   }
   return displayLines;
@@ -679,6 +732,20 @@ void AppendWrappedPreview(std::vector<std::string>* lines,
   if (lines == nullptr || value.empty()) return;
   const auto wrapped = WrapLineVisually(
       prefix + value, std::max(1, contentWidth));
+  lines->insert(lines->end(), wrapped.begin(), wrapped.end());
+}
+
+// Colored variant: applies ANSI color to the prefix and value separately.
+void AppendWrappedPreviewColored(std::vector<std::string>* lines,
+                                  const std::string& prefix,
+                                  const std::string& value,
+                                  const char* prefixColor,
+                                  const char* valueColor,
+                                  int contentWidth) {
+  if (lines == nullptr || value.empty()) return;
+  std::string colored = std::string(prefixColor) + prefix + "\x1b[0m" +
+                        std::string(valueColor) + value + "\x1b[0m";
+  const auto wrapped = WrapLineVisually(colored, std::max(1, contentWidth));
   lines->insert(lines->end(), wrapped.begin(), wrapped.end());
 }
 
@@ -781,7 +848,7 @@ bool CopyUtf8ToClipboard(const std::string& text) {
 
 struct TuiState {
   std::mutex mutex;
-  std::deque<std::string> logLines;
+  std::deque<LogLine> logLines;
   std::string liveResponse;
   std::string liveToolStatus;
   std::string liveStage;
@@ -797,6 +864,8 @@ struct TuiState {
   std::string protocol;
   std::string toolsList;
   std::string statusText;
+  int contextUsagePercent = 0;    // 0-100 percentage of context window used
+  int estimatedTokens = 0;        // Raw token count
   std::atomic<bool> running{false};
   std::atomic<bool> quitRequested{false};
 };
@@ -890,10 +959,11 @@ class AnsiTui {
     SetCursorPosition(2, h - 1);
   }
 
-  void AppendMessage(const std::string& line) {
+  void AppendMessage(const std::string& line,
+                     LogLineCategory cat = LogLineCategory::kPlain) {
     {
       std::lock_guard<std::mutex> lock(state_.mutex);
-      state_.logLines.push_back(line);
+      state_.logLines.push_back({line, cat});
       while (static_cast<int>(state_.logLines.size()) > 200)
         state_.logLines.pop_front();
     }
@@ -917,6 +987,18 @@ class AnsiTui {
       state_.liveToolStatus = text;
     }
     RefreshMessages();
+  }
+
+  void SetContextUsage(int tokens, int contextWindow) {
+    {
+      std::lock_guard<std::mutex> lock(state_.mutex);
+      state_.estimatedTokens = tokens;
+      if (contextWindow > 0) {
+        state_.contextUsagePercent = std::min(100,
+            static_cast<int>((static_cast<double>(tokens) / contextWindow) * 100));
+      }
+    }
+    RefreshStatus();
   }
 
   void SetLiveStage(const std::string& text) {
@@ -1091,7 +1173,7 @@ class AnsiTui {
       for (const auto& line : state_.logLines) {
         if (!first) joined << "\r\n";
         first = false;
-        joined << line;
+        joined << line.text;
       }
     }
     return CopyUtf8ToClipboard(joined.str());
@@ -1104,10 +1186,13 @@ class AnsiTui {
       std::lock_guard<std::mutex> lock(state_.mutex);
       std::vector<std::string> displayLines =
           BuildDisplayLines(state_.logLines, std::max(1, sz.width - 4));
-      AppendWrappedPreview(
-          &displayLines, "stream: ", state_.liveResponse, std::max(1, sz.width - 4));
-      AppendWrappedPreview(
-          &displayLines, "tool: ", state_.liveToolStatus, std::max(1, sz.width - 4));
+      // Colored live previews: stream=bold white, tool=cyan
+      AppendWrappedPreviewColored(
+          &displayLines, "stream: ", state_.liveResponse,
+          "\x1b[2m", "\x1b[1;37m", std::max(1, sz.width - 4));
+      AppendWrappedPreviewColored(
+          &displayLines, "tool: ", state_.liveToolStatus,
+          "\x1b[2m", "\x1b[36m", std::max(1, sz.width - 4));
       totalLines = static_cast<int>(displayLines.size());
     }
     int maxVisible = msgHeight_ - 2;
@@ -1347,7 +1432,7 @@ class AnsiTui {
     for (int i = 0; i < boxW - 12; ++i) std::cout << "\xe2\x94\x80";
     std::cout << "\xe2\x94\x90\x1b[0m";
 
-    std::deque<std::string> logLines;
+    std::deque<LogLine> logLines;
     std::string liveResponse;
     std::string liveToolStatus;
     {
@@ -1358,10 +1443,12 @@ class AnsiTui {
     }
     std::vector<std::string> displayLines =
         BuildDisplayLines(logLines, std::max(1, boxW - 2));
-    AppendWrappedPreview(
-        &displayLines, "stream: ", liveResponse, std::max(1, boxW - 2));
-    AppendWrappedPreview(
-        &displayLines, "tool: ", liveToolStatus, std::max(1, boxW - 2));
+    AppendWrappedPreviewColored(
+        &displayLines, "stream: ", liveResponse,
+        "\x1b[2m", "\x1b[1;37m", std::max(1, boxW - 2));
+    AppendWrappedPreviewColored(
+        &displayLines, "tool: ", liveToolStatus,
+        "\x1b[2m", "\x1b[36m", std::max(1, boxW - 2));
 
     int maxVisible = height - 2;
     if (maxVisible < 1) maxVisible = 1;
@@ -1488,12 +1575,16 @@ class AnsiTui {
     bool running;
     std::string liveStage;
     std::string permissionModeLabel;
+    int ctxPercent = 0;
+    int ctxTokens = 0;
     {
       std::lock_guard<std::mutex> lock(state_.mutex);
       status = state_.statusText;
       running = state_.running.load();
       liveStage = state_.liveStage;
       permissionModeLabel = state_.permissionModeLabel;
+      ctxPercent = state_.contextUsagePercent;
+      ctxTokens = state_.estimatedTokens;
     }
     if (status.empty()) status = "Ready";
     if (running && !liveStage.empty() &&
@@ -1502,6 +1593,19 @@ class AnsiTui {
     }
     if (!permissionModeLabel.empty()) {
       status += " | Perm:" + permissionModeLabel;
+    }
+    // Add context usage indicator with color warning
+    if (ctxTokens > 0) {
+      std::ostringstream ctxStr;
+      ctxStr << " | Ctx:" << ctxPercent << "%";
+      // Color code: green < 50%, yellow 50-80%, red > 80%
+      if (ctxPercent >= 80) {
+        status += "\x1b[31m" + ctxStr.str() + "\x1b[0m\x1b[7m";
+      } else if (ctxPercent >= 50) {
+        status += "\x1b[33m" + ctxStr.str() + "\x1b[0m\x1b[7m";
+      } else {
+        status += ctxStr.str();
+      }
     }
 
     std::ostringstream ss;
@@ -1561,7 +1665,7 @@ int main() {
   llmCfg.apiEndpoint = GetEnvOrDefault(
       "CPP_AGENT_API_ENDPOINT", "http://127.0.0.1:8080/v1/chat/completions");
   llmCfg.mainModel = GetEnvOrDefault(
-      "CPP_AGENT_MAIN_MODEL", "Qwen3.6-35B-A3B-Q8_0.gguf");
+      "CPP_AGENT_MAIN_MODEL", "Qwen3.6-35B-A3B-Q8_0");
   llmCfg.validatorModel = GetEnvOrDefault(
       "CPP_AGENT_VALIDATOR_MODEL", "");
   llmCfg.fallbackModel = GetEnvOrDefault(
@@ -1697,7 +1801,8 @@ int main() {
             tui.SetPermissionModeLabel(PermissionModeLabel(choice.newMode));
             tui.AppendMessage(
                 std::string("[permission] mode set to ") +
-                PermissionModeLabel(choice.newMode));
+                PermissionModeLabel(choice.newMode),
+                LogLineCategory::kPermission);
           }
           agent::core::PermissionDecision resolved;
           resolved.behavior = choice.behavior;
@@ -1734,17 +1839,43 @@ int main() {
         case agent::core::QueryLoopEvent::Type::LoopCompleted:
           std::cout << "[loop_completed] " << event.terminalReason << std::endl;
           break;
+        case agent::core::QueryLoopEvent::Type::ContextUsageUpdate: {
+          const int pct = event.contextWindow > 0
+              ? (event.estimatedTokens * 100 / event.contextWindow) : 0;
+          std::cout << "[context] " << event.estimatedTokens
+                    << " tokens (" << pct << "%)" << std::endl;
+          break;
+        }
         default: break;
       }
       return;
     }
     switch (event.type) {
-      case agent::core::QueryLoopEvent::Type::StageChanged:
+      case agent::core::QueryLoopEvent::Type::StageChanged: {
         tui.SetLiveStage(QueryStageLabel(event.stage));
+        // Log compact-related stages with color
+        const char* label = QueryStageLabel(event.stage);
+        std::string stageLabel = std::string("[") + label + "]";
+        if (std::string(label) == "Microcompact" ||
+            std::string(label) == "Collapse" ||
+            std::string(label) == "Autocompact" ||
+            std::string(label) == "Snip") {
+          tui.AppendMessage(stageLabel, LogLineCategory::kCompact);
+        } else {
+          tui.AppendMessage(stageLabel, LogLineCategory::kStage);
+        }
         break;
+      }
       case agent::core::QueryLoopEvent::Type::AssistantMessage: {
         const std::string text = ExtractText(event.message);
         if (!text.empty()) tui.AppendLiveResponseChunk(text);
+
+        // Check for thinking indicators in the text
+        if (text.find("<thinking>") != std::string::npos ||
+            text.find("Let me think") != std::string::npos ||
+            text.find("I need to") != std::string::npos) {
+          tui.AppendMessage("\xe2\x88\xb4 Thinking...", LogLineCategory::kThinking);
+        }
         break;
       }
       case agent::core::QueryLoopEvent::Type::ToolProgress: {
@@ -1752,18 +1883,50 @@ int main() {
             event.message.content.front().type ==
                 agent::core::BlockType::ToolUse) {
           const auto& toolUse = event.message.content.front().asToolUse;
-          tui.SetLiveToolStatus(
-              toolUse.name + " " + Shorten(toolUse.inputJson, 80));
+          const std::string toolLine = toolUse.name + " " + Shorten(toolUse.inputJson, 80);
+          tui.SetLiveToolStatus(toolLine);
+
+          // Categorize by tool type
+          LogLineCategory cat = LogLineCategory::kToolCall;
+          if (toolUse.name == "FileWrite" || toolUse.name == "Write") {
+            cat = LogLineCategory::kFileWrite;
+          } else if (toolUse.name == "FileEdit" || toolUse.name == "Edit" ||
+                     toolUse.name == "MultiEdit") {
+            cat = LogLineCategory::kFileEdit;
+          } else if (toolUse.name == "TodoWrite" || toolUse.name == "TaskCreate" ||
+                     toolUse.name == "TaskUpdate") {
+            cat = LogLineCategory::kTask;
+            // Immediately refresh task panel on task-modifying tool calls
+            tui.SetTaskPanelData(agent::app::LoadTuiTaskPanelData(taskStorePath));
+          }
+          tui.AppendMessage("\xe2\x97\x8f " + toolLine, cat);
         }
         break;
       }
-      case agent::core::QueryLoopEvent::Type::ToolResult:
-        tui.SetLiveToolStatus("tool result received");
+      case agent::core::QueryLoopEvent::Type::ToolResult: {
+        // Check if the result contains an error
+        std::string resultText = "tool result received";
+        LogLineCategory cat = LogLineCategory::kToolResult;
+        // Simple error detection via event message
+        const std::string msgText = ExtractText(event.message);
+        if (msgText.find("Error") != std::string::npos ||
+            msgText.find("error") != std::string::npos ||
+            msgText.find("failed") != std::string::npos) {
+          cat = LogLineCategory::kError;
+          resultText = "tool error";
+        }
+        tui.SetLiveToolStatus(resultText);
         tui.SetTaskPanelData(agent::app::LoadTuiTaskPanelData(taskStorePath));
         break;
+      }
       case agent::core::QueryLoopEvent::Type::LoopCompleted:
         tui.SetTaskPanelData(agent::app::LoadTuiTaskPanelData(taskStorePath));
         tui.SetStatusText("Completed [" + event.terminalReason + "]");
+        tui.AppendMessage("[completed] " + event.terminalReason,
+                          LogLineCategory::kStage);
+        break;
+      case agent::core::QueryLoopEvent::Type::ContextUsageUpdate:
+        tui.SetContextUsage(event.estimatedTokens, event.contextWindow);
         break;
       default:
         break;
@@ -1980,9 +2143,11 @@ int main() {
     }
     if (line == "/copy") {
       if (tui.CopyMessagesToClipboard())
-        tui.AppendMessage("[copied] Messages copied to clipboard.");
+        tui.AppendMessage("[copied] Messages copied to clipboard.",
+                          LogLineCategory::kPlain);
       else
-        tui.AppendMessage("[error] Failed to copy messages to clipboard.");
+        tui.AppendMessage("[error] Failed to copy messages to clipboard.",
+                          LogLineCategory::kError);
       continue;
     }
     if (line == "/status") {
@@ -2033,7 +2198,7 @@ int main() {
       continue;
     }
 
-    tui.AppendMessage("> " + line);
+    tui.AppendMessage("> " + line, LogLineCategory::kUserInput);
     tui.ClearLiveState();
     tuiState.running.store(true);
     tuiState.statusText = "Running: " + Shorten(line, 50);
@@ -2044,23 +2209,33 @@ int main() {
     const bool ok = engine.RunTurnWithRecovery();
     tui.ClearLiveState();
     sessionManager.PersistSnapshot();
+    // Refresh task panel after turn completes to catch any updates
+    tui.SetTaskPanelData(agent::app::LoadTuiTaskPanelData(taskStorePath));
 
     const auto& msgs = engine.messages();
     for (std::size_t i = prevCount; i < msgs.size(); ++i) {
       std::string text = Trim(ExtractText(msgs[i]));
       if (text.empty()) continue;
-      const std::string role =
-          msgs[i].role == agent::core::MessageRole::Assistant
-              ? "asst"
-          : msgs[i].role == agent::core::MessageRole::System
-              ? "sys"
-              : "user";
+      const bool isAssistant =
+          msgs[i].role == agent::core::MessageRole::Assistant;
+      const bool isSystem =
+          msgs[i].role == agent::core::MessageRole::System;
+      const std::string role = isAssistant ? "asst"
+                              : isSystem ? "sys" : "user";
+      LogLineCategory cat = isAssistant ? LogLineCategory::kAssistantReply
+                          : isSystem ? LogLineCategory::kPlain
+                          : LogLineCategory::kUserInput;
+      // Detect error messages in system messages
+      if (isSystem && (text.find("error") != std::string::npos ||
+                       text.find("Error") != std::string::npos)) {
+        cat = LogLineCategory::kError;
+      }
       for (const auto& lineText : SplitLines(text))
-        tui.AppendMessage(role + ": " + lineText);
+        tui.AppendMessage(role + ": " + lineText, cat);
     }
 
     if (!ok)
-      tui.AppendMessage("[error] Turn failed.");
+      tui.AppendMessage("[error] Turn failed.", LogLineCategory::kError);
 
     tuiState.running.store(false);
   }

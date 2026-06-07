@@ -57,6 +57,9 @@ TuiTaskPanelData LoadTuiTaskPanelData(const std::string& taskStorePath) {
     TuiTaskItem item;
     item.id = entry.value("id", std::string());
     item.subject = entry.value("subject", std::string());
+    item.content = entry.value("content", std::string());
+    item.activeForm = entry.value("activeForm", std::string());
+    item.acceptance_criteria = entry.value("acceptance_criteria", std::string());
     item.status = entry.value("status", std::string("pending"));
     item.owner = entry.value("owner", std::string());
     if (entry.contains("blockedBy") && entry["blockedBy"].is_array()) {
@@ -92,6 +95,7 @@ std::vector<std::string> BuildTuiTaskPanelLines(
   std::vector<std::string> lines;
   if (width < 16) return lines;
 
+  // Header summary line with counts
   std::ostringstream summary;
   summary << "Tasks: " << data.tasks.size()
           << " total | " << data.inProgressCount << " running | "
@@ -105,10 +109,20 @@ std::vector<std::string> BuildTuiTaskPanelLines(
       std::min<std::size_t>(static_cast<std::size_t>(visibleTasks), data.tasks.size());
   for (std::size_t i = 0; i < count; ++i) {
     const TuiTaskItem& task = data.tasks[i];
+
+    // Primary line: status icon + id + display name
     std::ostringstream row;
     row << StatusIcon(task) << " ";
     if (!task.id.empty()) row << "#" << task.id << " ";
-    row << task.subject;
+
+    // Show activeForm for in_progress tasks, otherwise subject or content
+    if (task.status == "in_progress" && !task.activeForm.empty()) {
+      row << task.activeForm;
+    } else if (!task.subject.empty()) {
+      row << task.subject;
+    } else {
+      row << task.content;
+    }
     if (!task.owner.empty()) row << " @" << task.owner;
     if (!task.blockedBy.empty()) {
       row << " blocked:";
@@ -118,6 +132,19 @@ std::vector<std::string> BuildTuiTaskPanelLines(
       }
     }
     lines.push_back(TruncateText(row.str(), taskWidth));
+
+    // Secondary line: content summary (dimmed via prefix)
+    if (!task.content.empty() && task.content != task.subject &&
+        task.content != task.activeForm) {
+      std::string detail = "  " + task.content;
+      lines.push_back(TruncateText(detail, taskWidth));
+    }
+
+    // Show acceptance_criteria for completed tasks
+    if (task.status == "completed" && !task.acceptance_criteria.empty()) {
+      std::string criteria = "  [criteria] " + task.acceptance_criteria;
+      lines.push_back(TruncateText(criteria, taskWidth));
+    }
   }
 
   if (data.tasks.size() > count) {

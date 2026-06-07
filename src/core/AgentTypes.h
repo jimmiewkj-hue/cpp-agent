@@ -202,11 +202,14 @@ struct QueryLoopEvent {
     CompactionBoundary,
     Tombstone,
     LoopCompleted,
+    ContextUsageUpdate,
   };
   Type type = Type::LoopCompleted;
   QueryStage stage = QueryStage::Completed;
   Message message;
   std::string terminalReason;
+  int estimatedTokens = 0;
+  int contextWindow = 0;
 };
 
 }  // namespace core

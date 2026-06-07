@@ -492,6 +492,7 @@ bool IsExplorationToolName(const std::string& toolName) {
 
 bool IsWorkspaceWriteToolName(const std::string& toolName) {
   return toolName == "Write" || toolName == "FileWrite" ||
+         toolName == "FileEdit" || toolName == "MultiEdit" ||
          toolName == "NotebookEdit";
 }
 
@@ -551,6 +552,21 @@ bool UserRequestedDirectCreation(const std::vector<Message>& messages) {
            ContainsToken(prompt, "从零开始") ||
            ContainsToken(prompt, "直接创建") ||
            ContainsToken(prompt, "直接新建");
+  }
+  return false;
+}
+
+// Check if the conversation history contains recent tool_result blocks,
+// indicating the model was actively using tools before a no-tool response
+// or an exploration-only loop.
+static bool HasRecentToolActivity(const QueryLoopContext& ctx) {
+  const int msgCount = static_cast<int>(ctx.messages.size());
+  const int scanWindow = (msgCount < 20) ? msgCount : 20;
+  const int start = msgCount - scanWindow;
+  for (int i = start; i < msgCount; ++i) {
+    for (const auto& block : ctx.messages[i].content) {
+      if (block.type == BlockType::ToolResult) return true;
+    }
   }
   return false;
 }
@@ -952,7 +968,50 @@ Rules:
 - Absolute workspace paths and relative workspace paths are both acceptable for
   read/search tools when they resolve to the same in-workspace target
 - "retry_from_tools" means the assistant fundamentally misunderstood and needs to redo tool work
-- Never invent information not present in the context)VALIDATOR";
+- Never invent information not present in the context
+
+VERIFICATION AWARENESS (critical for ensuring write-run-verify closed loop):
+- If the assistant just wrote/modified project files (Write, FileEdit, MultiEdit)
+  but has NOT subsequently run or verified the code (no Bash, no test execution),
+  this is a VERIFICATION GAP. Issue retry_from_tools with guidance like:
+  "You wrote project files but did not verify them. Run the code or tests before proceeding."
+- If the assistant is about to mark all tasks as completed but none of the tasks
+  involved running, testing, or checking the output, this is an INCOMPLETE session.
+  Issue retry_from_tools with guidance like:
+  "All tasks completed but none involves verification. Add a verification step
+  (run the code, run tests, check output) before reporting completion."
+- If execution_evidence shows that code was written but produced errors when run,
+  and the assistant is moving on without fixing those errors, issue retry_from_tools
+  with guidance to fix the errors first.
+- Do NOT approve a session that wrote code but never ran it. The write-run-verify
+  closed loop is MANDATORY for any non-trivial implementation.
+
+CODE ERROR DIAGNOSIS (critical for fixing AttributeError/NameError/ImportError/TypeError):
+- When the execution_evidence shows a Python runtime error (AttributeError, NameError,
+  ImportError, TypeError, ModuleNotFoundError), the assistant MUST read the relevant
+  source files to understand the actual API/signatures before attempting a fix.
+  Guessing method names without reading the code produces incorrect fixes.
+- Do NOT instruct the assistant to "stop reading files" or "just emit a Write".
+  Instead, guide the assistant to first READ the module file(s) to understand the
+  correct API, then fix the mismatch.
+- If the same error occurs repeatedly, the assistant is likely guessing the fix
+  without understanding the code. Issue retry_from_tools with guidance like:
+  "Read the actual class definition in [module].py to find the correct method name,
+  then fix main.py to call the right method with the right arguments."
+- Common code generation errors to watch for:
+  - Method name mismatch: main.py calls extract_characters() but the class defines
+    extract_all_characters(). Guide: "Read the CharacterExtractor class to find the
+    correct method name, then fix the call in main.py."
+  - Constructor argument mismatch: main.py creates ClassName(arg1, arg2) but
+    __init__ requires (self, arg1, arg2, arg3). Guide: "Read the class __init__
+    signature and fix the constructor call."
+  - Missing module import: main.py imports from a module that doesn't exist.
+    Guide: "Check which actual file contains the class and fix the import."
+  - Attribute access on wrong object: code accesses obj.attr but attr doesn't
+    exist. Guide: "Read the class definition to find the correct attribute name."
+- The write-run-verify loop is: Read-understand → Fix → Write → Run → Verify.
+  Skipping the Read-understand step when there are code errors leads to guess-based
+  fixes that fail repeatedly.)VALIDATOR";
 }
 
 std::string BuildToolsJson(const tools::ToolRegistry* toolRegistry) {
@@ -1086,9 +1145,9 @@ std::string QueryLoop::MakeToolFingerprint(const ContentBlock& block) const {
   return block.asToolUse.name + ":" + input;
 }
 
-bool QueryLoop::ShouldTerminateOnExcessiveExploration(
+bool QueryLoop::HandleExcessiveExploration(
     QueryLoopContext& ctx,
-    QueryLoopInternalState& state) const {
+    QueryLoopInternalState& state) {
   // Count consecutive turns where the model produces ONLY exploration/planning
   // tools (Read, Glob, Grep, LS, TodoWrite) without any action tools
   // (Write, FileWrite, NotebookEdit, Bash, TaskCreate).
@@ -1110,6 +1169,7 @@ bool QueryLoop::ShouldTerminateOnExcessiveExploration(
 
   if (hasActionTool) {
     state.consecutiveExplorationOnlyTurns = 0;
+    state.explorationActionNudgeCount = 0;
     return false;
   }
 
@@ -1118,6 +1178,44 @@ bool QueryLoop::ShouldTerminateOnExcessiveExploration(
   static const int kMaxExplorationOnlyTurns = 12;
   if (state.consecutiveExplorationOnlyTurns < kMaxExplorationOnlyTurns) {
     return false;
+  }
+
+  static const int kMaxExplorationActionNudges = 1;
+  if (state.explorationActionNudgeCount < kMaxExplorationActionNudges &&
+      HasRecentToolActivity(ctx)) {
+    ++state.explorationActionNudgeCount;
+    Message nudge;
+    nudge.role = MessageRole::System;
+    nudge.uuid = "exploration-action-nudge";
+    nudge.isMeta = true;
+    std::string nudgeText =
+        "[system] You are stuck in an exploration loop. You already have enough "
+        "evidence from prior tool results. Stop using Read/Glob/Grep/LS/TodoWrite "
+        "for now and take ONE concrete action immediately:\n"
+        "1. Edit the relevant file to fix the bug you identified, or\n"
+        "2. Run a verification command that advances the task, or\n"
+        "3. If the work is blocked, provide a final answer that clearly states the "
+        "current blocker.\n\n"
+        "Do NOT spend more turns only exploring. Your next turn must use an action "
+        "tool (Write/FileWrite/FileEdit/MultiEdit/Bash/TaskCreate) or give a final "
+        "user-facing answer.";
+    if (!state.lastErrorSummary.empty()) {
+      nudgeText += "\n\nLatest known errors:\n" + state.lastErrorSummary;
+    }
+    nudge.content.push_back(ContentBlock::MakeText(nudgeText));
+    ctx.messages.push_back(nudge);
+    if (ctx.sessionManager) {
+      ctx.sessionManager->AppendMessageToTranscript(nudge);
+    }
+    state.assistantMessages.clear();
+    state.toolResultMessages.clear();
+    state.pendingFollowupMessages.clear();
+    state.toolUseBlocks.clear();
+    state.forceContinuation = true;
+    state.forceContinuationReason = "excessive_exploration";
+    state.stage = QueryStage::ToolResultBudget;
+    state.transition = TransitionReason::ForcedContinuation;
+    return true;
   }
 
   // Hard terminate: the model has spent too many turns only exploring.
@@ -1139,6 +1237,8 @@ bool QueryLoop::ShouldTerminateOnExcessiveExploration(
   if (ctx.sessionManager) {
     ctx.sessionManager->AppendMessageToTranscript(terminationMsg);
   }
+  state.completed = true;
+  state.terminalReason = "excessive_exploration";
   return true;
 }
 
@@ -1255,8 +1355,450 @@ void QueryLoop::AppendTurnArtifacts(
 
 void QueryLoop::PostToolTurnProcessing(QueryLoopContext& ctx,
                                        QueryLoopInternalState& state) {
-  (void)ctx;
-  (void)state;
+  // P0-2: Detect file write operations and inject verification nudge.
+  // After a file write (Write/FileWrite/FileEdit), the agent should run
+  // or verify the generated code before marking the task as done.
+  // This implements the "write-run-verify" closed loop.
+  //
+  // We scan ctx.messages for the most recent tool_use blocks (from the
+  // assistant messages just appended by ApplyStepRunTools) since
+  // state.toolUseBlocks has already been cleared.
+
+  bool hadFileWrite = false;
+  bool hadBashRun = false;
+
+  // Scan recent messages for tool_use blocks from the last turn.
+  // The assistant messages were just appended, so scan backwards.
+  int scanned = 0;
+  for (auto it = ctx.messages.rbegin();
+       it != ctx.messages.rend() && scanned < 10; ++it, ++scanned) {
+    if (it->role != MessageRole::Assistant) continue;
+    for (const auto& block : it->content) {
+      if (block.type != BlockType::ToolUse) continue;
+      const std::string& name = block.asToolUse.name;
+      if (name == "Write" || name == "FileWrite" || name == "FileEdit" ||
+          name == "NotebookEdit" || name == "MultiEdit") {
+        hadFileWrite = true;
+      }
+      if (name == "Bash") {
+        hadBashRun = true;
+      }
+    }
+    // Once we've found both or scanned enough, stop
+    if (hadFileWrite && hadBashRun) break;
+  }
+
+  if (hadFileWrite && !hadBashRun) {
+    ++state.consecutiveWriteWithoutVerifyCount;
+  } else if (hadBashRun) {
+    // Bash was run, which counts as verification
+    state.consecutiveWriteWithoutVerifyCount = 0;
+    state.verificationNudgeCount = 0;  // Reset nudge count after verification
+
+    // P0-3: Check Bash output for suspicious results that indicate the
+    // code ran but produced empty/wrong output. This catches cases like
+    // "0 characters extracted" where the code runs without errors but
+    // the result is clearly wrong.
+    //
+    // P1-5: Extract specific Python error messages from Bash output
+    // to include in the nudge, so the model knows exactly what to fix.
+    std::string bashOutput;
+    for (auto it = ctx.messages.rbegin();
+         it != ctx.messages.rend() && bashOutput.empty(); ++it) {
+      if (it->role != MessageRole::User) continue;
+      for (const auto& block : it->content) {
+        if (block.type != BlockType::ToolResult) continue;
+        // Only check non-error results (successful runs with bad output)
+        if (block.asToolResult.isError) continue;
+        bashOutput = block.asToolResult.content;
+        break;
+      }
+    }
+    // Detect suspicious output patterns: zero counts, empty results, etc.
+    if (!bashOutput.empty()) {
+      std::string lowerOutput = bashOutput;
+      std::transform(lowerOutput.begin(), lowerOutput.end(),
+                     lowerOutput.begin(),
+                     [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      bool suspiciousOutput = false;
+      std::string suspicionReason;
+      std::string specificError;
+      // Check for zero-count patterns (e.g., "0 个", "0 items", "no results")
+      if (lowerOutput.find("0 个") != std::string::npos ||
+          lowerOutput.find("0 items") != std::string::npos ||
+          lowerOutput.find("0 results") != std::string::npos ||
+          lowerOutput.find("0 characters") != std::string::npos ||
+          lowerOutput.find("no output") != std::string::npos ||
+          lowerOutput.find("empty result") != std::string::npos) {
+        suspiciousOutput = true;
+        suspicionReason = "The output contains zero/empty results, which "
+            "usually indicates a bug in the code.";
+      }
+      // Check for Python runtime errors in non-error output
+      // Extract specific error type and message for better diagnostics
+      if (!suspiciousOutput && (lowerOutput.find("traceback") != std::string::npos ||
+          lowerOutput.find("attributeerror") != std::string::npos ||
+          lowerOutput.find("nameerror") != std::string::npos ||
+          lowerOutput.find("importerror") != std::string::npos ||
+          lowerOutput.find("typeerror") != std::string::npos ||
+          lowerOutput.find("modulenotfounderror") != std::string::npos ||
+          lowerOutput.find("filenotfounderror") != std::string::npos)) {
+        suspiciousOutput = true;
+        suspicionReason = "The output contains Python runtime error messages, "
+            "even though the exit code was 0.";
+        // Extract the specific error line for targeted diagnostics
+        auto tracePos = bashOutput.find("Traceback");
+        if (tracePos == std::string::npos) {
+          tracePos = bashOutput.find("traceback");
+        }
+        if (tracePos != std::string::npos) {
+          // Find the last line which usually contains the actual error
+          size_t lastLineStart = tracePos;
+          size_t pos = tracePos;
+          while (pos < bashOutput.size()) {
+            size_t nextNL = bashOutput.find('\n', pos);
+            if (nextNL == std::string::npos) break;
+            pos = nextNL + 1;
+            if (pos < bashOutput.size() && bashOutput[pos] != ' ' &&
+                bashOutput[pos] != '\t') {
+              lastLineStart = pos;
+            }
+          }
+          // Find the actual error line (the last non-indented line of traceback)
+          std::string errorLine;
+          size_t errorStart = bashOutput.rfind('\n');
+          if (errorStart != std::string::npos && errorStart + 1 < bashOutput.size()) {
+            errorLine = bashOutput.substr(errorStart + 1);
+            // Trim trailing whitespace
+            while (!errorLine.empty() &&
+                   (errorLine.back() == '\n' || errorLine.back() == '\r' ||
+                    errorLine.back() == ' ')) {
+              errorLine.pop_back();
+            }
+          }
+          if (!errorLine.empty()) {
+            specificError = "The specific error is: " + errorLine;
+          }
+        }
+      }
+      if (suspiciousOutput && state.resultCheckNudgeCount < 2) {
+        ++state.resultCheckNudgeCount;
+        Message check;
+        check.role = MessageRole::System;
+        check.uuid = "result-check-nudge-"
+                     + std::to_string(state.resultCheckNudgeCount);
+        check.isMeta = true;
+        std::string nudgeText =
+            "[Result Check Required] The code ran but produced suspicious "
+            "output. " + suspicionReason + "\n";
+        if (!specificError.empty()) {
+          nudgeText += specificError + "\n\n";
+        } else {
+          nudgeText += "\n";
+        }
+        nudgeText +=
+            "You MUST:\n"
+            "1. Read the relevant module file(s) to understand the actual API\n"
+            "2. Fix the mismatch (method name, constructor signature, import, etc.)\n"
+            "3. Re-run the code after fixing\n"
+            "4. Do NOT proceed to the next task or mark this task as "
+            "completed until the output is correct";
+        check.content.push_back(ContentBlock::MakeText(nudgeText));
+        ctx.messages.push_back(check);
+        if (ctx.sessionManager) {
+          ctx.sessionManager->AppendMessageToTranscript(check);
+        }
+      }
+    }
+  } else if (!hadFileWrite) {
+    // Neither write nor bash - no change to counters
+  }
+
+  state.lastTurnHadFileWrite = hadFileWrite;
+
+  // P1-6: API consistency check after multi-module code generation.
+  // When the model writes multiple .py files and a main.py (or similar entry
+  // point), the main.py often calls methods with wrong names or signatures
+  // because the model generates modules independently. Inject a check to
+  // verify API consistency before running.
+  if (hadFileWrite && !hadBashRun) {
+    int pyFileCount = 0;
+    bool hasMainPy = false;
+    std::string mainPyName;
+    // Re-scan recent writes for .py files
+    scanned = 0;
+    for (auto it = ctx.messages.rbegin();
+         it != ctx.messages.rend() && scanned < 10; ++it, ++scanned) {
+      if (it->role != MessageRole::Assistant) continue;
+      for (const auto& block : it->content) {
+        if (block.type != BlockType::ToolUse) continue;
+        const std::string& name = block.asToolUse.name;
+        if (name != "Write" && name != "FileWrite" && name != "FileEdit" &&
+            name != "MultiEdit") continue;
+        // Check if the written file is a .py file
+        std::string filePath;
+        if (block.asToolUse.inputJson.find("\"file_path\"") != std::string::npos ||
+            block.asToolUse.inputJson.find("\"path\"") != std::string::npos) {
+          try {
+            auto j = json::parse(block.asToolUse.inputJson);
+            if (j.contains("file_path")) filePath = j["file_path"].get<std::string>();
+            else if (j.contains("path")) filePath = j["path"].get<std::string>();
+            else if (j.contains("new_str")) {
+              // For FileEdit, check the path field
+              if (j.contains("file_path")) filePath = j["file_path"].get<std::string>();
+            }
+          } catch (...) { continue; }
+        }
+        if (filePath.empty()) continue;
+        // Check if it's a .py file
+        std::string lowerPath = filePath;
+        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (lowerPath.size() < 3 || lowerPath.substr(lowerPath.size() - 3) != ".py") continue;
+        ++pyFileCount;
+        // Check if it's a main entry point
+        std::string fileName = filePath;
+        auto lastSep = fileName.find_last_of("/\\");
+        if (lastSep != std::string::npos) {
+          fileName = fileName.substr(lastSep + 1);
+        }
+        std::string lowerFile = fileName;
+        std::transform(lowerFile.begin(), lowerFile.end(), lowerFile.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (lowerFile == "main.py" || lowerFile == "run.py" ||
+            lowerFile == "app.py" || lowerFile == "start.py" ||
+            lowerFile.find("main") != std::string::npos) {
+          hasMainPy = true;
+          mainPyName = fileName;
+        }
+      }
+      if (pyFileCount >= 3) break;
+    }
+    // Inject API consistency check when multiple .py files + main.py detected
+    if (pyFileCount >= 3 && hasMainPy) {
+      Message apiCheck;
+      apiCheck.role = MessageRole::System;
+      apiCheck.uuid = "api-consistency-check";
+      apiCheck.isMeta = true;
+      apiCheck.content.push_back(ContentBlock::MakeText(
+          "[API Consistency Check] You have written " +
+          std::to_string(pyFileCount) + " Python modules including " +
+          mainPyName + ". Before running the code, verify API consistency:\n"
+          "1. Read each module's class definitions to find the EXACT method names\n"
+          "2. Read " + mainPyName + " and check that all method calls match the "
+          "actual class APIs\n"
+          "3. Check constructor signatures: does " + mainPyName +
+          " pass the correct number of arguments?\n"
+          "4. Check import statements: does the module actually exist?\n"
+          "5. Fix ALL mismatches in one pass before running\n\n"
+          "Common mistakes: calling extract_characters() when the method is "
+          "extract_all_characters(), passing wrong number of args to constructors, "
+          "importing from a module that doesn't exist. Do NOT guess method names - "
+          "READ the actual code."));
+      ctx.messages.push_back(apiCheck);
+      if (ctx.sessionManager) {
+        ctx.sessionManager->AppendMessageToTranscript(apiCheck);
+      }
+    }
+  }
+
+  // Inject verification nudge after file writes without subsequent run/verify.
+  // Only nudge up to 2 times to avoid infinite loops.
+  static const int kMaxVerificationNudges = 2;
+  static const int kWriteWithoutVerifyThreshold = 1;
+
+  if (state.consecutiveWriteWithoutVerifyCount >= kWriteWithoutVerifyThreshold &&
+      state.verificationNudgeCount < kMaxVerificationNudges) {
+    ++state.verificationNudgeCount;
+
+    Message nudge;
+    nudge.role = MessageRole::System;
+    nudge.uuid = "verification-nudge-" + std::to_string(state.verificationNudgeCount);
+    nudge.isMeta = true;
+
+    std::string nudgeText;
+    if (state.verificationNudgeCount == 1) {
+      nudgeText =
+          "[Verification Required] You just wrote/modified project files. "
+          "Before marking the task as completed, you MUST verify the code works:\n"
+          "1. If it's a script/program: run it with Bash and check the output\n"
+          "2. If it's a config: validate the syntax\n"
+          "3. If there are tests: run them\n"
+          "4. If it's a library: check it compiles/imports correctly\n\n"
+          "Do NOT mark the task as completed until you have verified the output.";
+    } else {
+      nudgeText =
+          "[Verification Still Required] You wrote files but have not yet "
+          "verified they work. Run the code or tests NOW using Bash. "
+          "Do not proceed to the next task without verifying.";
+    }
+
+    nudge.content.push_back(ContentBlock::MakeText(nudgeText));
+    ctx.messages.push_back(nudge);
+    if (ctx.sessionManager) {
+      ctx.sessionManager->AppendMessageToTranscript(nudge);
+    }
+  }
+
+  // P1-2: Error-driven repair loop.
+  // When tool execution produces errors, inject a repair guidance message
+  // to help the model diagnose and fix the issue instead of skipping it.
+  // P1-5: Extract specific error types for targeted repair guidance.
+  // P0-FIX: Filter out false-positive errors from benign exit code 1.
+  // Commands like "pip list | Select-String -Pattern 'sklearn'" return
+  // exit code 1 when no match is found, which is not a real error.
+  // We only count as errors if the output contains actual error indicators
+  // (Traceback, error messages, etc.) beyond just [exit code: 1].
+  int errorCount = 0;
+  std::string errorSummary;
+  std::string errorType;  // Track the dominant error type for targeted guidance
+  for (auto it = ctx.messages.rbegin();
+       it != ctx.messages.rend() && errorCount < 3; ++it) {
+    if (it->role != MessageRole::User) continue;  // Tool results are in User messages
+    for (const auto& block : it->content) {
+      if (block.type != BlockType::ToolResult) continue;
+      if (!block.asToolResult.isError) continue;
+      std::string errContent = block.asToolResult.content;
+      // P0-FIX: Skip benign exit code 1 from grep/Select-String patterns.
+      // These commands return exit code 1 when no match is found, which is
+      // expected behavior, not a real error. Check if the content has useful
+      // output and only contains "[exit code: 1]" as the error indicator.
+      std::string lowerContent = errContent;
+      std::transform(lowerContent.begin(), lowerContent.end(),
+                     lowerContent.begin(),
+                     [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      bool isBenignExitCode = false;
+      if (lowerContent.find("[exit code: 1]") != std::string::npos) {
+        // Check if the error is ONLY an exit code 1 without real error messages
+        bool hasRealError = false;
+        hasRealError = hasRealError ||
+            lowerContent.find("traceback") != std::string::npos;
+        hasRealError = hasRealError ||
+            lowerContent.find("error:") != std::string::npos;
+        hasRealError = hasRealError ||
+            lowerContent.find("exception") != std::string::npos;
+        hasRealError = hasRealError ||
+            lowerContent.find("cannot") != std::string::npos;
+        hasRealError = hasRealError ||
+            lowerContent.find("failed") != std::string::npos;
+        hasRealError = hasRealError ||
+            lowerContent.find("denied") != std::string::npos;
+        hasRealError = hasRealError ||
+            lowerContent.find("not found") != std::string::npos;
+        hasRealError = hasRealError ||
+            lowerContent.find("no such file") != std::string::npos;
+        // Also check if the content before the exit code is empty (real error)
+        size_t exitPos = lowerContent.find("[exit code:");
+        std::string beforeExit = (exitPos != std::string::npos)
+            ? lowerContent.substr(0, exitPos) : lowerContent;
+        // Trim whitespace
+        while (!beforeExit.empty() &&
+               (beforeExit.back() == ' ' || beforeExit.back() == '\n' ||
+                beforeExit.back() == '\r' || beforeExit.back() == '\t')) {
+          beforeExit.pop_back();
+        }
+        isBenignExitCode = !hasRealError && !beforeExit.empty();
+      }
+      if (isBenignExitCode) continue;  // Skip benign exit code 1
+      ++errorCount;
+      // Detect Python error type for targeted guidance
+      if (errorType.empty()) {
+        if (lowerContent.find("attributeerror") != std::string::npos)
+          errorType = "AttributeError";
+        else if (lowerContent.find("nameerror") != std::string::npos)
+          errorType = "NameError";
+        else if (lowerContent.find("importerror") != std::string::npos ||
+                 lowerContent.find("modulenotfounderror") != std::string::npos)
+          errorType = "ImportError";
+        else if (lowerContent.find("typeerror") != std::string::npos)
+          errorType = "TypeError";
+        else if (lowerContent.find("syntaxerror") != std::string::npos)
+          errorType = "SyntaxError";
+      }
+      if (errContent.size() > 200) {
+        errContent = errContent.substr(0, 200) + "...";
+      }
+      if (!errorSummary.empty()) errorSummary += "\n";
+      errorSummary += "- " + errContent;
+    }
+  }
+
+  state.lastTurnErrorCount = errorCount;
+  if (errorCount > 0) {
+    ++state.consecutiveErrorTurns;
+    state.lastErrorSummary = errorSummary;
+  } else {
+    state.consecutiveErrorTurns = 0;
+    state.lastErrorSummary.clear();
+  }
+
+  // Inject repair guidance when errors occur, but limit to avoid loops.
+  static const int kMaxRepairNudges = 3;
+  if (errorCount > 0 && state.consecutiveErrorTurns <= kMaxRepairNudges) {
+    Message repair;
+    repair.role = MessageRole::System;
+    repair.uuid = "error-repair-nudge-" + std::to_string(state.consecutiveErrorTurns);
+    repair.isMeta = true;
+
+    std::string repairText;
+    if (state.consecutiveErrorTurns == 1) {
+      repairText =
+          "[Error Detected] Tool execution produced errors. ";
+      if (!errorType.empty()) {
+        repairText += "The error type is " + errorType + ". ";
+      }
+      repairText +=
+          "You MUST diagnose and fix the error before proceeding:\n"
+          "1. Read the error message carefully\n"
+          "2. If the error is about a missing method/attribute: READ the relevant "
+          "source file to find the correct API, then fix the mismatch\n"
+          "3. If the error is about a missing import: check which module actually "
+          "contains the class/function\n"
+          "4. Fix the issue using Edit or Write tool\n"
+          "5. Re-run to verify the fix works\n\n"
+          "Errors encountered:\n" + errorSummary;
+    } else if (state.consecutiveErrorTurns == 2) {
+      repairText =
+          "[Error Persists - 2nd occurrence] You have had errors for " +
+          std::to_string(state.consecutiveErrorTurns) +
+          " consecutive turns. ";
+      if (!errorType.empty()) {
+        repairText += "The same " + errorType + " is occurring repeatedly. ";
+      }
+      repairText +=
+          "Your previous fix was likely incorrect. Try a different approach:\n"
+          "1. READ the actual source file(s) to understand the real API (method names, "
+          "constructor signatures, attribute names)\n"
+          "2. Compare your calling code against the actual class definitions\n"
+          "3. Fix ALL discovered mismatches, not just the first one\n"
+          "4. Do NOT guess method names - look at the actual code\n\n"
+          "Latest errors:\n" + errorSummary;
+    } else {
+      repairText =
+          "[Error Persists - " + std::to_string(state.consecutiveErrorTurns) +
+          "rd occurrence] You have had errors for " +
+          std::to_string(state.consecutiveErrorTurns) +
+          " consecutive turns. ";
+      if (!errorType.empty()) {
+        repairText += "The same " + errorType + " still occurs. ";
+      }
+      repairText +=
+          "Your approach is fundamentally not working. CRITICAL:\n"
+          "1. STOP guessing. READ the actual source file(s) to understand the code\n"
+          "2. Consider: the method/attribute/import you're trying to use may NOT EXIST\n"
+          "3. Try a completely different approach: instead of fixing the caller, add "
+          "the missing method/attribute to the module, or restructure the code\n"
+          "4. If the error is in an orchestration script (main.py), read every module "
+          "it imports and verify ALL API calls match actual class definitions\n\n"
+          "Latest errors:\n" + errorSummary;
+    }
+
+    repair.content.push_back(ContentBlock::MakeText(repairText));
+    ctx.messages.push_back(repair);
+    if (ctx.sessionManager) {
+      ctx.sessionManager->AppendMessageToTranscript(repair);
+    }
+  }
 }
 
 bool QueryLoop::ContinueWithFollowup(QueryLoopContext& ctx,
@@ -1341,34 +1883,79 @@ std::vector<Message> QueryLoop::DoCollapseCompact(
     const std::vector<Message>& input, int keepRecent) {
   std::vector<Message> result;
 
+  // P0-FIX: Always preserve the original user message (first User-role message).
+  // Without this, the LLM loses the original task description after collapse,
+  // causing context confusion, "The user hasn't asked me anything new" behavior,
+  // and eventual termination due to exploration loops or empty responses.
+  // The original user prompt is the anchor of the entire conversation.
+  int firstUserIdx = -1;
+  for (int i = 0; i < static_cast<int>(input.size()); ++i) {
+    if (input[i].role == MessageRole::User && !input[i].isMeta) {
+      firstUserIdx = i;
+      break;
+    }
+  }
+
   if (keepRecent < 0) {
     std::size_t half = input.size() / 2;
     if (half < 1) half = 1;
+
+    // Preserve the original user message
+    if (firstUserIdx >= 0 &&
+        firstUserIdx < static_cast<int>(input.size() - half)) {
+      result.push_back(input[firstUserIdx]);
+    }
+
     Message boundary;
     boundary.role = MessageRole::System;
     boundary.uuid = "collapse-boundary";
     boundary.isMeta = true;
     boundary.content.push_back(ContentBlock::MakeText(
-        "[Context Collapse] Earlier conversation archived."));
+        "[Context Collapse] Earlier conversation archived. "
+        "The original user request is preserved above."));
     result.push_back(boundary);
-    result.insert(result.end(), input.begin() + input.size() - half,
-                  input.end());
+
+    auto recentStart = input.begin() + input.size() - half;
+    for (auto it = recentStart; it != input.end(); ++it) {
+      // Skip the original user message if it was already added
+      if (firstUserIdx >= 0 && it == input.begin() + firstUserIdx) continue;
+      result.push_back(*it);
+    }
     return result;
   }
 
   auto start = input.begin();
   if (keepRecent > 0 && static_cast<int>(input.size()) > keepRecent)
     start = input.end() - keepRecent;
-  if (start != input.begin()) {
+
+  bool needsBoundary = (start != input.begin());
+  bool userPreserved = false;
+
+  // Preserve the original user message before the boundary
+  if (firstUserIdx >= 0 &&
+      start > input.begin() + firstUserIdx) {
+    result.push_back(input[firstUserIdx]);
+    userPreserved = true;
+  }
+
+  if (needsBoundary) {
     Message boundary;
     boundary.role = MessageRole::System;
     boundary.uuid = "collapse-boundary";
     boundary.isMeta = true;
     boundary.content.push_back(ContentBlock::MakeText(
-        "[Context Collapse] Earlier conversation archived."));
+        "[Context Collapse] Earlier conversation archived. "
+        + std::string(userPreserved
+            ? "Original user request preserved above."
+            : "")));
     result.push_back(boundary);
   }
-  result.insert(result.end(), start, input.end());
+
+  for (auto it = start; it != input.end(); ++it) {
+    if (userPreserved && firstUserIdx >= 0 &&
+        it == input.begin() + firstUserIdx) continue;
+    result.push_back(*it);
+  }
   return result;
 }
 
@@ -1551,6 +2138,28 @@ void QueryLoop::ApplyStepCollapse(QueryLoopContext& ctx,
     keepRecent =
         std::max(5, static_cast<int>(state.messagesForTurn.size()) / 2);
   }
+  // P0-FIX: Ensure keepRecent covers the original user message.
+  // Find the first non-meta User message to verify it won't be dropped.
+  int firstUserMsgIdx = -1;
+  for (int i = 0; i < static_cast<int>(state.messagesForTurn.size()); ++i) {
+    if (state.messagesForTurn[i].role == MessageRole::User &&
+        !state.messagesForTurn[i].isMeta) {
+      firstUserMsgIdx = i;
+      break;
+    }
+  }
+  int messagesAfterKeep = static_cast<int>(state.messagesForTurn.size()) - keepRecent;
+  if (firstUserMsgIdx >= 0 && firstUserMsgIdx < messagesAfterKeep) {
+    ReportQueryLoopDebugEvent(
+        "3", "QueryLoop.cpp:collapse:user-preserved",
+        "[DEBUG] Collapse would drop user message; extending keepRecent",
+        {{"firstUserMsgIdx", firstUserMsgIdx},
+         {"messagesAfterKeep", messagesAfterKeep},
+         {"oldKeepRecent", keepRecent}},
+        MakeQueryLoopTraceId("collapse-guard"));
+    // Extend keepRecent to include the user message
+    keepRecent = static_cast<int>(state.messagesForTurn.size()) - firstUserMsgIdx;
+  }
   state.messagesForTurn = DoCollapseCompact(state.messagesForTurn, keepRecent);
   if (ctx.hookExecutor != nullptr) {
     ctx.hookExecutor->RunPostCompactHooks(
@@ -1612,7 +2221,22 @@ bool QueryLoop::ApplyStepAutocompact(QueryLoopContext& ctx,
   summary.isMeta = true;
   summary.content.push_back(ContentBlock::MakeText(summaryText));
 
+  // P0-FIX: Always preserve the original user message (first non-meta User message).
+  // Without this, autocompact can lose the task description when the user message
+  // is beyond the keepCount window, causing the LLM to forget what it was asked to do.
   size_t keepCount = std::min<size_t>(3, state.messagesForTurn.size());
+  int firstUserIdx = -1;
+  for (int i = 0; i < static_cast<int>(state.messagesForTurn.size()); ++i) {
+    if (state.messagesForTurn[i].role == MessageRole::User &&
+        !state.messagesForTurn[i].isMeta) {
+      firstUserIdx = i;
+      break;
+    }
+  }
+  // Ensure keepCount covers the user message
+  if (firstUserIdx >= 0 && static_cast<size_t>(firstUserIdx) >= keepCount) {
+    keepCount = static_cast<size_t>(firstUserIdx) + 1;
+  }
   std::vector<Message> compacted;
   for (size_t i = 0; i < keepCount; ++i)
     compacted.push_back(state.messagesForTurn[i]);
@@ -2203,6 +2827,41 @@ bool QueryLoop::ApplyStepTerminate(QueryLoopContext& ctx,
                                    QueryLoopInternalState& state) {
   state.toolUseBlocks = CollectToolUseBlocks(state.assistantMessages);
   if (state.toolUseBlocks.empty()) {
+    // P0-3: Before terminating, check if the session has written files
+    // but never verified them. If so, inject a final completion nudge
+    // to give the model one last chance to run/test/verify.
+    // This prevents the "wrote files then silently exited" pattern.
+    static const int kMaxCompletionNudges = 1;
+    if (state.consecutiveWriteWithoutVerifyCount > 0 &&
+        state.completionNudgeCount < kMaxCompletionNudges &&
+        HasRecentToolActivity(ctx)) {
+      ++state.completionNudgeCount;
+      ReportQueryLoopDebugEvent(
+          "3", "QueryLoop.cpp:terminate:completion-nudge",
+          "[DEBUG] Injecting completion nudge before termination",
+          {{"turnCount", state.turnCount},
+           {"consecutiveWriteWithoutVerifyCount",
+            state.consecutiveWriteWithoutVerifyCount},
+           {"completionNudgeCount", state.completionNudgeCount}},
+          MakeQueryLoopTraceId("completion-nudge"));
+
+      Message nudge;
+      nudge.role = MessageRole::User;
+      nudge.uuid = "completion-nudge-"
+                   + std::to_string(state.completionNudgeCount);
+      nudge.isMeta = true;
+      nudge.content.push_back(ContentBlock::MakeText(
+          "[system] You are about to finish, but you wrote project files "
+          "without verifying them. You MUST run the code or tests NOW. "
+          "Use Bash to execute the main script or run tests. If there are "
+          "errors, fix them and re-run. Do not end the session without "
+          "verification."));
+      std::vector<Message> nudgeFollowups = {nudge};
+      return ContinueWithFollowup(
+          ctx, state, nudgeFollowups,
+          TransitionReason::ForcedContinuation, false);
+    }
+
     AppendTurnArtifacts(
         ctx, state.assistantMessages, state.toolResultMessages,
         state.pendingFollowupMessages);
@@ -2216,21 +2875,6 @@ bool QueryLoop::ApplyStepTerminate(QueryLoopContext& ctx,
     return false;
   }
   return true;
-}
-
-// Check if the conversation history contains recent tool_result blocks,
-// indicating the model was actively using tools before this no-tool response.
-static bool HasRecentToolActivity(const QueryLoopContext& ctx) {
-  // Scan the last N messages for tool_result content blocks
-  const int msgCount = static_cast<int>(ctx.messages.size());
-  const int scanWindow = (msgCount < 20) ? msgCount : 20;
-  const int start = msgCount - scanWindow;
-  for (int i = start; i < msgCount; ++i) {
-    for (const auto& block : ctx.messages[i].content) {
-      if (block.type == BlockType::ToolResult) return true;
-    }
-  }
-  return false;
 }
 
 bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
@@ -2255,6 +2899,8 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
       state.validatorRetryCount >= kMaxValidatorRetryContinuations) {
     if (state.validatorNudgeCount >= 1) {
       // Already nudged once without improvement - hard-terminate
+      // But first, check if there are unverified file writes and inject
+      // a final summary request so the user knows what was done vs not done.
       Message note;
       note.role = MessageRole::System;
       note.uuid = "validator-retry-limit";
@@ -2267,6 +2913,15 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
           " and surface the current state.";
       if (!state.lastValidatorGuidance.empty()) {
         text += " Latest guidance: " + state.lastValidatorGuidance;
+      }
+      // P0-3: Add explicit reminder about what was NOT verified
+      if (state.consecutiveWriteWithoutVerifyCount > 0) {
+        text += "\n\nIMPORTANT: You wrote project files but did NOT verify "
+            "them. Before ending, provide a clear summary of:\n"
+            "1. What files were created/modified\n"
+            "2. What was NOT verified (not run, not tested)\n"
+            "3. What errors were encountered but not fixed\n"
+            "Do NOT claim the work is complete if you have not verified it.";
       }
       note.content.push_back(ContentBlock::MakeText(text));
       AppendTurnArtifacts(
@@ -2377,11 +3032,40 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
   // --- Bounded continuation nudge (aligned with local-ace max_output_tokens
   // recovery). When the model was actively using tools and then stops with
   // text-only output (no tool_use), it likely hit a generation limit rather
-  // than genuinely finishing. Inject a short "resume" nudge, capped at 3
-  // attempts to prevent death spirals.
-  static const int kMaxNoToolNudges = 3;
+  // than genuinely finishing. Inject a short "resume" nudge, capped at 5
+  // attempts to prevent death spirals. Increased from 3 to 5 for weaker
+  // models (Qwen 3.6 35b) that need more directive prompting.
+  static const int kMaxNoToolNudges = 5;
   const bool hasPriorToolActivity = HasRecentToolActivity(ctx);
   const bool modelProducedText = !CollectText(state.assistantMessages).empty();
+
+  // Task 4: Detect recent edit failures to inject specific re-read guidance
+  bool hasRecentEditFailures = false;
+  int recentEditFailCount = 0;
+  {
+    int scanStart = std::max(0, static_cast<int>(ctx.messages.size()) - 6);
+    for (int i = scanStart; i < static_cast<int>(ctx.messages.size()); ++i) {
+      const auto& msg = ctx.messages[i];
+      if (msg.role == MessageRole::User && msg.isMeta) continue;
+      for (const auto& block : msg.content) {
+        if (block.type == BlockType::Text) {
+          const std::string& text = block.asText.text;
+          if (text.find("search string not found") != std::string::npos ||
+              text.find("Error: cannot read file") != std::string::npos ||
+              text.find("old_string") != std::string::npos) {
+            ++recentEditFailCount;
+          }
+        }
+        if (block.type == BlockType::ToolResult && block.asToolResult.isError) {
+          if (block.asToolResult.content.find("search string not found") != std::string::npos ||
+              block.asToolResult.content.find("not found") != std::string::npos) {
+            ++recentEditFailCount;
+          }
+        }
+      }
+    }
+    hasRecentEditFailures = (recentEditFailCount >= 2);
+  }
 
   if (hasPriorToolActivity && modelProducedText &&
       state.missingToolUsePromptCount < kMaxNoToolNudges) {
@@ -2401,22 +3085,41 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
     nudge.isMeta = true;
     // Escalating nudge messages (aligned with local-ace max_output_tokens
     // recovery). Later nudges are more directive to break the model out of
-    // text-only planning loops.
+    // text-only planning loops. Weaker models need explicit tool directives.
     std::string nudgeText;
-    if (state.missingToolUsePromptCount <= 1) {
+    if (hasRecentEditFailures) {
+      // Special case: recent edit failures detected - guide the model to
+      // re-read the file before retrying the edit
+      nudgeText =
+          "[system] Your recent file edits FAILED because old_string did not match.\n"
+          "You MUST do the following BEFORE retrying any edit:\n"
+          "1. Use Read to get the CURRENT content of the file that failed to edit\n"
+          "2. Copy the EXACT text from the Read output that you want to replace\n"
+          "3. Use Edit with the correctly copied old_string\n"
+          "Do NOT guess the file content. Do NOT describe what you will do. "
+          "Execute the Read tool call NOW.";
+    } else if (state.missingToolUsePromptCount <= 2) {
       nudgeText =
           "[system] Your previous response ended without a tool call. "
           "Resume directly - no apology, no recap of what you were doing. "
           "Pick up mid-thought if that is where the cut happened. "
-          "Break remaining work into smaller pieces.";
-    } else {
+          "Break remaining work into smaller pieces. "
+          "Emit a tool call immediately.";
+    } else if (state.missingToolUsePromptCount <= 4) {
       // Stronger directive for repeated failures
       nudgeText =
           "[system] You keep describing what you will do instead of doing it. "
-          "STOP planning. Emit a Write tool call NOW for the next file. "
-          "If the file is large, create a skeleton first with class/function "
-          "stubs, then use Write to add implementation in separate calls. "
-          "Do NOT describe the file content in text - just write it.";
+          "STOP planning. Emit a tool call NOW.\n"
+          "If editing a file: first Read it, then Edit with exact old_string.\n"
+          "If writing a file: use Write with the full content.\n"
+          "Do NOT describe the file content in text - just call the tool.";
+    } else {
+      // Final nudge: verify completion or continue
+      nudgeText =
+          "[system] FINAL NOTICE: Either the task is complete or you must "
+          "take action. If complete, provide a brief summary of what was done. "
+          "If NOT complete, emit a tool call IMMEDIATELY to continue work. "
+          "Do not repeat plans or reasoning.";
     }
     nudge.content.push_back(ContentBlock::MakeText(nudgeText));
     std::vector<Message> nudgeFollowups = {nudge};
@@ -2488,6 +3191,18 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
           continue;
         }
         ApplyStepBudget(ctx, state);
+        // Emit context usage update event for TUI display
+        {
+          const int estimatedTokens = EstimateMessageTokens(state.messagesForTurn);
+          const int contextWindow = GetContextWindowForFamily(ctx.model);
+          if (ctx.eventCallback) {
+            QueryLoopEvent usageEvent;
+            usageEvent.type = QueryLoopEvent::Type::ContextUsageUpdate;
+            usageEvent.estimatedTokens = estimatedTokens;
+            usageEvent.contextWindow = contextWindow;
+            ctx.eventCallback(usageEvent);
+          }
+        }
         // First-iteration fast path: skip compact stages when context is
         // trivially small. Aligned with local-ace where snip/microcompact/
         // collapse/autocompact all no-op on first turn because their
@@ -2663,11 +3378,7 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
       }
       case QueryStage::RunTools: {
         // P0-FIX: Check for excessive exploration-only turns
-        if (ShouldTerminateOnExcessiveExploration(ctx, state)) {
-          state.completed = true;
-          state.terminalReason = "excessive_exploration";
-          continue;
-        }
+        if (HandleExcessiveExploration(ctx, state)) continue;
         // P0-02: Check for duplicate tool call loops
         if (ShouldTerminateOnDuplicates(ctx, state)) {
           state.completed = true;

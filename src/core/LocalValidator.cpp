@@ -251,6 +251,55 @@ LocalValidationResult RunLocalToolValidation(const ValidationContext& context) {
     }
   }
 
+  // P1-3: Check for TodoWrite with all completed tasks but no verification step.
+  // This mirrors local-ace's verificationNudgeNeeded mechanism.
+  for (const auto& block : context.toolUseBlocks) {
+    if (block.type != BlockType::ToolUse) continue;
+    if (block.asToolUse.name != "TodoWrite") continue;
+
+    // Parse the todos from the input
+    try {
+      auto j = json::parse(block.asToolUse.inputJson);
+      auto todos = j.value("todos", json::array());
+      if (!todos.is_array() || todos.size() < 3) continue;
+
+      bool allCompleted = true;
+      bool hasVerificationStep = false;
+      for (const auto& todo : todos) {
+        std::string status = todo.value("status", std::string());
+        std::string content = todo.value("content",
+            todo.value("subject", std::string()));
+        if (status != "completed") {
+          allCompleted = false;
+        }
+        // Check for verification-related keywords
+        std::string lowerContent = content;
+        std::transform(lowerContent.begin(), lowerContent.end(),
+                       lowerContent.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (lowerContent.find("verif") != std::string::npos ||
+            lowerContent.find("test") != std::string::npos ||
+            lowerContent.find("run") != std::string::npos ||
+            lowerContent.find("check") != std::string::npos ||
+            lowerContent.find("build") != std::string::npos) {
+          hasVerificationStep = true;
+        }
+      }
+
+      if (allCompleted && !hasVerificationStep) {
+        result.ruleHits.push_back({
+          "no_verification_step", "warn",
+          "All tasks completed but none involves verification (run/test/check/build). "
+          "Consider adding a verification step before reporting completion."
+        });
+        // Note: We only warn, not block. The actual nudge is handled by
+        // ExecuteTodoWrite in ToolOrchestrator.cpp.
+      }
+    } catch (...) {
+      continue;
+    }
+  }
+
   return result;
 }
 
