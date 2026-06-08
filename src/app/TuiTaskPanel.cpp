@@ -4,7 +4,14 @@
 
 #include <algorithm>
 #include <fstream>
+#include <mutex>
 #include <sstream>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/stat.h>
+#endif
 
 using json = nlohmann::json;
 
@@ -36,9 +43,46 @@ const char* StatusIcon(const TuiTaskItem& item) {
 
 }  // namespace
 
+namespace {
+
+// Get file modification time as a 64-bit value for cache invalidation.
+// Returns 0 if the file doesn't exist.
+uint64_t GetFileModTime(const std::string& path) {
+#ifdef _WIN32
+  WIN32_FILE_ATTRIBUTE_DATA fad;
+  if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fad))
+    return 0;
+  return (static_cast<uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32)
+      | fad.ftLastWriteTime.dwLowDateTime;
+#else
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0) return 0;
+  return static_cast<uint64_t>(st.st_mtime);
+#endif
+}
+
+}  // namespace
+
 TuiTaskPanelData LoadTuiTaskPanelData(const std::string& taskStorePath) {
+  // Cache: avoid re-reading the file from disk on every refresh.
+  // Only re-read when the file's modification time has changed.
+  static std::mutex s_cacheMutex;
+  static std::string s_cachedPath;
+  static uint64_t s_cachedModTime = 0;
+  static TuiTaskPanelData s_cachedData;
+
+  if (taskStorePath.empty()) return {};
+
+  {
+    std::lock_guard<std::mutex> lock(s_cacheMutex);
+    uint64_t modTime = GetFileModTime(taskStorePath);
+    if (modTime != 0 && taskStorePath == s_cachedPath
+        && modTime == s_cachedModTime) {
+      return s_cachedData;
+    }
+  }
+
   TuiTaskPanelData data;
-  if (taskStorePath.empty()) return data;
 
   std::ifstream input(taskStorePath, std::ios::binary);
   if (!input) return data;
@@ -85,6 +129,15 @@ TuiTaskPanelData LoadTuiTaskPanelData(const std::string& taskStorePath) {
               if (lhsRank != rhsRank) return lhsRank < rhsRank;
               return lhs.id < rhs.id;
             });
+
+  // Update cache
+  {
+    std::lock_guard<std::mutex> lock(s_cacheMutex);
+    s_cachedPath = taskStorePath;
+    s_cachedModTime = GetFileModTime(taskStorePath);
+    s_cachedData = data;
+  }
+
   return data;
 }
 

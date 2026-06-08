@@ -10,14 +10,34 @@ namespace infra {
 
 namespace {
 
-std::string ReadFromPipe(HANDLE pipeHandle) {
+// Read from pipe with a timeout to prevent blocking indefinitely when child
+// processes (e.g., python spawned by PowerShell) hold the pipe write handle.
+// Uses PeekNamedPipe polling since CreatePipe handles don't support overlapped I/O.
+std::string ReadFromPipe(HANDLE pipeHandle, DWORD timeoutMs = 5000) {
   std::string output;
   char buffer[4096];
-  DWORD bytesRead = 0;
 
-  while (ReadFile(pipeHandle, buffer, sizeof(buffer), &bytesRead, nullptr) &&
-         bytesRead > 0) {
-    output.append(buffer, buffer + bytesRead);
+  auto startTime = GetTickCount64();
+  for (;;) {
+    DWORD bytesAvailable = 0;
+    if (!PeekNamedPipe(pipeHandle, nullptr, 0, nullptr, &bytesAvailable, nullptr)) {
+      // Pipe broken or error — stop reading
+      break;
+    }
+    if (bytesAvailable > 0) {
+      DWORD bytesRead = 0;
+      DWORD toRead = (bytesAvailable < sizeof(buffer)) ? bytesAvailable : sizeof(buffer);
+      if (!ReadFile(pipeHandle, buffer, toRead, &bytesRead, nullptr) || bytesRead == 0) {
+        break;
+      }
+      output.append(buffer, buffer + bytesRead);
+      // Reset the timer since we're still getting data
+      startTime = GetTickCount64();
+    } else {
+      // No data available — check if we've exceeded the timeout
+      if (GetTickCount64() - startTime > timeoutMs) break;
+      Sleep(10);  // Brief sleep to avoid busy-wait
+    }
   }
 
   return output;

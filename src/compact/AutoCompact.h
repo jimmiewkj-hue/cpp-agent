@@ -26,7 +26,8 @@ struct AutoCompactConfig {
   static constexpr int kErrorThresholdBufferTokens = 20000;
   static constexpr int kManualCompactBufferTokens = 3000;
   static constexpr int kMaxConsecutiveAutocompactFailures = 3;
-  static constexpr int kContextWindowDefault = 200000;
+  // kContextWindowDefault removed: context window is now model-aware via
+  // GetContextWindowForFamily() in AgentTypes.h (aligned with local-ace).
 };
 
 // Get the effective context window size (window - output tokens).

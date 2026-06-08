@@ -29,11 +29,14 @@ namespace core {
 
 static const int kAutoCompactMaxFailures = 3;
 static const int kMaxOutputTokensRecoveryLimit = 3;
-static const int kContextWindow = 200000;
+// kContextWindow removed: now uses model-aware GetContextWindowForFamily()
 static const int kMaxOutputTokensForSummary = 20000;
 static const int kAutoCompactBufferTokens = 13000;
 static const int kPerMessageBudgetLimit = 600000;
 static const int kMicroCompactOldMarkerBytes = 64;
+// System prompt + tool schema token overhead estimation.
+// local-ace counts these separately; we approximate as a flat overhead.
+static const int kSystemOverheadTokens = 2000;
 static const int kEscalatedMaxTokens = 65536;
 static const int kMaxOutputTokensDefault = 8192;  // aligned with local-ace CAPPED_DEFAULT_MAX_TOKENS
 static const int kMicroCompactAgeMs = 5 * 60 * 1000;
@@ -2032,8 +2035,9 @@ void QueryLoop::ApplyStepMicrocompact(QueryLoopContext& ctx,
   (void)ctx;
   // Guard: skip when too few messages to have meaningful old tool results.
   // Aligned with local-ace's microcompact which returns early when no
-  // compactable tool results exist.
-  if (state.messagesForTurn.size() < 4) return;
+  // compactable tool results exist. Raised from 4 to 10 to avoid premature
+  // compaction on short conversations.
+  if (state.messagesForTurn.size() < 10) return;
   const long long now = CurrentTimeMs();
 
   // Build a map from tool_use_id to tool name by scanning all messages
@@ -2121,7 +2125,8 @@ void QueryLoop::ApplyStepCollapse(QueryLoopContext& ctx,
   // - threshold raised to 95% of context window (last resort only)
   // - Added model-aware context window calculation
   if (state.messagesForTurn.size() < 30) return;
-  const int estimatedTokens = EstimateMessageTokens(state.messagesForTurn);
+  const int estimatedTokens = EstimateMessageTokens(state.messagesForTurn)
+      + kSystemOverheadTokens;
   const int contextWindow = GetContextWindowForFamily(ctx.model);
   // Last-resort threshold: 95% of effective context window.
   // This ensures collapse only fires when autoCompact hasn't kept up.
@@ -2181,7 +2186,8 @@ bool QueryLoop::ApplyStepAutocompact(QueryLoopContext& ctx,
       (ctx.querySource == "compact" || ctx.querySource == "session_memory")) {
     return false;
   }
-  const int estimatedTokens = EstimateMessageTokens(state.messagesForTurn);
+  const int estimatedTokens = EstimateMessageTokens(state.messagesForTurn)
+      + kSystemOverheadTokens;
   // Use model-aware context window instead of hardcoded 200k
   const int contextWindow = GetContextWindowForFamily(ctx.model);
   const int threshold =
@@ -2195,8 +2201,10 @@ bool QueryLoop::ApplyStepAutocompact(QueryLoopContext& ctx,
         "autocompact", beforeCount, 15000);
   }
 
-  std::vector<Message> compactInput;
-  compactInput.push_back(state.messagesForTurn.back());
+  // Aligned with local-ace compactConversation: send the full message history
+  // to the compact LLM so it can produce a meaningful summary. Previously only
+  // the last message was sent, which produced a useless summary.
+  std::vector<Message> compactInput = state.messagesForTurn;
 
   std::vector<Message> summaryResponse =
       modelClient_.GenerateResponse(compactInput,
@@ -3193,7 +3201,8 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
         ApplyStepBudget(ctx, state);
         // Emit context usage update event for TUI display
         {
-          const int estimatedTokens = EstimateMessageTokens(state.messagesForTurn);
+          const int estimatedTokens = EstimateMessageTokens(state.messagesForTurn)
+              + kSystemOverheadTokens;
           const int contextWindow = GetContextWindowForFamily(ctx.model);
           if (ctx.eventCallback) {
             QueryLoopEvent usageEvent;
@@ -3203,14 +3212,22 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
             ctx.eventCallback(usageEvent);
           }
         }
-        // First-iteration fast path: skip compact stages when context is
-        // trivially small. Aligned with local-ace where snip/microcompact/
-        // collapse/autocompact all no-op on first turn because their
-        // threshold checks (token count, message count) are not met.
+        // Fast path: skip compact stages when context is trivially small.
+        // Aligned with local-ace where snip/microcompact/collapse/autocompact
+        // all no-op on early turns because their threshold checks (token count,
+        // message count) are not met. Extended to first 3 iterations OR when
+        // message count is below 20, since a single user query + system prompt
+        // should not trigger any compaction.
         const int msgCount = static_cast<int>(state.messagesForTurn.size());
-        const bool isFirstIteration = (state.modelCallCount == 0);
-        const bool contextIsSmall = (msgCount < 10);
-        if (isFirstIteration && contextIsSmall) {
+        const bool isEarlyIteration = (state.modelCallCount < 3);
+        const bool contextIsSmall = (msgCount < 20);
+        if ((isEarlyIteration || contextIsSmall) &&
+            state.modelCallCount == 0) {
+          state.stage = QueryStage::ModelCall;
+          continue;
+        }
+        // Also skip all compact stages when context is still small
+        if (contextIsSmall) {
           state.stage = QueryStage::ModelCall;
           continue;
         }

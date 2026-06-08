@@ -2116,6 +2116,18 @@ std::string ToolOrchestrator::ExecuteBash(const std::string& inputJson,
     return std::string();
   }
 
+  // Parse optional per-call timeout (ms) from LLM input, aligned with local-ace.
+  // Falls back to the global bashTimeoutMs_ if not specified.
+  int callTimeoutMs = JsonGetInt(inputJson, "timeout", 0);
+  if (callTimeoutMs <= 0) {
+    // Also try "is_background" boolean: background commands get a longer default timeout
+    callTimeoutMs = bashTimeoutMs_;
+  } else {
+    // Clamp to [5s, 600s] to prevent abuse
+    if (callTimeoutMs < 5000) callTimeoutMs = 5000;
+    if (callTimeoutMs > 600000) callTimeoutMs = 600000;
+  }
+
   const std::string normalizedCommand = NormalizeWindowsShellCommand(command);
 
   infra::ProcessRunOptions options;
@@ -2124,7 +2136,7 @@ std::string ToolOrchestrator::ExecuteBash(const std::string& inputJson,
   if (!workspaceRoot_.empty()) {
     options.workingDirectory = workspaceRoot_;
   }
-  options.timeoutMs = bashTimeoutMs_;
+  options.timeoutMs = static_cast<unsigned long>(callTimeoutMs);
 
   infra::ProcessRunResult result = processRunner_.Run(options);
 
@@ -2136,8 +2148,8 @@ std::string ToolOrchestrator::ExecuteBash(const std::string& inputJson,
     if (error) *error = result.errorMessage;
     output << "Error: " << result.errorMessage;
   } else if (result.timedOut) {
-    if (error) *error = "command timed out after " + std::to_string(bashTimeoutMs_ / 1000) + "s";
-    output << "Error: command timed out after " << (bashTimeoutMs_ / 1000) << "s\n";
+    if (error) *error = "command timed out after " + std::to_string(callTimeoutMs / 1000) + "s";
+    output << "Error: command timed out after " << (callTimeoutMs / 1000) << "s\n";
     output << result.stdoutText;
   } else {
     output << result.stdoutText;

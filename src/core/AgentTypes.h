@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <functional>
 #include <string>
 #include <vector>
@@ -29,15 +30,20 @@ inline ModelFamily DetectModelFamily(const std::string& model) {
 }
 
 // Get context window size for a model family. Aligned with local-ace's
-// getContextWindowForModel().
+// getContextWindowForModel(). Supports env override via CPP_AGENT_CONTEXT_WINDOW.
 inline int GetContextWindowForFamily(const std::string& model) {
-  switch (DetectModelFamily(model)) {
-    case ModelFamily::Claude: return 200000;
-    case ModelFamily::Qwen:   return 32768;   // Qwen 3 typical
-    case ModelFamily::Gemma:  return 32768;   // Gemma 4 typical
-    case ModelFamily::Generic: return 32768;
+  // Allow per-session override (aligned with local-ace CLAUDE_CODE_MAX_CONTEXT_TOKENS)
+  if (const char* envOverride = std::getenv("CPP_AGENT_CONTEXT_WINDOW")) {
+    int parsed = std::atoi(envOverride);
+    if (parsed > 0) return parsed;
   }
-  return 32768;
+  switch (DetectModelFamily(model)) {
+    case ModelFamily::Claude: return 200000;   // Claude 3.5/4 standard
+    case ModelFamily::Qwen:   return 131072;  // Qwen3 128K context
+    case ModelFamily::Gemma:  return 131072;  // Gemma 128K context
+    case ModelFamily::Generic: return 131072; // Safe default for unknown models
+  }
+  return 131072;
 }
 
 // Get default max output tokens for a model family.

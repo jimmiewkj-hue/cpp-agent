@@ -981,6 +981,25 @@ class AnsiTui {
     RefreshMessages();
   }
 
+  // Commit the live response to the log as a colored entry, then clear it.
+  void FlushLiveResponse() {
+    std::string text;
+    {
+      std::lock_guard<std::mutex> lock(state_.mutex);
+      text = state_.liveResponse;
+      state_.liveResponse.clear();
+    }
+    if (!text.empty()) {
+      // Trim to first 200 chars for the log entry
+      std::string preview = text.size() > 200
+          ? text.substr(0, 200) + "..."
+          : text;
+      // Replace newlines for compact display
+      std::replace(preview.begin(), preview.end(), '\n', ' ');
+      AppendMessage(preview, LogLineCategory::kAssistantReply);
+    }
+  }
+
   void SetLiveToolStatus(const std::string& text) {
     {
       std::lock_guard<std::mutex> lock(state_.mutex);
@@ -994,8 +1013,13 @@ class AnsiTui {
       std::lock_guard<std::mutex> lock(state_.mutex);
       state_.estimatedTokens = tokens;
       if (contextWindow > 0) {
+        // Use effective context window (subtract output reserve) aligned with
+        // local-ace calculateContextPercentages and AutoCompact kMaxOutputTokensForSummary.
+        static constexpr int kOutputReserveTokens = 20000;
+        int effectiveWindow = contextWindow - kOutputReserveTokens;
+        if (effectiveWindow <= 0) effectiveWindow = contextWindow;
         state_.contextUsagePercent = std::min(100,
-            static_cast<int>((static_cast<double>(tokens) / contextWindow) * 100));
+            static_cast<int>((static_cast<double>(tokens) / effectiveWindow) * 100));
       }
     }
     RefreshStatus();
@@ -1853,14 +1877,24 @@ int main() {
     switch (event.type) {
       case agent::core::QueryLoopEvent::Type::StageChanged: {
         tui.SetLiveStage(QueryStageLabel(event.stage));
-        // Log compact-related stages with color
+        // Log compact-related stages with color, but only when context is
+        // actually significant (>50%) to avoid noisy no-op stage labels
         const char* label = QueryStageLabel(event.stage);
         std::string stageLabel = std::string("[") + label + "]";
         if (std::string(label) == "Microcompact" ||
             std::string(label) == "Collapse" ||
             std::string(label) == "Autocompact" ||
             std::string(label) == "Snip") {
-          tui.AppendMessage(stageLabel, LogLineCategory::kCompact);
+          // Only log compact stages when context usage is above 50%
+          // to avoid showing all 4 stages as no-ops every iteration
+          int ctxPct = 0;
+          {
+            std::lock_guard<std::mutex> lock(tuiState.mutex);
+            ctxPct = tuiState.contextUsagePercent;
+          }
+          if (ctxPct >= 50) {
+            tui.AppendMessage(stageLabel, LogLineCategory::kCompact);
+          }
         } else {
           tui.AppendMessage(stageLabel, LogLineCategory::kStage);
         }
@@ -1879,6 +1913,9 @@ int main() {
         break;
       }
       case agent::core::QueryLoopEvent::Type::ToolProgress: {
+        // Flush the live response to the log before tool output appears,
+        // so assistant text is committed with kAssistantReply color
+        tui.FlushLiveResponse();
         if (!event.message.content.empty() &&
             event.message.content.front().type ==
                 agent::core::BlockType::ToolUse) {
@@ -1916,6 +1953,10 @@ int main() {
           resultText = "tool error";
         }
         tui.SetLiveToolStatus(resultText);
+        // Add a visible colored log line for the tool result
+        tui.AppendMessage(
+            std::string(cat == LogLineCategory::kError ? "\xe2\x9c\x98 " : "\xe2\x9c\x93 ") +
+            resultText, cat);
         tui.SetTaskPanelData(agent::app::LoadTuiTaskPanelData(taskStorePath));
         break;
       }
