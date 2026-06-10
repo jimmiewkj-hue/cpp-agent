@@ -1689,9 +1689,16 @@ int main() {
   llmCfg.apiEndpoint = GetEnvOrDefault(
       "CPP_AGENT_API_ENDPOINT", "http://127.0.0.1:8080/v1/chat/completions");
   llmCfg.mainModel = GetEnvOrDefault(
-      "CPP_AGENT_MAIN_MODEL", "Qwen3.6-35B-A3B-Q8_0");
+      "CPP_AGENT_MAIN_MODEL", "gemma-4-31B-it-Q8_0");
   llmCfg.validatorModel = GetEnvOrDefault(
       "CPP_AGENT_VALIDATOR_MODEL", "");
+  // NOTE: validatorModel intentionally empty by default.
+  // Dual-model validation with same-tier local models (e.g., Qwen validating
+  // Gemma) produces WORSE results than single-model operation due to protocol
+  // overhead, JSON parsing failures, and false-positive tool blocking.
+  // Quality assurance is handled by framework-level mechanisms instead:
+  // write-run-verify loop, edit loop breaker, error repair loop, and
+  // shell syntax translation. See ShouldRunValidation() in QueryLoop.cpp.
   llmCfg.fallbackModel = GetEnvOrDefault(
       "CPP_AGENT_FALLBACK_MODEL", "gemma-4-31B-it-Q8_0");
   llmCfg.apiKey = GetEnvOrDefault("CPP_AGENT_API_KEY", "");

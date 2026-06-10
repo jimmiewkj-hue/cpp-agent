@@ -79,6 +79,12 @@ struct QueryLoopInternalState {
   int resultCheckNudgeCount = 0;
   // P0-4: Give one forced-action nudge before hard-stopping exploration loops
   int explorationActionNudgeCount = 0;
+  // GEMMA-ENHANCE: Same-file edit loop breaker
+  // Tracks consecutive failed edit attempts on the same file to detect
+  // tunnel vision / stuck-loop behavior where the model repeatedly tries
+  // to fix one line without success.
+  std::string lastEditedFilePath;
+  int consecutiveSameFileEditFailures = 0;
 };
 
 struct StopHookResult {

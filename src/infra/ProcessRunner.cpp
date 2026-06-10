@@ -2,48 +2,13 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace agent {
 namespace infra {
-
-namespace {
-
-// Read from pipe with a timeout to prevent blocking indefinitely when child
-// processes (e.g., python spawned by PowerShell) hold the pipe write handle.
-// Uses PeekNamedPipe polling since CreatePipe handles don't support overlapped I/O.
-std::string ReadFromPipe(HANDLE pipeHandle, DWORD timeoutMs = 5000) {
-  std::string output;
-  char buffer[4096];
-
-  auto startTime = GetTickCount64();
-  for (;;) {
-    DWORD bytesAvailable = 0;
-    if (!PeekNamedPipe(pipeHandle, nullptr, 0, nullptr, &bytesAvailable, nullptr)) {
-      // Pipe broken or error — stop reading
-      break;
-    }
-    if (bytesAvailable > 0) {
-      DWORD bytesRead = 0;
-      DWORD toRead = (bytesAvailable < sizeof(buffer)) ? bytesAvailable : sizeof(buffer);
-      if (!ReadFile(pipeHandle, buffer, toRead, &bytesRead, nullptr) || bytesRead == 0) {
-        break;
-      }
-      output.append(buffer, buffer + bytesRead);
-      // Reset the timer since we're still getting data
-      startTime = GetTickCount64();
-    } else {
-      // No data available — check if we've exceeded the timeout
-      if (GetTickCount64() - startTime > timeoutMs) break;
-      Sleep(10);  // Brief sleep to avoid busy-wait
-    }
-  }
-
-  return output;
-}
-
-}  // namespace
 
 ProcessRunResult ProcessRunner::Run(const ProcessRunOptions& options) const {
   ProcessRunResult result;
@@ -145,6 +110,40 @@ ProcessRunResult ProcessRunner::Run(const ProcessRunOptions& options) const {
     stdinWrite = nullptr;
   }
 
+  // CRITICAL FIX: Read stdout concurrently to prevent pipe-buffer deadlock.
+  // When the child process writes more output than the pipe buffer (~4KB on
+  // Windows), it blocks on WriteFile waiting for the buffer to drain. If the
+  // parent is in WaitForSingleObject waiting for the child to exit, neither
+  // can proceed — classic deadlock. Solution: spawn a reader thread that
+  // drains the pipe while we wait for the process.
+  std::atomic<bool> processDone{false};
+  std::string collectedStdout;
+
+  std::thread stdoutReader([&stdoutRead, &processDone, &collectedStdout]() {
+    char buffer[4096];
+    for (;;) {
+      DWORD bytesAvailable = 0;
+      if (!PeekNamedPipe(stdoutRead, nullptr, 0, nullptr,
+                         &bytesAvailable, nullptr)) {
+        break;  // Pipe broken or error
+      }
+      if (bytesAvailable > 0) {
+        DWORD bytesRead = 0;
+        DWORD toRead =
+            (bytesAvailable < sizeof(buffer)) ? bytesAvailable : sizeof(buffer);
+        if (!ReadFile(stdoutRead, buffer, toRead, &bytesRead, nullptr) ||
+            bytesRead == 0) {
+          break;
+        }
+        collectedStdout.append(buffer, bytesRead);
+      } else if (processDone.load()) {
+        break;  // Process exited and no more data in pipe
+      } else {
+        Sleep(5);  // Brief sleep to avoid busy-wait
+      }
+    }
+  });
+
   const DWORD waitCode =
       WaitForSingleObject(processInfo.hProcess, options.timeoutMs);
   if (waitCode == WAIT_TIMEOUT) {
@@ -153,11 +152,16 @@ ProcessRunResult ProcessRunner::Run(const ProcessRunOptions& options) const {
     WaitForSingleObject(processInfo.hProcess, 5000);
   }
 
+  // Signal the reader thread that the process has exited, then wait for it
+  // to finish draining any remaining data from the pipe.
+  processDone.store(true);
+  if (stdoutReader.joinable()) stdoutReader.join();
+
   DWORD exitCode = 0;
   GetExitCodeProcess(processInfo.hProcess, &exitCode);
   result.exitCode = static_cast<int>(exitCode);
 
-  result.stdoutText = ReadFromPipe(stdoutRead);
+  result.stdoutText = std::move(collectedStdout);
 
   CloseHandle(stdoutRead);
   if (stdinWrite != nullptr) { CloseHandle(stdinWrite); }

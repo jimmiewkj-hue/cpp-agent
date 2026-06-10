@@ -390,6 +390,22 @@ std::string BuildRecentExecutionMemory(const QueryLoopContext& ctx,
         + " consecutive times. Do not rerun the same failing action without a"
           " concrete change. Latest error: "
         + repeatedErrorFingerprint);
+    // GEMMA-ENHANCE: If the repeated error involves Python API issues,
+    // inject API discovery guidance.
+    std::string lowerFp = repeatedErrorFingerprint;
+    std::transform(lowerFp.begin(), lowerFp.end(), lowerFp.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (lowerFp.find("typeerror") != std::string::npos ||
+        lowerFp.find("attributeerror") != std::string::npos ||
+        lowerFp.find("unexpected keyword") != std::string::npos ||
+        lowerFp.find("has no attribute") != std::string::npos) {
+      lines.push_back(
+          "API DISCOVERY HINT: This looks like a Python library API mismatch. "
+          "Run `pip show <library>` to check the installed version, then run "
+          "`python -c \"import <lib>; help(<lib>.<class>)\"` to discover the "
+          "actual parameter names and method signatures. Do NOT guess based on "
+          "old documentation.");
+    }
   }
 
   // Also detect repeated non-error tool results (e.g., reading same file, same Glob)
@@ -589,6 +605,20 @@ std::string ResolveValidatorModel(const QueryLoopContext& ctx) {
 }
 
 bool ShouldRunValidation(const QueryLoopContext& ctx) {
+  // DESIGN NOTE (Gemma-4-31B single-model optimization):
+  // Dual-model validation (Actor-Evaluator pattern) is only effective when
+  // the Validator model has significantly higher logical capability than
+  // the main model (e.g., GPT-4o validating a 30B local model).
+  // For same-tier models (Qwen-35B vs Gemma-31B), the protocol overhead,
+  // parsing failures, and false-positive interventions make results WORSE
+  // than single-model operation. Engineering logs from jianlai_graph
+  // confirm: Gemma single-model outperforms Gemma+Qwen validator combo.
+  // KEEP validatorModel empty by default. Quality is enforced through:
+  // - Write-Run-Verify closed loop (PostToolTurnProcessing)
+  // - Edit loop breaker (same-file edit failure detection)
+  // - Error-driven repair loop (consecutive error tracking)
+  // - Shell syntax translation (NormalizeWindowsShellCommand)
+  // - Model-family-aware nudge escalation (HandleNoToolContinuation)
   return !ResolveValidatorModel(ctx).empty();
 }
 
@@ -1519,6 +1549,91 @@ void QueryLoop::PostToolTurnProcessing(QueryLoopContext& ctx,
 
   state.lastTurnHadFileWrite = hadFileWrite;
 
+  // GEMMA-ENHANCE: Same-file edit loop breaker.
+  // Detect when the model repeatedly tries to edit the same file and fails.
+  // After 3 consecutive failures on the same file, inject a forced
+  // context-refresh message telling it to read the full function and use
+  // Write to rewrite the block instead of surgical SearchReplace.
+  {
+    std::string currentEditFile;
+    bool currentEditHadError = false;
+    // Scan the most recent tool_use blocks from the last turn.
+    for (auto it = ctx.messages.rbegin();
+         it != ctx.messages.rend() && currentEditFile.empty(); ++it) {
+      if (it->role == MessageRole::Assistant) {
+        for (const auto& block : it->content) {
+          if (block.type != BlockType::ToolUse) continue;
+          const std::string& name = block.asToolUse.name;
+          if (name != "FileEdit" && name != "Edit" && name != "MultiEdit" &&
+              name != "Write" && name != "FileWrite") continue;
+          // Extract file_path from the tool input JSON
+          try {
+            auto j = json::parse(block.asToolUse.inputJson);
+            if (j.contains("file_path"))
+              currentEditFile = j["file_path"].get<std::string>();
+            else if (j.contains("path"))
+              currentEditFile = j["path"].get<std::string>();
+          } catch (...) {}
+          break;  // Only need the first edit tool_use found
+        }
+      } else if (it->role == MessageRole::User) {
+        // Check if the most recent tool result was an error
+        for (const auto& block : it->content) {
+          if (block.type == BlockType::ToolResult && block.asToolResult.isError) {
+            currentEditHadError = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!currentEditFile.empty() && currentEditHadError) {
+      if (currentEditFile == state.lastEditedFilePath) {
+        ++state.consecutiveSameFileEditFailures;
+      } else {
+        state.lastEditedFilePath = currentEditFile;
+        state.consecutiveSameFileEditFailures = 1;
+      }
+    } else if (!currentEditFile.empty()) {
+      // Edit succeeded — reset counter
+      state.lastEditedFilePath = currentEditFile;
+      state.consecutiveSameFileEditFailures = 0;
+    } else {
+      // Non-edit tool used — reset
+      state.lastEditedFilePath.clear();
+      state.consecutiveSameFileEditFailures = 0;
+    }
+
+    static const int kEditLoopThreshold = 3;
+    if (state.consecutiveSameFileEditFailures >= kEditLoopThreshold) {
+      Message loopBreaker;
+      loopBreaker.role = MessageRole::System;
+      loopBreaker.uuid = "edit-loop-breaker-"
+                         + std::to_string(state.consecutiveSameFileEditFailures);
+      loopBreaker.isMeta = true;
+      std::string loopText =
+          "[Edit Loop Detected] You have failed to edit `"
+          + state.lastEditedFilePath + "` "
+          + std::to_string(state.consecutiveSameFileEditFailures)
+          + " consecutive times. STOP and change strategy:\n"
+          "1. Read the ENTIRE function or block around the target line "
+          "(20+ lines of context)\n"
+          "2. Understand the actual code structure and quoting\n"
+          "3. Use the Write tool to rewrite the entire function block "
+          "instead of surgical single-line SearchReplace\n"
+          "4. If the issue is with escape characters or complex strings, "
+          "write the content to a temporary .py file and use Python to "
+          "generate the correct content\n\n"
+          "Do NOT attempt another SearchReplace on the same line without "
+          "first reading the full context.";
+      loopBreaker.content.push_back(ContentBlock::MakeText(loopText));
+      ctx.messages.push_back(loopBreaker);
+      if (ctx.sessionManager) {
+        ctx.sessionManager->AppendMessageToTranscript(loopBreaker);
+      }
+    }
+  }
+
   // P1-6: API consistency check after multi-module code generation.
   // When the model writes multiple .py files and a main.py (or similar entry
   // point), the main.py often calls methods with wrong names or signatures
@@ -1606,12 +1721,16 @@ void QueryLoop::PostToolTurnProcessing(QueryLoopContext& ctx,
   }
 
   // Inject verification nudge after file writes without subsequent run/verify.
-  // Only nudge up to 2 times to avoid infinite loops.
-  static const int kMaxVerificationNudges = 2;
-  static const int kWriteWithoutVerifyThreshold = 1;
+  // GEMMA-ENHANCE: Use model-family-aware thresholds. Gemma tends to write
+  // many files without verifying; enforce stricter write-verify cadence.
+  const ModelFamily verifyFamily = DetectModelFamily(ctx.model);
+  const int maxVerifyNudges =
+      (verifyFamily == ModelFamily::Gemma || verifyFamily == ModelFamily::Qwen)
+          ? 3 : 2;
+  const int writeWithoutVerifyThreshold = 1;
 
-  if (state.consecutiveWriteWithoutVerifyCount >= kWriteWithoutVerifyThreshold &&
-      state.verificationNudgeCount < kMaxVerificationNudges) {
+  if (state.consecutiveWriteWithoutVerifyCount >= writeWithoutVerifyThreshold &&
+      state.verificationNudgeCount < maxVerifyNudges) {
     ++state.verificationNudgeCount;
 
     Message nudge;
@@ -1629,11 +1748,26 @@ void QueryLoop::PostToolTurnProcessing(QueryLoopContext& ctx,
           "3. If there are tests: run them\n"
           "4. If it's a library: check it compiles/imports correctly\n\n"
           "Do NOT mark the task as completed until you have verified the output.";
-    } else {
+    } else if (state.verificationNudgeCount == 2) {
       nudgeText =
           "[Verification Still Required] You wrote files but have not yet "
           "verified they work. Run the code or tests NOW using Bash. "
           "Do not proceed to the next task without verifying.";
+    } else {
+      // GEMMA-ENHANCE: 3rd nudge — hard block style for models that keep
+      // writing without verifying (observed in Gemma-4-31B logs where it
+      // wrote 6+ files before attempting to run).
+      nudgeText =
+          "[MANDATORY VERIFICATION - STOP WRITING] You have written "
+          + std::to_string(state.consecutiveWriteWithoutVerifyCount)
+          + " files without running ANY verification.\n"
+          "STOP writing more files. You MUST NOW:\n"
+          "1. Run the entry point (e.g., python main.py) with Bash\n"
+          "2. Check the output for errors\n"
+          "3. Fix any errors found\n"
+          "4. Only after verification passes, continue with remaining work\n\n"
+          "Writing more unverified code will only compound errors. "
+          "VERIFY FIRST, then write more.";
     }
 
     nudge.content.push_back(ContentBlock::MakeText(nudgeText));
@@ -1774,12 +1908,21 @@ void QueryLoop::PostToolTurnProcessing(QueryLoopContext& ctx,
           "constructor signatures, attribute names)\n"
           "2. Compare your calling code against the actual class definitions\n"
           "3. Fix ALL discovered mismatches, not just the first one\n"
-          "4. Do NOT guess method names - look at the actual code\n\n"
-          "Latest errors:\n" + errorSummary;
+          "4. Do NOT guess method names - look at the actual code\n";
+      // GEMMA-ENHANCE: API discovery hint for library errors
+      if (errorType == "TypeError" || errorType == "AttributeError") {
+        repairText +=
+            "\n5. This looks like a library API compatibility error. Run:\n"
+            "   pip show <library_name>   (to check the installed version)\n"
+            "   python -c \"import <library>; help(<library>.<class>)\" "
+            "(to discover the actual API)\n"
+            "   Then use the ACTUAL parameter names from the library source.";
+      }
+      repairText += "\n\nLatest errors:\n" + errorSummary;
     } else {
       repairText =
           "[Error Persists - " + std::to_string(state.consecutiveErrorTurns) +
-          "rd occurrence] You have had errors for " +
+          " occurrences] You have had errors for " +
           std::to_string(state.consecutiveErrorTurns) +
           " consecutive turns. ";
       if (!errorType.empty()) {
@@ -1792,8 +1935,20 @@ void QueryLoop::PostToolTurnProcessing(QueryLoopContext& ctx,
           "3. Try a completely different approach: instead of fixing the caller, add "
           "the missing method/attribute to the module, or restructure the code\n"
           "4. If the error is in an orchestration script (main.py), read every module "
-          "it imports and verify ALL API calls match actual class definitions\n\n"
-          "Latest errors:\n" + errorSummary;
+          "it imports and verify ALL API calls match actual class definitions\n";
+      // GEMMA-ENHANCE: Force step-back for persistent API errors
+      if (errorType == "TypeError" || errorType == "AttributeError" ||
+          errorType == "ImportError") {
+        repairText +=
+            "\n5. STEP BACK: This is a library API mismatch. Before any fix:\n"
+            "   a) Run: pip show <library>   (check installed version)\n"
+            "   b) Run: python -c \"import <library>; print(dir(<library>))\" "
+            "(list available symbols)\n"
+            "   c) READ the library source file where the class is defined\n"
+            "   d) Use ONLY parameters/methods that actually exist in this version\n"
+            "   e) Do NOT invent parameter names based on documentation you remember.";
+      }
+      repairText += "\n\nLatest errors:\n" + errorSummary;
     }
 
     repair.content.push_back(ContentBlock::MakeText(repairText));
@@ -1972,11 +2127,26 @@ bool QueryLoop::IsPromptTooLong(const Message& msg) {
   for (const auto& block : msg.content) {
     if (block.type == BlockType::Text) {
       const auto& t = block.asText.text;
+      // Standard prompt-too-long patterns (HTTP 413 and explicit messages)
       if (t.find("prompt too long") != std::string::npos ||
           t.find("413") != std::string::npos ||
           t.find("Payload Too Large") != std::string::npos ||
           t.find("prompt_too_long") != std::string::npos)
         return true;
+      // Context overflow patterns from local LLM servers (HTTP 400):
+      // llama.cpp: "input too large" / "context length exceeded"
+      // ollama: "context length exceeded"
+      // vllm: "max model context length"
+      if (t.find("HTTP 400") != std::string::npos) {
+        if (t.find("context") != std::string::npos ||
+            t.find("too long") != std::string::npos ||
+            t.find("too large") != std::string::npos ||
+            t.find("exceed") != std::string::npos ||
+            t.find("maximum") != std::string::npos ||
+            t.find("token") != std::string::npos ||
+            t.find("length") != std::string::npos)
+          return true;
+      }
     }
   }
   return false;
@@ -2540,7 +2710,24 @@ bool QueryLoop::Handle413Recovery(QueryLoopContext& ctx,
   if (state.assistantMessages.empty()) return false;
   const Message& lastMsg = state.assistantMessages.back();
   if (!lastMsg.isApiErrorMessage) return false;
-  if (!IsPromptTooLong(lastMsg)) return false;
+
+  // Detect prompt-too-long: either explicit patterns OR generic HTTP 400
+  // with a large context (likely context overflow on local LLM servers).
+  const bool isExplicitPromptTooLong = IsPromptTooLong(lastMsg);
+  bool isHttp400WithLargeContext = false;
+  if (!isExplicitPromptTooLong) {
+    for (const auto& block : lastMsg.content) {
+      if (block.type == BlockType::Text &&
+          block.asText.text.find("HTTP 400") != std::string::npos) {
+        // Generic HTTP 400 with large context = assume context overflow
+        if (ctx.messages.size() > 30) {
+          isHttp400WithLargeContext = true;
+        }
+        break;
+      }
+    }
+  }
+  if (!isExplicitPromptTooLong && !isHttp400WithLargeContext) return false;
 
   if (!state.hasAttemptedCollapseDrain &&
       state.transition != TransitionReason::CollapseDrainRetry) {
@@ -2582,27 +2769,38 @@ bool QueryLoop::HandleMaxOutputTokens(QueryLoopContext& ctx,
                                       QueryLoopInternalState& state) {
   if (state.assistantMessages.empty()) return false;
   const Message& lastMsg = state.assistantMessages.back();
-  if (!lastMsg.isApiErrorMessage) return false;
 
   bool isMaxTokens = false;
-  for (const auto& block : lastMsg.content) {
-    if (block.type != BlockType::Text) continue;
-    if (block.asText.text.find("max_output_tokens") != std::string::npos ||
-        block.asText.text.find("output token limit") != std::string::npos) {
-      isMaxTokens = true; break;
+  // Check for explicit API error messages about token limits
+  if (lastMsg.isApiErrorMessage) {
+    for (const auto& block : lastMsg.content) {
+      if (block.type != BlockType::Text) continue;
+      if (block.asText.text.find("max_output_tokens") != std::string::npos ||
+          block.asText.text.find("output token limit") != std::string::npos) {
+        isMaxTokens = true; break;
+      }
     }
   }
+  // Check stop_reason for standard truncation signals
   if (!isMaxTokens && !lastMsg.stopReason.empty() &&
       (lastMsg.stopReason.find("max_tokens") != std::string::npos ||
        lastMsg.stopReason.find("length") != std::string::npos))
     isMaxTokens = true;
-  // P0-FIX: Also detect max_output_tokens when model returns text-only
-  // without tools (Qwen may return stop_reason="stop" when truncated).
+  // P0-FIX: Detect silent truncation when model returns text-only without
+  // tools. Many models (Qwen, MiMo) return stop_reason="stop" even when
+  // truncated at max_tokens. Heuristic: long text with no tools suggests
+  // the model was in the middle of generating a tool_use block when cut off.
   if (!isMaxTokens && state.toolUseBlocks.empty() &&
       !lastMsg.isApiErrorMessage) {
     std::string lastText = CollectText(state.assistantMessages);
-    // Heuristic: long text with no tools suggests token limit truncation
-    if (lastText.size() > 2000 && state.forcedContinuationCount >= 3) {
+    // Lower threshold for cloud models that tend to truncate silently
+    ModelFamily family = DetectModelFamily(ctx.model);
+    int textThreshold = (family == ModelFamily::MiMo ||
+                         family == ModelFamily::Qwen) ? 1500 : 2000;
+    int continuationThreshold = (family == ModelFamily::MiMo ||
+                                 family == ModelFamily::Qwen) ? 2 : 3;
+    if (static_cast<int>(lastText.size()) > textThreshold &&
+        state.forcedContinuationCount >= continuationThreshold) {
       isMaxTokens = true;
     }
   }
@@ -2726,6 +2924,31 @@ StopHookResult QueryLoop::ExecuteStopHooks(QueryLoopContext& ctx,
       state.stopHookActive = true;
     }
   }
+
+  // GEMMA-ENHANCE: Built-in self-correction hook.
+  // When the model is about to terminate but has written files without
+  // verification, inject a final verification nudge. This replaces the
+  // dual-model Validator approach with a lightweight framework-level check
+  // that leverages the model's own self-correction capability.
+  if (result.followupMessages.empty() && !result.preventContinuation &&
+      state.consecutiveWriteWithoutVerifyCount >= 2 &&
+      state.completionNudgeCount < 1) {
+    ++state.completionNudgeCount;
+    Message verifyNudge;
+    verifyNudge.role = MessageRole::System;
+    verifyNudge.uuid = "self-correction-verify";
+    verifyNudge.isMeta = true;
+    verifyNudge.content.push_back(ContentBlock::MakeText(
+        "[Self-Correction] You wrote "
+        + std::to_string(state.consecutiveWriteWithoutVerifyCount)
+        + " files but did NOT run them to verify they work. "
+        "Before finishing, you MUST run the code with Bash and check "
+        "the output. If there are errors, fix them before reporting "
+        "completion. Do NOT claim the task is done without verification."));
+    result.followupMessages.push_back(verifyNudge);
+    state.stopHookActive = true;
+  }
+
   return result;
 }
 
@@ -3043,9 +3266,40 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
   // than genuinely finishing. Inject a short "resume" nudge, capped at 5
   // attempts to prevent death spirals. Increased from 3 to 5 for weaker
   // models (Qwen 3.6 35b) that need more directive prompting.
-  static const int kMaxNoToolNudges = 5;
+  int maxNoToolNudges = 5;
+  ModelFamily family = DetectModelFamily(ctx.model);
+  if (family == ModelFamily::Qwen || family == ModelFamily::Gemma) {
+    maxNoToolNudges = 8;
+  }
   const bool hasPriorToolActivity = HasRecentToolActivity(ctx);
   const bool modelProducedText = !CollectText(state.assistantMessages).empty();
+
+  // Task 1 & 4: Detect repetitive planning text loops
+  bool isRepetitivePlanning = false;
+  std::string currentText = CollectText(state.assistantMessages);
+  if (modelProducedText) {
+    std::string lowerText = currentText;
+    std::transform(lowerText.begin(), lowerText.end(), lowerText.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    
+    // Check if it starts with planning phrases
+    bool isPlanning = false;
+    if (lowerText.find("the user wants me to") < 20 ||
+        lowerText.find("the user wants") < 20 ||
+        lowerText.find("let me ") < 20 ||
+        lowerText.find("i need to ") < 20 ||
+        lowerText.find("i will ") < 20 ||
+        currentText.find("用户想要") < 20 ||
+        currentText.find("让我") < 20 ||
+        currentText.find("我需要") < 20) {
+      isPlanning = true;
+    }
+
+    if (isPlanning && state.missingToolUsePromptCount > 0) {
+      // If we are already in a missing tool prompt loop and still planning, consider it repetitive
+      isRepetitivePlanning = true;
+    }
+  }
 
   // Task 4: Detect recent edit failures to inject specific re-read guidance
   bool hasRecentEditFailures = false;
@@ -3075,65 +3329,85 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
     hasRecentEditFailures = (recentEditFailCount >= 2);
   }
 
-  if (hasPriorToolActivity && modelProducedText &&
-      state.missingToolUsePromptCount < kMaxNoToolNudges) {
-    ++state.missingToolUsePromptCount;
-    ReportQueryLoopDebugEvent(
-        "4", "QueryLoop.cpp:no-tool:bounded-nudge",
-        "[DEBUG] Injecting bounded continuation nudge",
-        {{"nudgeCount", state.missingToolUsePromptCount},
-         {"modelCallCount", state.modelCallCount},
-         {"turnCount", state.turnCount}},
-        MakeQueryLoopTraceId("nudge"));
+  if ((hasPriorToolActivity && modelProducedText) || isRepetitivePlanning) {
+    if (state.missingToolUsePromptCount < maxNoToolNudges) {
+      ++state.missingToolUsePromptCount;
+      ReportQueryLoopDebugEvent(
+          "4", "QueryLoop.cpp:no-tool:bounded-nudge",
+          "[DEBUG] Injecting bounded continuation nudge",
+          {{"nudgeCount", state.missingToolUsePromptCount},
+           {"modelCallCount", state.modelCallCount},
+           {"turnCount", state.turnCount},
+           {"isRepetitivePlanning", isRepetitivePlanning}},
+          MakeQueryLoopTraceId("nudge"));
 
-    Message nudge;
-    nudge.role = MessageRole::User;
-    nudge.uuid = "bounded-continuation-nudge-"
-                 + std::to_string(state.missingToolUsePromptCount);
-    nudge.isMeta = true;
-    // Escalating nudge messages (aligned with local-ace max_output_tokens
-    // recovery). Later nudges are more directive to break the model out of
-    // text-only planning loops. Weaker models need explicit tool directives.
-    std::string nudgeText;
-    if (hasRecentEditFailures) {
-      // Special case: recent edit failures detected - guide the model to
-      // re-read the file before retrying the edit
-      nudgeText =
-          "[system] Your recent file edits FAILED because old_string did not match.\n"
-          "You MUST do the following BEFORE retrying any edit:\n"
-          "1. Use Read to get the CURRENT content of the file that failed to edit\n"
-          "2. Copy the EXACT text from the Read output that you want to replace\n"
-          "3. Use Edit with the correctly copied old_string\n"
-          "Do NOT guess the file content. Do NOT describe what you will do. "
-          "Execute the Read tool call NOW.";
-    } else if (state.missingToolUsePromptCount <= 2) {
-      nudgeText =
-          "[system] Your previous response ended without a tool call. "
-          "Resume directly - no apology, no recap of what you were doing. "
-          "Pick up mid-thought if that is where the cut happened. "
-          "Break remaining work into smaller pieces. "
-          "Emit a tool call immediately.";
-    } else if (state.missingToolUsePromptCount <= 4) {
-      // Stronger directive for repeated failures
-      nudgeText =
-          "[system] You keep describing what you will do instead of doing it. "
-          "STOP planning. Emit a tool call NOW.\n"
-          "If editing a file: first Read it, then Edit with exact old_string.\n"
-          "If writing a file: use Write with the full content.\n"
-          "Do NOT describe the file content in text - just call the tool.";
-    } else {
-      // Final nudge: verify completion or continue
-      nudgeText =
-          "[system] FINAL NOTICE: Either the task is complete or you must "
-          "take action. If complete, provide a brief summary of what was done. "
-          "If NOT complete, emit a tool call IMMEDIATELY to continue work. "
-          "Do not repeat plans or reasoning.";
+      Message nudge;
+      nudge.role = MessageRole::User;
+      nudge.uuid = "bounded-continuation-nudge-"
+                   + std::to_string(state.missingToolUsePromptCount);
+      nudge.isMeta = true;
+      // Escalating nudge messages (aligned with local-ace max_output_tokens
+      // recovery). Later nudges are more directive to break the model out of
+      // text-only planning loops. Weaker models need explicit tool directives.
+      std::string nudgeText;
+      if (hasRecentEditFailures) {
+        // Special case: recent edit failures detected - guide the model to
+        // re-read the file before retrying the edit
+        nudgeText =
+            "[system] Your recent file edits FAILED because old_string did not match.\n"
+            "You MUST do the following BEFORE retrying any edit:\n"
+            "1. Use Read to get the CURRENT content of the file that failed to edit\n"
+            "2. Copy the EXACT text from the Read output that you want to replace\n"
+            "3. Use Edit with the correctly copied old_string\n"
+            "Do NOT guess the file content. Do NOT describe what you will do. "
+            "Execute the Read tool call NOW.";
+      } else if (family == ModelFamily::Qwen) {
+        if (state.missingToolUsePromptCount <= 2 && !isRepetitivePlanning) {
+          nudgeText = "[system] 请立即执行工具调用，不要停留在计划阶段。直接继续你的工作。";
+        } else if (state.missingToolUsePromptCount <= 5) {
+          nudgeText = "[system] 停止解释你的计划！你必须立即输出工具调用（tool_use）。不要输出诸如“用户想要我...”或“让我...”的文本。立即执行工具调用！";
+        } else {
+          nudgeText = "[system] 最后警告：任务是否完成？如果完成请总结，如果没有完成，必须立即调用工具！不要重复推理过程！";
+        }
+      } else if (family == ModelFamily::Gemma) {
+        if (state.missingToolUsePromptCount <= 2 && !isRepetitivePlanning) {
+          nudgeText = "[system] Execute a tool call immediately. Do not stop at planning.";
+        } else if (state.missingToolUsePromptCount <= 5) {
+          nudgeText = "[system] STOP planning. You must emit a tool call NOW. Do not describe what you will do. Execute the tool call!";
+        } else {
+          nudgeText = "[system] FINAL WARNING: If task is done, summarize it. If not, emit a tool call IMMEDIATELY. Do not repeat your plan.";
+        }
+      } else {
+        if (state.missingToolUsePromptCount <= 2 && !isRepetitivePlanning) {
+          nudgeText =
+              "[system] Your previous response ended without a tool call. "
+              "Resume directly - no apology, no recap of what you were doing. "
+              "Pick up mid-thought if that is where the cut happened. "
+              "Break remaining work into smaller pieces. "
+              "Emit a tool call immediately.";
+        } else if (state.missingToolUsePromptCount <= 4) {
+          // Stronger directive for repeated failures
+          nudgeText =
+              "[system] You keep describing what you will do instead of doing it. "
+              "STOP planning. Emit a tool call NOW.\n"
+              "If editing a file: first Read it, then Edit with exact old_string.\n"
+              "If writing a file: use Write with the full content.\n"
+              "Do NOT describe the file content in text - just call the tool.";
+        } else {
+          // Final nudge: verify completion or continue
+          nudgeText =
+              "[system] FINAL NOTICE: Either the task is complete or you must "
+              "take action. If complete, provide a brief summary of what was done. "
+              "If NOT complete, emit a tool call IMMEDIATELY to continue work. "
+              "Do not repeat plans or reasoning.";
+        }
+      }
+      nudge.content.push_back(ContentBlock::MakeText(nudgeText));
+      std::vector<Message> nudgeFollowups = {nudge};
+      return ContinueWithFollowup(
+          ctx, state, nudgeFollowups,
+          TransitionReason::ForcedContinuation, false);
     }
-    nudge.content.push_back(ContentBlock::MakeText(nudgeText));
-    std::vector<Message> nudgeFollowups = {nudge};
-    return ContinueWithFollowup(
-        ctx, state, nudgeFollowups,
-        TransitionReason::ForcedContinuation, false);
   }
 
   // Align with local-ace: when model produces no tool_use and no validator

@@ -835,11 +835,17 @@ void ParseOpenAISseDelta(const std::string& rawBody,
     if (choice.contains("delta") && choice["delta"].is_object()) {
       const json& delta = choice["delta"];
       std::string textDelta;
-      if (delta.contains("content") && delta["content"].is_string())
+      // Robust content extraction: handle null, missing, and reasoning_content.
+      // MiMo and some cloud models emit reasoning_content first, then content.
+      // Some serving frameworks emit content: null during reasoning phase.
+      if (delta.contains("content") && delta["content"].is_string() &&
+          !delta["content"].get<std::string>().empty()) {
         textDelta = delta["content"].get<std::string>();
-      else if (delta.contains("reasoning_content") &&
-               delta["reasoning_content"].is_string())
+      } else if (delta.contains("reasoning_content") &&
+                 delta["reasoning_content"].is_string() &&
+                 !delta["reasoning_content"].get<std::string>().empty()) {
         textDelta = delta["reasoning_content"].get<std::string>();
+      }
 
       if (!textDelta.empty()) {
         emitPendingToolUse();
@@ -1016,21 +1022,24 @@ std::string HttpLlmClient::BuildOpenAIBody(
     body["temperature"] = temperature;
   }
 
-  // Model-specific adaptations for Qwen/Gemma local models
+  // Model-specific adaptations for Qwen/Gemma/MiMo local and cloud models
   core::ModelFamily family = core::DetectModelFamily(model);
   if (family == core::ModelFamily::Qwen) {
     // Qwen models benefit from slightly lower temperature for tool calls
     if (temperature < 0.0) body["temperature"] = 0.7;
-    // Ensure stream_options for vLLM/Ollama compatibility
-    if (stream) {
-      body["stream_options"] = {{"include_usage", true}};
-    }
   } else if (family == core::ModelFamily::Gemma) {
     // Gemma: use lower temperature for more deterministic output
     if (temperature < 0.0) body["temperature"] = 0.6;
-    if (stream) {
-      body["stream_options"] = {{"include_usage", true}};
-    }
+  } else if (family == core::ModelFamily::MiMo) {
+    // MiMo: use moderate temperature for balanced creativity/accuracy
+    if (temperature < 0.0) body["temperature"] = 0.7;
+  }
+  // Always include stream_options for OpenAI-compatible endpoints.
+  // Many serving frameworks (vLLM, Ollama, SGLang) require this for
+  // proper usage tracking. Previously only set for Qwen/Gemma, causing
+  // compatibility issues with MiMo and other cloud models.
+  if (stream) {
+    body["stream_options"] = {{"include_usage", true}};
   }
 
   if (!toolsJson.empty()) {
@@ -1245,6 +1254,17 @@ std::string HttpLlmClient::SendHttpPost(const std::string& body,
     if (error) {
       *error = "HTTP " + std::to_string(static_cast<int>(statusCode)) +
                " from LLM endpoint";
+      // Append server response body for diagnostic info (e.g., context overflow).
+      // Local LLM servers (llama.cpp, ollama) return useful error details in the
+      // body that help identify context-length-exceeded vs other failures.
+      if (!responseBody.empty()) {
+        // Truncate to keep error messages manageable
+        const std::size_t maxBodyLen = 500;
+        std::string bodySnippet = responseBody.size() > maxBodyLen
+            ? responseBody.substr(0, maxBodyLen) + "..."
+            : responseBody;
+        *error += ": " + bodySnippet;
+      }
     }
     return {};
   }

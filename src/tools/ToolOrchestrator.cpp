@@ -170,6 +170,75 @@ std::string NormalizeWindowsShellCommand(const std::string& command) {
   const std::string trimmed = Trim(command);
   if (trimmed.empty()) return trimmed;
 
+  // GEMMA-ENHANCE: Translate common Linux/Bash shell idioms to PowerShell
+  // equivalents BEFORE any other normalization. This catches the #1 defect
+  // observed in Gemma-4-31B logs: using && and 2>/dev/null which are not
+  // valid PowerShell syntax.
+  {
+    std::string result = trimmed;
+    bool shellModified = false;
+
+    // && -> ; (PowerShell statement separator)
+    // Must not touch && inside quoted strings.
+    {
+      std::string out;
+      out.reserve(result.size());
+      bool inSingle = false;
+      bool inDouble = false;
+      for (std::size_t i = 0; i < result.size(); ++i) {
+        char ch = result[i];
+        if (ch == '\'' && !inDouble) {
+          inSingle = !inSingle;
+          out.push_back(ch);
+        } else if (ch == '"' && !inSingle) {
+          inDouble = !inDouble;
+          out.push_back(ch);
+        } else if (!inSingle && !inDouble && ch == '&' &&
+                   i + 1 < result.size() && result[i + 1] == '&') {
+          // Replace && with ;
+          out.push_back(';');
+          ++i;  // skip second '&'
+          shellModified = true;
+        } else {
+          out.push_back(ch);
+        }
+      }
+      result = out;
+    }
+
+    // 2>/dev/null -> 2>$null
+    {
+      const std::string devNull = "2>/dev/null";
+      const std::string psNull = "2>$null";
+      std::size_t pos = 0;
+      while ((pos = result.find(devNull, pos)) != std::string::npos) {
+        result.replace(pos, devNull.size(), psNull);
+        pos += psNull.size();
+        shellModified = true;
+      }
+    }
+
+    // Also handle 1>/dev/null -> $null and >/dev/null -> $null
+    {
+      const std::string patterns[] = {"1>/dev/null", ">/dev/null"};
+      const std::string replacement = "$null";
+      for (const auto& pat : patterns) {
+        std::size_t pos = 0;
+        while ((pos = result.find(pat, pos)) != std::string::npos) {
+          result.replace(pos, pat.size(), replacement);
+          pos += replacement.size();
+          shellModified = true;
+        }
+      }
+    }
+
+    if (shellModified) {
+      // After shell syntax translation, recurse to apply other normalizations
+      // (e.g., pipe conversions) on the translated command.
+      return NormalizeWindowsShellCommand(result);
+    }
+  }
+
   // P0-03: Handle piped Unix commands (| grep, | head, | tail) FIRST,
   // before command-specific dispatch. This fixes the bug where commands
   // like "python -m pip list | head -100" would bypass pipe conversion
@@ -294,6 +363,87 @@ std::string NormalizeWindowsShellCommand(const std::string& command) {
   const std::vector<ShellToken> tokens = TokenizeShellCommand(trimmed);
   if (tokens.empty()) return trimmed;
   const std::string commandName = ToLowerAscii(tokens[0].text);
+
+  if (commandName == "pwd") {
+    return "Get-Location";
+  }
+
+  if (commandName == "which" && tokens.size() >= 2) {
+    return "Get-Command " + QuoteForPowerShellSingleQuoted(tokens[1].text) + " | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue";
+  }
+
+  if (commandName == "rm" && tokens.size() >= 2) {
+    bool recurse = false;
+    bool force = false;
+    std::vector<std::string> paths;
+    for (std::size_t i = 1; i < tokens.size(); ++i) {
+      const std::string& current = tokens[i].text;
+      if (!current.empty() && current[0] == '-') {
+        for (std::size_t j = 1; j < current.size(); ++j) {
+          const char flag = static_cast<char>(std::tolower(static_cast<unsigned char>(current[j])));
+          if (flag == 'r' || flag == 'R') recurse = true;
+          if (flag == 'f' || flag == 'F') force = true;
+        }
+        continue;
+      }
+      paths.push_back(current);
+    }
+    if (paths.empty()) return trimmed;
+    std::ostringstream normalized;
+    normalized << "Remove-Item";
+    if (recurse) normalized << " -Recurse";
+    if (force) normalized << " -Force";
+    for (const auto& path : paths) {
+      normalized << " -Path " << QuoteForPowerShellSingleQuoted(path);
+    }
+    return normalized.str();
+  }
+
+  if (commandName == "cp" && tokens.size() >= 3) {
+    bool recurse = false;
+    std::vector<std::string> args;
+    for (std::size_t i = 1; i < tokens.size(); ++i) {
+      const std::string& current = tokens[i].text;
+      if (!current.empty() && current[0] == '-') {
+        for (std::size_t j = 1; j < current.size(); ++j) {
+          const char flag = static_cast<char>(std::tolower(static_cast<unsigned char>(current[j])));
+          if (flag == 'r' || flag == 'R') recurse = true;
+        }
+        continue;
+      }
+      args.push_back(current);
+    }
+    if (args.size() < 2) return trimmed;
+    std::string dest = args.back();
+    args.pop_back();
+    std::ostringstream normalized;
+    normalized << "Copy-Item";
+    if (recurse) normalized << " -Recurse";
+    for (const auto& src : args) {
+      normalized << " -Path " << QuoteForPowerShellSingleQuoted(src);
+    }
+    normalized << " -Destination " << QuoteForPowerShellSingleQuoted(dest);
+    return normalized.str();
+  }
+
+  if (commandName == "mv" && tokens.size() >= 3) {
+    std::vector<std::string> args;
+    for (std::size_t i = 1; i < tokens.size(); ++i) {
+      const std::string& current = tokens[i].text;
+      if (!current.empty() && current[0] == '-') continue;
+      args.push_back(current);
+    }
+    if (args.size() < 2) return trimmed;
+    std::string dest = args.back();
+    args.pop_back();
+    std::ostringstream normalized;
+    normalized << "Move-Item";
+    for (const auto& src : args) {
+      normalized << " -Path " << QuoteForPowerShellSingleQuoted(src);
+    }
+    normalized << " -Destination " << QuoteForPowerShellSingleQuoted(dest);
+    return normalized.str();
+  }
 
   if (commandName == "ls") {
     bool useForce = false;
@@ -2168,6 +2318,43 @@ std::string ToolOrchestrator::ExecuteBash(const std::string& inputJson,
   }
 
   std::string finalOutput = output.str();
+
+  // GEMMA-ENHANCE: Auto-append API discovery hints when Python library errors
+  // are detected in Bash output. This gives the model immediate guidance to
+  // check the library version and discover actual API signatures, instead of
+  // blindly guessing parameter names (a major defect observed in Gemma-4-31B
+  // logs with pyecharts).
+  if (result.exitCode != 0 || !result.stderrText.empty()) {
+    std::string lowerOutput = finalOutput;
+    std::transform(lowerOutput.begin(), lowerOutput.end(),
+                   lowerOutput.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    bool isPythonApiError = false;
+    std::string libraryHint;
+    if (lowerOutput.find("typeerror") != std::string::npos &&
+        (lowerOutput.find("unexpected keyword argument") != std::string::npos ||
+         lowerOutput.find("got an unexpected") != std::string::npos ||
+         lowerOutput.find("takes") != std::string::npos)) {
+      isPythonApiError = true;
+      libraryHint = "TypeError with unexpected keyword argument";
+    } else if (lowerOutput.find("attributeerror") != std::string::npos &&
+               (lowerOutput.find("has no attribute") != std::string::npos ||
+                lowerOutput.find("module") != std::string::npos)) {
+      isPythonApiError = true;
+      libraryHint = "AttributeError (missing method/attribute)";
+    }
+    if (isPythonApiError) {
+      finalOutput +=
+          "\n\n[API Discovery Hint] The error (" + libraryHint +
+          ") suggests a library API version mismatch. Before fixing:\n"
+          "1. Run: pip show <library_name>   (check installed version)\n"
+          "2. Run: python -c \"import <lib>; help(<lib>.<class>)\" "
+          "(discover actual API)\n"
+          "3. READ the library source file to find correct parameter names\n"
+          "Do NOT guess parameter names from memory.";
+    }
+  }
+
   return TruncateResult(finalOutput, maxResultSize > 0 ? maxResultSize
                                                         : kMaxToolResultTruncation);
 }

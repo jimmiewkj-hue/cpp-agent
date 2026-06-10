@@ -16,7 +16,7 @@ enum class BlockType { Text, ToolUse, ToolResult, Image };
 
 // Model family detection for adapting prompts, tool formats, and thresholds.
 // Aligned with local-ace's model-specific behavior.
-enum class ModelFamily { Claude, Qwen, Gemma, Generic };
+enum class ModelFamily { Claude, Qwen, Gemma, MiMo, Generic };
 
 // Detect model family from model name string.
 inline ModelFamily DetectModelFamily(const std::string& model) {
@@ -26,6 +26,7 @@ inline ModelFamily DetectModelFamily(const std::string& model) {
   if (lower.find("claude") != std::string::npos) return ModelFamily::Claude;
   if (lower.find("qwen") != std::string::npos) return ModelFamily::Qwen;
   if (lower.find("gemma") != std::string::npos) return ModelFamily::Gemma;
+  if (lower.find("mimo") != std::string::npos) return ModelFamily::MiMo;
   return ModelFamily::Generic;
 }
 
@@ -39,19 +40,21 @@ inline int GetContextWindowForFamily(const std::string& model) {
   }
   switch (DetectModelFamily(model)) {
     case ModelFamily::Claude: return 200000;   // Claude 3.5/4 standard
-    case ModelFamily::Qwen:   return 131072;  // Qwen3 128K context
-    case ModelFamily::Gemma:  return 131072;  // Gemma 128K context
-    case ModelFamily::Generic: return 131072; // Safe default for unknown models
+    case ModelFamily::Qwen:   return 200000;  // Qwen3 128K context
+    case ModelFamily::Gemma:  return 200000;  // Gemma 128K context
+    case ModelFamily::MiMo:   return 200000;  // MiMo 128K context
+    case ModelFamily::Generic: return 200000; // Safe default for unknown models
   }
-  return 131072;
+  return 200000;
 }
 
 // Get default max output tokens for a model family.
 inline int GetMaxOutputTokensForFamily(const std::string& model) {
   switch (DetectModelFamily(model)) {
     case ModelFamily::Claude: return 8192;
-    case ModelFamily::Qwen:   return 8192;
-    case ModelFamily::Gemma:  return 8192;
+    case ModelFamily::Qwen:   return 16384;
+    case ModelFamily::Gemma:  return 16384;
+    case ModelFamily::MiMo:   return 16384;  // MiMo supports larger outputs
     case ModelFamily::Generic: return 8192;
   }
   return 8192;
@@ -61,7 +64,7 @@ inline int GetMaxOutputTokensForFamily(const std::string& model) {
 inline bool ModelPrefersOpenAIFormat(const std::string& model) {
   ModelFamily fam = DetectModelFamily(model);
   return fam == ModelFamily::Qwen || fam == ModelFamily::Gemma ||
-         fam == ModelFamily::Generic;
+         fam == ModelFamily::MiMo || fam == ModelFamily::Generic;
 }
 
 enum class QueryStage {
