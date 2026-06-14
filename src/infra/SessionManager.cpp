@@ -1,5 +1,7 @@
 ﻿#include "infra/SessionManager.h"
 #include "infra/ProtoLite.h"
+#include "infra/StringUtil.h"
+#include "infra/ThreadPool.h"
 #include "memory/SessionMemory.h"
 #include "third_party/nlohmann_json.hpp"
 
@@ -138,20 +140,9 @@ std::string TimestampNow() {
   return stream.str();
 }
 
-// ===== P1-04 Fix: Unicode path support =====
-static std::wstring ToWide(const std::string& utf8) {
-  if (utf8.empty()) return {};
-  int len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
-                                static_cast<int>(utf8.size()), nullptr, 0);
-  std::wstring w(static_cast<size_t>(len), L'\0');
-  MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
-                      static_cast<int>(utf8.size()), &w[0], len);
-  return w;
-}
-
 bool EnsureDirectoryRecursive(const std::string& path) {
   if (path.empty()) return false;
-  std::wstring wpath = ToWide(path);
+  std::wstring wpath = Utf8ToWide(path);
   std::replace(wpath.begin(), wpath.end(), L'/', L'\\');
   std::size_t cursor = 0;
   if (wpath.size() >= 2 && wpath[1] == L':') cursor = 3;
@@ -174,7 +165,7 @@ bool EnsureDirectoryRecursive(const std::string& path) {
 }
 
 static bool ReadFileContentUtf8(const std::string& path, std::string& out) {
-  const std::wstring wpath = ToWide(path);
+  const std::wstring wpath = Utf8ToWide(path);
   HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ,
                          FILE_SHARE_READ, nullptr,
                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -204,7 +195,7 @@ static bool ReadFileContentUtf8(const std::string& path, std::string& out) {
 
 static bool WriteFileContentUtf8(const std::string& path,
                                  const std::string& content) {
-  const std::wstring wpath = ToWide(path);
+  const std::wstring wpath = Utf8ToWide(path);
   HANDLE h = CreateFileW(wpath.c_str(), GENERIC_WRITE,
                          0, nullptr,
                          CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -219,7 +210,7 @@ static bool WriteFileContentUtf8(const std::string& path,
 
 static bool AppendFileContentUtf8(const std::string& path,
                                   const std::string& content) {
-  const std::wstring wpath = ToWide(path);
+  const std::wstring wpath = Utf8ToWide(path);
   HANDLE h = CreateFileW(wpath.c_str(), FILE_APPEND_DATA,
                          FILE_SHARE_READ, nullptr,
                          OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -2105,6 +2096,42 @@ void SessionManager::PersistSnapshot() const {
   }
 
   WriteTextFile(LatestTranscriptPath(), transcript.str());
+}
+
+void SessionManager::PersistSnapshotAsync() const {
+  // Serialize on calling thread (fast, in-memory).
+  std::string binaryData;
+  std::string legacyText;
+  std::string transcriptText;
+  std::string snapshotPath;
+  std::string legacyPath;
+  std::string transcriptPath;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const SessionSnapshot snap = BuildSnapshot();
+    binaryData = SerializeProtoSnapshot(snap);
+    BuildLegacySnapshotText(snap, &legacyText);
+    snapshotPath = SnapshotPath();
+    legacyPath = LegacySnapshotPath();
+    transcriptPath = LatestTranscriptPath();
+    std::ostringstream transcript;
+    for (const auto& m : snap.messages) {
+      const char* roleStr = "unknown";
+      if (m.role == core::MessageRole::User) roleStr = "user";
+      else if (m.role == core::MessageRole::Assistant) roleStr = "asst";
+      else if (m.role == core::MessageRole::System) roleStr = "sys";
+      transcript << "[" << roleStr << "] blocks=" << m.content.size() << "\n";
+    }
+    transcriptText = transcript.str();
+  }
+  // Write to disk on worker thread (slow I/O).
+  infra::ThreadPool::Global().Submit(
+      [binaryData, legacyText, transcriptText,
+       snapshotPath, legacyPath, transcriptPath]() {
+        WriteBinaryFile(snapshotPath, binaryData);
+        WriteTextFile(legacyPath, legacyText);
+        WriteTextFile(transcriptPath, transcriptText);
+      });
 }
 
 bool SessionManager::RestoreFromDisk() {

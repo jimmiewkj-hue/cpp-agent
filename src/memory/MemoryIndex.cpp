@@ -1,6 +1,7 @@
 #include "memory/MemoryIndex.h"
 
 #include "api/SideQueryClient.h"
+#include "infra/StringUtil.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -36,28 +37,8 @@ std::string MemoryTypeToString(MemoryType type) {
 
 namespace {
 
-std::string Trim(const std::string& value) {
-  const std::string whitespace = " \t\r\n";
-  const std::size_t start = value.find_first_not_of(whitespace);
-  if (start == std::string::npos) {
-    return std::string();
-  }
-  const std::size_t end = value.find_last_not_of(whitespace);
-  return value.substr(start, end - start + 1);
-}
-
-std::vector<std::string> SplitLines(const std::string& value) {
-  std::vector<std::string> lines;
-  std::stringstream stream(value);
-  std::string line;
-  while (std::getline(stream, line)) {
-    lines.push_back(line);
-  }
-  if (!value.empty() && value.back() == '\n') {
-    lines.push_back(std::string());
-  }
-  return lines;
-}
+using infra::Trim;
+using infra::SplitLines;
 
 std::string ReadWholeFile(const std::string& path) {
   std::ifstream input(path, std::ios::binary);

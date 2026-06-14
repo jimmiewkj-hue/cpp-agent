@@ -4,6 +4,7 @@
 #include "api/SideQueryClient.h"
 #include "agents/SubAgentManager.h"
 #include "core/QueryLoop.h"
+#include "hooks/HookExecutor.h"
 #include "infra/SessionManager.h"
 #include "infra/StabilityWatchdog.h"
 #include "memory/MemoryIndex.h"
@@ -133,6 +134,11 @@ void QueryEngine::SubmitUserPrompt(const std::string& prompt) {
   userMessage.content.push_back(ContentBlock::MakeText(prompt));
   messages_.push_back(userMessage);
   SyncSessionState();
+
+  // Fire UserPromptSubmit hooks (aligned with local-ace)
+  if (hookExecutor_) {
+    hookExecutor_->RunUserPromptSubmitHooks(prompt, 30000);
+  }
 }
 
 void QueryEngine::SaveCheckpoint() {

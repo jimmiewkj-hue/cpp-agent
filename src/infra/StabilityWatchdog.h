@@ -25,6 +25,11 @@ struct StabilityMetrics {
   double averageTurnTimeMs = 0.0;
   double lastHeartbeatAgeMs = 0.0;
   bool healthy = true;
+  // Memory tracking (added for 24h stability)
+  int64_t currentMemoryBytes = 0;     // Current RSS in bytes
+  int64_t baselineMemoryBytes = 0;    // Memory at session start
+  double memoryGrowthRatio = 1.0;     // current / baseline
+  int handleCount = 0;                // Windows handle count (0 on Linux)
 };
 
 struct TaskStateMetrics {

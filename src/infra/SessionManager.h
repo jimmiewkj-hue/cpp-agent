@@ -50,6 +50,8 @@ class SessionManager {
   std::vector<agents::SubAgentExecutorSlot> subAgentExecutors() const;
 
   void PersistSnapshot() const;
+  // Serializes snapshot on the calling thread, writes to disk on a worker thread.
+  void PersistSnapshotAsync() const;
   bool RestoreFromDisk();
 
   std::string LatestTranscriptPath() const;

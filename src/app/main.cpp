@@ -7,8 +7,12 @@
 #include "agents/SubAgentManager.h"
 #include "hooks/HookConfig.h"
 #include "hooks/HookExecutor.h"
+#include "infra/Logger.h"
+#include "infra/EnvUtil.h"
 #include "infra/SessionManager.h"
 #include "infra/StabilityWatchdog.h"
+#include "infra/StringUtil.h"
+#include "infra/ThreadPool.h"
 #include "mcp/McpClientManager.h"
 #include "memory/MemoryIndex.h"
 #include "permissions/PermissionEngine.h"
@@ -22,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <csignal>
 #include <cstring>
 #include <cstdlib>
 #include <deque>
@@ -37,8 +42,8 @@
 
 namespace {
 
-std::wstring Utf8ToWide(const std::string& text);
-std::string WideToUtf8(const std::wstring& text);
+using agent::infra::Utf8ToWide;
+using agent::infra::WideToUtf8;
 
 // ===== P0-01 Fix: Unicode-aware pipe input reader =====
 // Reads raw bytes from stdin, tries UTF-8 first, falls back to ACP (GBK/936).
@@ -83,15 +88,7 @@ std::string ReadPipedInputLineUtf8() {
 
 
 std::string GetEnvOrDefault(const char* name, const std::string& fallback) {
-  char* value = nullptr;
-  std::size_t len = 0;
-  if (_dupenv_s(&value, &len, name) != 0 || value == nullptr || value[0] == '\0') {
-    if (value != nullptr) std::free(value);
-    return fallback;
-  }
-  std::string result(value);
-  std::free(value);
-  return result;
+  return agent::infra::GetEnvOrDefault(name, fallback);
 }
 
 
@@ -245,11 +242,7 @@ std::string DiscoverProjectRoot() {
 }
 
 std::string TrimWhitespace(const std::string& value) {
-  const std::string whitespace = " \t\r\n";
-  const std::size_t begin = value.find_first_not_of(whitespace);
-  if (begin == std::string::npos) return std::string();
-  const std::size_t end = value.find_last_not_of(whitespace);
-  return value.substr(begin, end - begin + 1);
+  return agent::infra::Trim(value);
 }
 
 int GetEnvIntOrDefault(const char* name, int fallback) {
@@ -351,49 +344,22 @@ WorkspaceSelection ResolveWorkspaceSelection() {
 }
 
 std::string Trim(const std::string& value) {
-  const std::string whitespace = " \t\r\n";
-  std::size_t begin = value.find_first_not_of(whitespace);
-  if (begin == std::string::npos) return std::string();
-  if (value.size() >= begin + 3 &&
-      static_cast<unsigned char>(value[begin]) == 0xEF &&
-      static_cast<unsigned char>(value[begin + 1]) == 0xBB &&
-      static_cast<unsigned char>(value[begin + 2]) == 0xBF) {
-    begin += 3;
-    begin = value.find_first_not_of(whitespace, begin);
-    if (begin == std::string::npos) return std::string();
+  std::string trimmed = agent::infra::Trim(value);
+  // Strip UTF-8 BOM if present
+  if (trimmed.size() >= 3 &&
+      static_cast<unsigned char>(trimmed[0]) == 0xEF &&
+      static_cast<unsigned char>(trimmed[1]) == 0xBB &&
+      static_cast<unsigned char>(trimmed[2]) == 0xBF) {
+    trimmed = trimmed.substr(3);
+    trimmed = agent::infra::Trim(trimmed);
   }
-  std::size_t end = value.find_last_not_of(whitespace);
-  return value.substr(begin, end - begin + 1);
+  return trimmed;
 }
 
 std::string Shorten(const std::string& value, std::size_t maxLength) {
   if (value.size() <= maxLength) return value;
   if (maxLength <= 3) return value.substr(0, maxLength);
   return value.substr(0, maxLength - 3) + "...";
-}
-
-std::wstring Utf8ToWide(const std::string& text) {
-  if (text.empty()) return std::wstring();
-  const int size = MultiByteToWideChar(
-      CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
-  if (size <= 0) return std::wstring();
-  std::wstring wide(static_cast<std::size_t>(size), L'\0');
-  MultiByteToWideChar(
-      CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), &wide[0], size);
-  return wide;
-}
-
-std::string WideToUtf8(const std::wstring& text) {
-  if (text.empty()) return std::string();
-  const int size = WideCharToMultiByte(
-      CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
-      nullptr, 0, nullptr, nullptr);
-  if (size <= 0) return std::string();
-  std::string utf8(static_cast<std::size_t>(size), '\0');
-  WideCharToMultiByte(
-      CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
-      &utf8[0], size, nullptr, nullptr);
-  return utf8;
 }
 
 void EraseLastWideCodepoint(std::wstring* text) {
@@ -1219,8 +1185,8 @@ class AnsiTui {
           "\x1b[2m", "\x1b[36m", std::max(1, sz.width - 4));
       totalLines = static_cast<int>(displayLines.size());
     }
-    int maxVisible = msgHeight_ - 2;
-    if (maxVisible < 1) maxVisible = 1;
+    // height-3 content rows: top border(1) + content(height-3) + hint bar(1) + bottom border(1) = height
+    int maxVisible = std::max(1, msgHeight_ - 3);
     if (scrollOffset_ < 0) scrollOffset_ = 0;
     int maxOffset = totalLines - maxVisible;
     if (maxOffset < 0) maxOffset = 0;
@@ -1474,8 +1440,8 @@ class AnsiTui {
         &displayLines, "tool: ", liveToolStatus,
         "\x1b[2m", "\x1b[36m", std::max(1, boxW - 2));
 
-    int maxVisible = height - 2;
-    if (maxVisible < 1) maxVisible = 1;
+    // height-3 content rows: top border(1) + content(height-3) + hint bar(1) + bottom border(1) = height
+    int maxVisible = std::max(1, height - 3);
     int totalLines = static_cast<int>(displayLines.size());
     int maxOffset = totalLines - maxVisible;
     if (maxOffset < 0) maxOffset = 0;
@@ -1667,7 +1633,48 @@ class AnsiTui {
 
 }  // namespace
 
+// ===== Graceful shutdown support =====
+// Global flag set by signal handlers (SIGINT/SIGTERM).
+// The main loop checks this to save session state before exit.
+static std::atomic<bool> g_shutdownRequested{false};
+
+#ifdef _WIN32
+static BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
+  switch (ctrlType) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+      g_shutdownRequested.store(true);
+      return TRUE;
+    default:
+      return FALSE;
+  }
+}
+#else
+static void PosixSignalHandler(int sig) {
+  if (sig == SIGINT || sig == SIGTERM) {
+    g_shutdownRequested.store(true);
+  }
+}
+#endif
+
 int main() {
+  // Register signal handlers for graceful shutdown
+#ifdef _WIN32
+  SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+#else
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = PosixSignalHandler;
+  sigaction(SIGINT, &sa, nullptr);
+  sigaction(SIGTERM, &sa, nullptr);
+#endif
+
+  // Initialize structured logging system from environment variables
+  agent::infra::Logger::Instance().InitFromEnv();
+
   const WorkspaceSelection workspace = ResolveWorkspaceSelection();
   const std::string stateRoot = JoinPath(
       workspace.trusted ? workspace.trustedRoot : workspace.launchDir,
@@ -1687,7 +1694,7 @@ int main() {
 
   agent::core::LlmConfig llmCfg;
   llmCfg.apiEndpoint = GetEnvOrDefault(
-      "CPP_AGENT_API_ENDPOINT", "http://127.0.0.1:8080/v1/chat/completions");
+      "CPP_AGENT_API_ENDPOINT", "http://127.0.0.1:8090/v1/chat/completions");
   llmCfg.mainModel = GetEnvOrDefault(
       "CPP_AGENT_MAIN_MODEL", "gemma-4-31B-it-Q8_0");
   llmCfg.validatorModel = GetEnvOrDefault(
@@ -1776,6 +1783,10 @@ int main() {
   engine.SetSubAgentManager(&subAgentManager);
   engine.SetSessionDir(sessionDir);
   engine.SetHookExecutor(&hookExecutor);
+
+  // Fire SessionStart hooks (aligned with local-ace)
+  hookExecutor.RunSessionStartHooks(sessionDir, workspace.trustedRoot, 60000);
+
   const int maxTurns = GetEnvIntOrDefault("CPP_AGENT_MAX_TURNS", 0);
   engine.SetMaxTurns(maxTurns);
   const long long wallClockBudgetMs =
@@ -1968,6 +1979,11 @@ int main() {
         break;
       }
       case agent::core::QueryLoopEvent::Type::LoopCompleted:
+        // Flush the accumulated streaming response to the log (truncated to
+        // 200 chars) and clear the live tool status so the Messages panel
+        // stays clean after the turn completes.
+        tui.FlushLiveResponse();
+        tui.SetLiveToolStatus("");
         tui.SetTaskPanelData(agent::app::LoadTuiTaskPanelData(taskStorePath));
         tui.SetStatusText("Completed [" + event.terminalReason + "]");
         tui.AppendMessage("[completed] " + event.terminalReason,
@@ -2032,13 +2048,16 @@ int main() {
     tuiState.quitRequested.store(true);
   }
 
-  while (!tuiState.quitRequested.load()) {
+  while (!tuiState.quitRequested.load() && !g_shutdownRequested.load()) {
     if (!isInteractiveSession) break;
     tuiState.statusText = "Ready  |  /help for commands  |  Esc to quit";
     tui.RefreshStatus();
 
     std::string rawLine = tui.GetInput();
     if (rawLine.empty()) break;
+
+    // Check shutdown signal after blocking input
+    if (g_shutdownRequested.load()) break;
 
     std::string line = Trim(rawLine);
 
@@ -2252,35 +2271,25 @@ int main() {
     tuiState.statusText = "Running: " + Shorten(line, 50);
     tui.RefreshStatus();
 
-    const std::size_t prevCount = engine.messages().size();
     engine.SubmitUserPrompt(line);
     const bool ok = engine.RunTurnWithRecovery();
+    // Fix: Flush the live streaming response to the log BEFORE clearing
+    // live state. Without this, the final assistant message (the one that
+    // ends the turn without a tool call) is discarded from the display,
+    // then re-dumped all at once from the message history, causing the
+    // "last output shows all content at once" bug.
+    tui.FlushLiveResponse();
     tui.ClearLiveState();
     sessionManager.PersistSnapshot();
     // Refresh task panel after turn completes to catch any updates
     tui.SetTaskPanelData(agent::app::LoadTuiTaskPanelData(taskStorePath));
 
-    const auto& msgs = engine.messages();
-    for (std::size_t i = prevCount; i < msgs.size(); ++i) {
-      std::string text = Trim(ExtractText(msgs[i]));
-      if (text.empty()) continue;
-      const bool isAssistant =
-          msgs[i].role == agent::core::MessageRole::Assistant;
-      const bool isSystem =
-          msgs[i].role == agent::core::MessageRole::System;
-      const std::string role = isAssistant ? "asst"
-                              : isSystem ? "sys" : "user";
-      LogLineCategory cat = isAssistant ? LogLineCategory::kAssistantReply
-                          : isSystem ? LogLineCategory::kPlain
-                          : LogLineCategory::kUserInput;
-      // Detect error messages in system messages
-      if (isSystem && (text.find("error") != std::string::npos ||
-                       text.find("Error") != std::string::npos)) {
-        cat = LogLineCategory::kError;
-      }
-      for (const auto& lineText : SplitLines(text))
-        tui.AppendMessage(role + ": " + lineText, cat);
-    }
+    // NOTE: Do NOT dump engine messages here. The event callback during
+    // RunTurnWithRecovery() already logged stages, assistant streaming,
+    // tool calls, tool results, and [completed] to the TUI. Dumping them
+    // again creates massive duplication (50-100+ lines per turn) that
+    // overflows the 200-line logLines buffer and evicts early entries,
+    // making it impossible to scroll back to the start of the conversation.
 
     if (!ok)
       tui.AppendMessage("[error] Turn failed.", LogLineCategory::kError);
@@ -2294,6 +2303,10 @@ int main() {
     std::cout << "Session saved. Bye." << std::endl;
   }
   sessionManager.PersistSnapshot();
+
+  // Fire SessionEnd hooks (aligned with local-ace)
+  hookExecutor.RunSessionEndHooks(sessionDir, "user_exit", 1500);
+
   watchdog.Stop();
 
   return 0;

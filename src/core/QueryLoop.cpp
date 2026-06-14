@@ -4,6 +4,8 @@
 #include "api/SideQueryClient.h"
 #include "core/StreamingToolExecutor.h"
 #include "hooks/HookExecutor.h"
+#include "infra/EnvUtil.h"
+#include "infra/Logger.h"
 #include "infra/SessionManager.h"
 #include "permissions/PermissionEngine.h"
 #include "tools/ToolOrchestrator.h"
@@ -590,18 +592,94 @@ static bool HasRecentToolActivity(const QueryLoopContext& ctx) {
   return false;
 }
 
-std::string GetEnvString(const char* name) {
-  char buffer[256] = {0};
-  DWORD len = GetEnvironmentVariableA(name, buffer, sizeof(buffer));
-  if (len == 0 || len >= sizeof(buffer)) return {};
-  return std::string(buffer, len);
+// Detect whether the model's text-only response indicates genuine task
+// completion (vs. being stuck in a planning loop). This is the cpp-agent
+// equivalent of local-ace's stop hooks: when the model produces a conclusive
+// summary, we should terminate rather than injecting more nudges.
+//
+// Signals checked (aligned with local-ace's stop hook behavior):
+//   - Completion keywords: "done", "complete", "finished", "summary",
+//     "all tests pass", "here is", "here's", etc.
+//   - Chinese equivalents: "完成", "结束", "总结", "所有测试", "已实现"
+//   - Response length: very short conclusive responses are likely complete
+//   - Absence of planning phrases ("let me", "I will", "I need to")
+static bool IsLikelyCompletionResponse(const std::string& text) {
+  if (text.empty()) return false;
+
+  // Build lowercase version for case-insensitive matching
+  std::string lower = text;
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+
+  // Strong completion signals - if any of these appear, the model is
+  // almost certainly done. These are phrases that a model uses when
+  // wrapping up, NOT when planning next steps.
+  static const char* kStrongCompletionSignals[] = {
+    // English
+    "task is complete", "task completed", "all done", "implementation is complete",
+    "here is a summary", "here's a summary", "here is the summary",
+    "in summary", "to summarize", "summary of changes", "summary of what was done",
+    "all tests pass", "all tests passed", "tests pass successfully",
+    "successfully completed", "successfully implemented",
+    "the implementation is done", "the work is done", "everything is done",
+    "no further action", "no further changes",
+    // Chinese
+    "\xe4\xbb\xbb\xe5\x8a\xa1\xe5\xae\x8c\xe6\x88\x90",  // 任务完成
+    "\xe5\xb7\xb2\xe5\xae\x8c\xe6\x88\x90",              // 已完成
+    "\xe5\xb7\xb2\xe7\xbb\x93\xe6\x9d\x9f",              // 已结束
+    "\xe6\x80\xbb\xe7\xbb\x93",                            // 总结
+    "\xe6\x89\x80\xe6\x9c\x89\xe6\xb5\x8b\xe8\xaf\x95",  // 所有测试
+    "\xe5\xb7\xb2\xe5\xae\x9e\xe7\x8e\xb0",              // 已实现
+    "\xe5\xae\x8c\xe6\x88\x90\xe4\xba\x86",              // 完成了
+    "\xe5\xb7\xa5\xe4\xbd\x9c\xe5\xb7\xb2\xe5\xae\x8c",  // 工作已完
+  };
+  for (const auto& signal : kStrongCompletionSignals) {
+    if (lower.find(signal) != std::string::npos) return true;
+  }
+
+  // Planning signals - if any of these appear, the model is NOT done
+  static const char* kPlanningSignals[] = {
+    "let me ", "i will ", "i need to ", "i should ", "i'll ",
+    "now i ", "next i ", "then i ", "after that",
+    "\xe8\xae\xa9\xe6\x88\x91",      // 让我
+    "\xe6\x88\x91\xe9\x9c\x80\xe8\xa6\x81",  // 我需要
+    "\xe6\x88\x91\xe5\xb0\x86",      // 我将
+    "\xe6\x8e\xa5\xe4\xb8\x8b\xe6\x9d\xa5",  // 接下来
+  };
+  for (const auto& signal : kPlanningSignals) {
+    if (lower.find(signal) != std::string::npos) return false;
+  }
+
+  // Weak completion signals - check for these in combination with
+  // short response length. A brief conclusive response without planning
+  // phrases is likely a genuine completion.
+  static const char* kWeakCompletionSignals[] = {
+    "done", "complete", "finished", "implemented",
+    "created", "updated", "modified", "fixed",
+    "all set", "ready",
+    "\xe5\xae\x8c\xe6\x88\x90",  // 完成
+    "\xe5\xa5\xbd\xe4\xba\x86",  // 好了
+  };
+  bool hasWeakSignal = false;
+  for (const auto& signal : kWeakCompletionSignals) {
+    if (lower.find(signal) != std::string::npos) {
+      hasWeakSignal = true;
+      break;
+    }
+  }
+
+  // A short response (< 500 chars) with a weak completion signal and
+  // no planning signals is likely a genuine wrap-up.
+  if (hasWeakSignal && text.size() < 500) return true;
+
+  return false;
 }
 
 std::string ResolveValidatorModel(const QueryLoopContext& ctx) {
   if (!ctx.validatorModel.empty()) return ctx.validatorModel;
-  std::string model = GetEnvString("CPP_AGENT_VALIDATOR_MODEL");
+  std::string model = infra::GetEnvString("CPP_AGENT_VALIDATOR_MODEL");
   if (!model.empty()) return model;
-  return GetEnvString("LOCALMODEL_VALIDATION_MODEL");
+  return infra::GetEnvString("LOCALMODEL_VALIDATION_MODEL");
 }
 
 bool ShouldRunValidation(const QueryLoopContext& ctx) {
@@ -1154,6 +1232,9 @@ bool QueryLoop::IsWallClockExpired(QueryLoopContext& ctx) const {
   const long long elapsedMs = CurrentTimeMs() - loopStartTimeMs_;
   if (elapsedMs < wallClockBudgetMs_) return false;
 
+  LOG_WARN(QUERY, "Wall-clock budget exceeded",
+           {{"elapsedMs", std::to_string(elapsedMs)},
+            {"budgetMs", std::to_string(wallClockBudgetMs_)}});
   Message timeout;
   timeout.role = MessageRole::System;
   timeout.uuid = "wall-clock-timeout";
@@ -2461,6 +2542,11 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
   // any side effects happen.
   const bool useStreamingExecution = false;
   const std::string modelTraceId = MakeQueryLoopTraceId("model-call");
+  LOG_INFO(QUERY, "Model call start",
+           {{"turn", std::to_string(state.turnCount)},
+            {"model", ctx.model},
+            {"contextMessages", std::to_string(ctx.messages.size())},
+            {"transition", std::to_string(static_cast<int>(state.transition))}});
   ReportQueryLoopDebugEvent(
       "1", "QueryLoop.cpp:model-call:start",
       "[DEBUG] About to start model call",
@@ -2710,6 +2796,9 @@ bool QueryLoop::Handle413Recovery(QueryLoopContext& ctx,
   if (state.assistantMessages.empty()) return false;
   const Message& lastMsg = state.assistantMessages.back();
   if (!lastMsg.isApiErrorMessage) return false;
+  LOG_WARN(QUERY, "413/prompt-too-long recovery triggered",
+           {{"turn", std::to_string(state.turnCount)},
+            {"contextMessages", std::to_string(ctx.messages.size())}});
 
   // Detect prompt-too-long: either explicit patterns OR generic HTTP 400
   // with a large context (likely context overflow on local LLM servers).
@@ -2910,6 +2999,25 @@ StopHookResult QueryLoop::ExecuteStopHooks(QueryLoopContext& ctx,
         ctx.hookExecutor->RunStopHooks(stopReason, 30000);
     MergeHookMessages(batch, "stop-hook", &result.followupMessages,
                       &result.blockingErrors);
+
+    // Fire StopFailure hooks if any stop hook errored (aligned with local-ace)
+    bool anyStopHookError = false;
+    for (const auto& hookResult : batch.results) {
+      if (hookResult.outcome == hooks::HookOutcome::NonBlockingError) {
+        anyStopHookError = true;
+        break;
+      }
+    }
+    if (anyStopHookError) {
+      std::string errorMsg;
+      for (const auto& hr : batch.results) {
+        if (hr.outcome == hooks::HookOutcome::NonBlockingError && !hr.stderrText.empty()) {
+          errorMsg += hr.stderrText + "; ";
+        }
+      }
+      ctx.hookExecutor->RunStopFailureHooks(stopReason, errorMsg, 30000);
+    }
+
     for (const auto& hookResult : batch.results) {
       if (hookResult.outcome == hooks::HookOutcome::Blocking) {
         result.preventContinuation = false;
@@ -3263,13 +3371,27 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
   // --- Bounded continuation nudge (aligned with local-ace max_output_tokens
   // recovery). When the model was actively using tools and then stops with
   // text-only output (no tool_use), it likely hit a generation limit rather
-  // than genuinely finishing. Inject a short "resume" nudge, capped at 5
-  // attempts to prevent death spirals. Increased from 3 to 5 for weaker
-  // models (Qwen 3.6 35b) that need more directive prompting.
-  int maxNoToolNudges = 5;
+  // than genuinely finishing. Inject a short "resume" nudge, capped to
+  // prevent death spirals.
+  //
+  // IMPORTANT: The counter (missingToolUsePromptCount) NEVER resets within
+  // a single RunFull() loop. For models like Gemma-4-31B that naturally
+  // alternate between text-only planning turns and tool-call turns, each
+  // text-only turn burns one nudge from the budget. A real engineering task
+  // with 20+ tool calls could have 20+ text-only turns, so the budget must
+  // be large enough to accommodate productive alternating patterns while
+  // still preventing infinite death spirals.
+  int maxNoToolNudges = 10;
   ModelFamily family = DetectModelFamily(ctx.model);
-  if (family == ModelFamily::Qwen || family == ModelFamily::Gemma) {
-    maxNoToolNudges = 8;
+  if (family == ModelFamily::Qwen) {
+    maxNoToolNudges = 15;
+  } else if (family == ModelFamily::Gemma) {
+    // Gemma-4-31B has a strong tendency to produce long reasoning text
+    // before tool calls, and frequently alternates between text-only and
+    // tool-call turns. Engineering tests (jianlai_graph2) show 9+ text-only
+    // turns in a 21-turn session. Budget of 30 allows ~60 total turns
+    // with alternating pattern, sufficient for complex tasks.
+    maxNoToolNudges = 30;
   }
   const bool hasPriorToolActivity = HasRecentToolActivity(ctx);
   const bool modelProducedText = !CollectText(state.assistantMessages).empty();
@@ -3330,7 +3452,21 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
   }
 
   if ((hasPriorToolActivity && modelProducedText) || isRepetitivePlanning) {
-    if (state.missingToolUsePromptCount < maxNoToolNudges) {
+    // CRITICAL: Before injecting a nudge, check if the model's response
+    // indicates genuine task completion. This prevents unnecessary repeated
+    // prompts when the model has legitimately finished the task but didn't
+    // emit a tool_use block. Aligned with local-ace's approach where
+    // end_turn without tool_use is treated as a natural termination.
+    if (!isRepetitivePlanning && IsLikelyCompletionResponse(currentText)) {
+      ReportQueryLoopDebugEvent(
+          "4", "QueryLoop.cpp:no-tool:completion-detected",
+          "[DEBUG] Model response indicates genuine completion, terminating",
+          {{"turnCount", state.turnCount},
+           {"nudgeCount", state.missingToolUsePromptCount},
+           {"textPreview", TruncateDebugText(currentText)}},
+          MakeQueryLoopTraceId("completion"));
+      // Fall through to HandleTokenBudget + ApplyStepTerminate below
+    } else if (state.missingToolUsePromptCount < maxNoToolNudges) {
       ++state.missingToolUsePromptCount;
       ReportQueryLoopDebugEvent(
           "4", "QueryLoop.cpp:no-tool:bounded-nudge",
@@ -3705,6 +3841,16 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
   EmitQueryLoopEvent(
       ctx, QueryLoopEvent::Type::LoopCompleted, QueryStage::Completed, nullptr,
       state.terminalReason);
+
+  // Fire Notification hooks when query loop completes (aligned with local-ace)
+  if (ctx.hookExecutor != nullptr) {
+    const std::string notifMessage =
+        "Agent turn completed (reason: " + state.terminalReason +
+        ", turns: " + std::to_string(state.turnCount) + ")";
+    ctx.hookExecutor->RunNotificationHooks(
+        notifMessage, state.terminalReason, 15000);
+  }
+
   ctx.lastTerminalReason = state.terminalReason;
   if (ctx.sessionManager != nullptr) {
     SessionMetadata metadata = ctx.sessionManager->metadata();

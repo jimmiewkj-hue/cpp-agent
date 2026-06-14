@@ -1,4 +1,5 @@
 #include "infra/StabilityWatchdog.h"
+#include "platform/Platform.h"
 
 #include <chrono>
 #include <iostream>
@@ -12,6 +13,9 @@ StabilityWatchdog::StabilityWatchdog(const StabilityConfig& config)
       std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::system_clock::now().time_since_epoch())
           .count());
+  // Record baseline memory for growth tracking
+  metrics_.baselineMemoryBytes = platform::GetProcessMemoryBytes();
+  metrics_.currentMemoryBytes = metrics_.baselineMemoryBytes;
 }
 
 void StabilityWatchdog::Start() {
@@ -115,6 +119,29 @@ bool StabilityWatchdog::PerformHealthCheck() {
   const int64_t age = now - lastHeartbeat_.load();
 
   bool healthy = true;
+
+  // Memory tracking: detect potential leaks (RSS > 2x baseline)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    metrics_.currentMemoryBytes = platform::GetProcessMemoryBytes();
+    metrics_.handleCount = platform::GetProcessHandleCount();
+    if (metrics_.baselineMemoryBytes > 0) {
+      metrics_.memoryGrowthRatio =
+          static_cast<double>(metrics_.currentMemoryBytes) /
+          static_cast<double>(metrics_.baselineMemoryBytes);
+    }
+    // Alert if memory grew beyond 2x baseline
+    if (metrics_.memoryGrowthRatio > 2.0) {
+      metrics_.healthy = false;
+      healthy = false;
+    }
+    // Alert if exceeding configured memory limit
+    if (config_.maxMemoryBytes > 0 &&
+        metrics_.currentMemoryBytes > config_.maxMemoryBytes) {
+      metrics_.healthy = false;
+      healthy = false;
+    }
+  }
 
   if (age > static_cast<int64_t>(config_.heartbeatTimeoutMs)) {
     std::lock_guard<std::mutex> lock(mutex_);

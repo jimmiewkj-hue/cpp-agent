@@ -39,6 +39,8 @@ enum class HookEventType {
   TeammateIdle,
   Elicitation,
   ElicitationResult,
+  WorktreeCreate,
+  WorktreeRemove,
 };
 
 inline const char* HookEventTypeToString(HookEventType event) {
@@ -68,6 +70,8 @@ inline const char* HookEventTypeToString(HookEventType event) {
     case HookEventType::TeammateIdle: return "TeammateIdle";
     case HookEventType::Elicitation: return "Elicitation";
     case HookEventType::ElicitationResult: return "ElicitationResult";
+    case HookEventType::WorktreeCreate: return "WorktreeCreate";
+    case HookEventType::WorktreeRemove: return "WorktreeRemove";
   }
   return "Unknown";
 }
@@ -98,6 +102,8 @@ inline HookEventType ParseHookEventType(const std::string& s) {
   if (s == "TeammateIdle") return HookEventType::TeammateIdle;
   if (s == "Elicitation") return HookEventType::Elicitation;
   if (s == "ElicitationResult") return HookEventType::ElicitationResult;
+  if (s == "WorktreeCreate") return HookEventType::WorktreeCreate;
+  if (s == "WorktreeRemove") return HookEventType::WorktreeRemove;
   return HookEventType::Notification;  // fallback
 }
 

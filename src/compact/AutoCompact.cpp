@@ -1,34 +1,18 @@
 #include "compact/AutoCompact.h"
+#include "infra/EnvUtil.h"
+#include "infra/StringUtil.h"
 
 #include <algorithm>
 #include <cstdlib>
 #include <sstream>
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 namespace agent {
 namespace compact {
 
 namespace {
 
-std::string GetEnvString(const char* name) {
-#ifdef _WIN32
-  char buffer[512] = {0};
-  DWORD len = GetEnvironmentVariableA(name, buffer, sizeof(buffer));
-  if (len == 0 || len >= sizeof(buffer)) return std::string();
-  return std::string(buffer, len);
-#else
-  const char* val = std::getenv(name);
-  return val ? std::string(val) : std::string();
-#endif
-}
-
-bool IsEnvTruthy(const std::string& value) {
-  return value == "1" || value == "true" || value == "TRUE" ||
-         value == "yes" || value == "YES" || value == "on" || value == "ON";
-}
+using infra::GetEnvString;
+using infra::IsTruthyEnvValue;
 
 }  // namespace
 
@@ -114,10 +98,10 @@ TokenWarningState CalculateTokenWarningState(
 // IsAutoCompactEnabled ? aligned with local-ace
 // ============================================================================
 bool IsAutoCompactEnabled() {
-  if (IsEnvTruthy(GetEnvString("CPP_AGENT_DISABLE_COMPACT"))) {
+  if (IsTruthyEnvValue(GetEnvString("CPP_AGENT_DISABLE_COMPACT"))) {
     return false;
   }
-  if (IsEnvTruthy(GetEnvString("CPP_AGENT_DISABLE_AUTO_COMPACT"))) {
+  if (IsTruthyEnvValue(GetEnvString("CPP_AGENT_DISABLE_AUTO_COMPACT"))) {
     return false;
   }
   return true;  // Default: enabled

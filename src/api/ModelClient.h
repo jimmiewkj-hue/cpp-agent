@@ -114,6 +114,16 @@ class HttpLlmClient : public ModelClient {
                            std::string* pathOverride,
                            std::string* error) const;
 
+  // Retry wrapper: retries SendHttpPost on transient HTTP errors (429, 500,
+  // 502, 503, 529) with exponential backoff and jitter. Aligned with
+  // local-ace's withRetry.ts strategy.
+  // maxRetries: max retry attempts (default 5).
+  std::string SendHttpPostWithRetry(const std::string& body,
+                                     const std::string& model,
+                                     std::string* pathOverride,
+                                     std::string* error,
+                                     int maxRetries = 5) const;
+
   core::LlmConfig config_;
   bool isNativeAnthropic_ = false;
 };

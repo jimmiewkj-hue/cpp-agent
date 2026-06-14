@@ -1,7 +1,11 @@
 #include "api/ModelClient.h"
+#include "infra/EnvUtil.h"
+#include "infra/Logger.h"
+#include "infra/StringUtil.h"
 #include "third_party/nlohmann_json.hpp"
 
 #include <fstream>
+#include <iostream>
 #include <windows.h>
 #include <winhttp.h>
 
@@ -24,33 +28,11 @@ struct DebugServerConfig {
   std::string sessionId = "stream-response-stall";
 };
 
-bool IsTruthyEnvValue(const std::string& value) {
-  return value == "1" || value == "true" || value == "TRUE" ||
-         value == "yes" || value == "YES" || value == "on" ||
-         value == "ON";
-}
-
-std::string GetEnvString(const char* name) {
-  char buffer[512] = {0};
-  DWORD len = GetEnvironmentVariableA(name, buffer, sizeof(buffer));
-  if (len == 0 || len >= sizeof(buffer)) return std::string();
-  return std::string(buffer, len);
-}
+using infra::GetEnvString;
+using infra::IsTruthyEnvValue;
 
 std::string TrimDebugValue(const std::string& value) {
-  std::size_t start = 0;
-  std::size_t end = value.size();
-  while (start < end &&
-         (value[start] == ' ' || value[start] == '\r' || value[start] == '\n' ||
-          value[start] == '\t')) {
-    ++start;
-  }
-  while (end > start &&
-         (value[end - 1] == ' ' || value[end - 1] == '\r' ||
-          value[end - 1] == '\n' || value[end - 1] == '\t')) {
-    --end;
-  }
-  return value.substr(start, end - start);
+  return infra::Trim(value);
 }
 
 DebugServerConfig LoadDebugServerConfig() {
@@ -172,40 +154,15 @@ void ReportDebugEvent(const std::string& runId,
 // #endregion
 
 std::wstring ToWide(const std::string& text) {
-  if (text.empty()) return {};
-  int sz = MultiByteToWideChar(CP_UTF8, 0, text.c_str(),
-                               static_cast<int>(text.size()), nullptr, 0);
-  std::wstring w(static_cast<size_t>(sz), L'\0');
-  MultiByteToWideChar(CP_UTF8, 0, text.c_str(),
-                      static_cast<int>(text.size()), &w[0], sz);
-  return w;
+  return infra::Utf8ToWide(text);
 }
 
 std::string ToUtf8(const std::wstring& text) {
-  if (text.empty()) return {};
-  int sz = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
-                               static_cast<int>(text.size()),
-                               nullptr, 0, nullptr, nullptr);
-  std::string u(static_cast<size_t>(sz), '\0');
-  WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
-                      static_cast<int>(text.size()),
-                      &u[0], sz, nullptr, nullptr);
-  return u;
+  return infra::WideToUtf8(text);
 }
 
 std::string EscapeJson(const std::string& s) {
-  std::ostringstream o;
-  for (char c : s) {
-    switch (c) {
-      case '"':  o << "\\\""; break;
-      case '\\': o << "\\\\"; break;
-      case '\n': o << "\\n"; break;
-      case '\r': o << "\\r"; break;
-      case '\t': o << "\\t"; break;
-      default:   o << c; break;
-    }
-  }
-  return o.str();
+  return infra::EscapeJson(s);
 }
 
 std::string RoleToString(core::MessageRole role) {
@@ -1272,11 +1229,76 @@ std::string HttpLlmClient::SendHttpPost(const std::string& body,
   return responseBody;
 }
 
+// Retry helper: retries SendHttpPost on transient HTTP errors with
+// exponential backoff and jitter. Aligned with local-ace's withRetry.ts.
+std::string HttpLlmClient::SendHttpPostWithRetry(
+    const std::string& body, const std::string& model,
+    std::string* pathOverride, std::string* error, int maxRetries) const {
+  static constexpr int kBaseDelayMs = 500;
+  static constexpr int kMaxDelayMs = 30000;
+
+  for (int attempt = 0; attempt <= maxRetries; ++attempt) {
+    std::string attemptError;
+    std::string result = SendHttpPost(body, model, pathOverride, &attemptError);
+
+    if (attemptError.empty()) {
+      // Success
+      if (error) error->clear();
+      return result;
+    }
+
+    // Parse HTTP status code from error string "HTTP NNN ..."
+    int httpStatus = 0;
+    if (attemptError.size() > 5 && attemptError.substr(0, 5) == "HTTP ") {
+      httpStatus = std::atoi(attemptError.substr(5).c_str());
+    }
+
+    // Determine if this error is retryable
+    bool retryable = false;
+    if (httpStatus == 429 || httpStatus == 500 || httpStatus == 502 ||
+        httpStatus == 503 || httpStatus == 529) {
+      retryable = true;
+    }
+    // Also retry on connection-level failures (no HTTP status)
+    if (httpStatus == 0 && (attemptError.find("failed") != std::string::npos ||
+                            attemptError.find("timeout") != std::string::npos)) {
+      retryable = true;
+    }
+
+    if (!retryable || attempt >= maxRetries) {
+      if (error) *error = attemptError;
+      return {};
+    }
+
+    // Exponential backoff with jitter
+    int delay = kBaseDelayMs * (1 << attempt);
+    if (delay > kMaxDelayMs) delay = kMaxDelayMs;
+    // Add jitter: +/- 25%
+    int jitter = delay / 4;
+    delay += (std::rand() % (2 * jitter + 1)) - jitter;
+    if (delay < 100) delay = 100;
+
+    // Check for Retry-After header (simplified: just use the backoff)
+    // Log retry attempt via structured logger
+    LOG_WARN(MODEL, "HTTP retry",
+             {{"attempt", std::to_string(attempt + 1) + "/" + std::to_string(maxRetries)},
+              {"httpStatus", std::to_string(httpStatus)},
+              {"delayMs", std::to_string(delay)}});
+
+    Sleep(delay);
+  }
+
+  if (error) *error = "Max retries exceeded";
+  return {};
+}
+
 std::vector<core::Message> HttpLlmClient::GenerateResponse(
     const std::vector<core::Message>& messages,
     const std::string& systemPrompt,
     const std::string& model) {
   std::string actualModel = model.empty() ? config_.mainModel : model;
+  LOG_INFO(MODEL, "GenerateResponse start",
+           {{"model", actualModel}, {"messages", std::to_string(messages.size())}});
   if (!isNativeAnthropic_) {
     return CollectStreamedTextResponse(
         this, messages, systemPrompt, actualModel, 4096);
@@ -1284,9 +1306,11 @@ std::vector<core::Message> HttpLlmClient::GenerateResponse(
   std::string body = BuildRequestBody(messages, systemPrompt, actualModel,
                                       4096, false, "");
   std::string error;
-  std::string raw = SendHttpPost(body, actualModel, nullptr, &error);
+  std::string raw = SendHttpPostWithRetry(body, actualModel, nullptr, &error);
   (void)raw;
   if (!error.empty()) {
+    LOG_ERROR(MODEL, "GenerateResponse API error",
+              {{"model", actualModel}, {"error", error}});
     core::Message errMsg;
     errMsg.role = core::MessageRole::Assistant;
     errMsg.uuid = "http-err";
@@ -1313,6 +1337,10 @@ void HttpLlmClient::StreamResponse(
     int maxTokensOverride) {
   const auto start = std::chrono::steady_clock::now();
   const std::string traceId = MakeDebugTraceId("stream");
+  std::string actualModel = model.empty() ? config_.mainModel : model;
+  LOG_INFO(MODEL, "StreamResponse start",
+           {{"model", actualModel}, {"messages", std::to_string(messages.size())},
+            {"hasTools", !toolsJson.empty() ? "true" : "false"}});
   int textEventCount = 0;
   int toolEventCount = 0;
   int apiErrorCount = 0;
@@ -1337,7 +1365,6 @@ void HttpLlmClient::StreamResponse(
         }
         if (onEvent) onEvent(event, data);
       };
-  std::string actualModel = model.empty() ? config_.mainModel : model;
   // Aligned with local-ace CAPPED_DEFAULT_MAX_TOKENS (8000). The previous
   // value of 4096 was too small for generating large file-creation tool_use
   // blocks, causing the model to stop mid-task without emitting tools.
@@ -1356,7 +1383,7 @@ void HttpLlmClient::StreamResponse(
   std::string body = BuildRequestBody(messages, systemPrompt, actualModel,
                                       maxTokens, true, toolsJson);
   std::string error;
-  std::string raw = SendHttpPost(body, actualModel, nullptr, &error);
+  std::string raw = SendHttpPostWithRetry(body, actualModel, nullptr, &error);
   // #region debug-point B:stream-post-return
   ReportDebugEvent("pre-fix", "B", "ModelClient.cpp:stream:post-return",
                    "[DEBUG] StreamResponse SendHttpPost returned",
@@ -1422,6 +1449,15 @@ void HttpLlmClient::StreamResponse(
                             std::chrono::steady_clock::now() - start).count())}},
                    traceId);
   // #endregion
+  LOG_INFO(MODEL, "StreamResponse complete",
+           {{"model", actualModel},
+            {"totalEvents", std::to_string(totalEventCount)},
+            {"textEvents", std::to_string(textEventCount)},
+            {"toolEvents", std::to_string(toolEventCount)},
+            {"apiErrors", std::to_string(apiErrorCount)},
+            {"elapsedMs", std::to_string(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start).count())}});
 }
 
 std::vector<core::Message> HttpLlmClient::SideQuery(

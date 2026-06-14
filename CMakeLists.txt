@@ -10,6 +10,7 @@ option(AGENT_ENABLE_AUTODREAM "Enable Auto-Dream background consolidation" ON)
 option(AGENT_ENABLE_STREAMING_TOOLS "Enable streaming tool execution" ON)
 option(AGENT_ENABLE_SANDBOX "Enable OS-level sandbox (requires platform support)" OFF)
 option(AGENT_ENABLE_WEB_TOOLS "Enable WebFetch/WebSearch network tools" OFF)
+option(AGENT_ENABLE_LOGGING "Enable structured logging system" ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -53,6 +54,9 @@ if(AGENT_ENABLE_STREAMING_TOOLS)
 endif()
 if(AGENT_ENABLE_WEB_TOOLS)
   add_compile_definitions(AGENT_FEATURE_WEB_TOOLS)
+endif()
+if(AGENT_ENABLE_LOGGING)
+  add_compile_definitions(AGENT_FEATURE_LOGGING)
 endif()
 
 add_library(agent_core
@@ -111,12 +115,25 @@ add_library(agent_core
   src/tools/WebSearchTool.cpp
   src/tools/NotebookEditTool.cpp
   src/tools/TaskCreateTool.cpp
-  src/tools/ToolOrchestrator.cpp
+  src/tools/ToolOrchestratorNew.cpp
+  src/tools/BashHelpers.cpp
+  src/tools/FileHelpers.cpp
   src/tools/ToolRegistry.cpp
   src/tools/Tool.cpp
   src/tools/ToolSearch.cpp
   src/core/LocalValidator.cpp
+  src/infra/StringUtil.cpp
+  src/infra/EnvUtil.cpp
+  src/infra/Logger.cpp
+  src/infra/ThreadPool.cpp
 )
+
+# Platform-specific source files
+if(WIN32)
+  target_sources(agent_core PRIVATE src/platform/PlatformWin32.cpp)
+else()
+  target_sources(agent_core PRIVATE src/platform/PlatformPosix.cpp)
+endif()
 
 target_include_directories(agent_core
   PUBLIC
@@ -126,7 +143,10 @@ target_include_directories(agent_core
 target_compile_features(agent_core PUBLIC cxx_std_17)
 
 if(WIN32)
-  target_link_libraries(agent_core PUBLIC winhttp)
+  target_link_libraries(agent_core PUBLIC winhttp psapi)
+else()
+  find_package(CURL REQUIRED)
+  target_link_libraries(agent_core PUBLIC CURL::libcurl pthread)
 endif()
 
 add_executable(agent_cli
