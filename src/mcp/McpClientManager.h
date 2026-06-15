@@ -144,6 +144,19 @@ class McpClientManager {
                                  std::string* bodyJson,
                                  std::string* error);
 
+  // STRENGTHEN-01: Invoke a tool on a connected MCP server via the
+  // "tools/call" JSON-RPC method. serverName matches RegisterServer;
+  // toolName is the bare tool name (NOT the "mcp__server__tool" fully
+  // qualified name); argumentsJson is the tool input as a JSON object
+  // string. On success, resultJson receives the raw "result" body (which
+  // contains a "content" array per the MCP spec); *error is set on failure.
+  // This mirrors ReadResourceFromTransport's structure exactly.
+  bool CallTool(const std::string& serverName,
+                const std::string& toolName,
+                const std::string& argumentsJson,
+                std::string* resultJson,
+                std::string* error);
+
   static std::string BuildMcpToolName(
       const std::string& serverName,
       const std::string& toolName);

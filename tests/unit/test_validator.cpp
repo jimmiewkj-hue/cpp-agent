@@ -1,5 +1,6 @@
 #include "core/LocalValidator.h"
 #include "core/AgentTypes.h"
+#include "core/StateTypes.h"
 
 #include <cassert>
 #include <iostream>
@@ -154,6 +155,38 @@ void TestRunLocalFinalTextValidation() {
   Check(result.immediateResult.has_value(), "Markdown in plain text response triggers validation");
 }
 
+// STRENGTHEN-07: Verify the ValidatorTier comparison logic that gates whether
+// the LLM validator runs. This is the core fix for the "same-tier
+// net-negative" death-loop (validator-retry-limit-session evidence).
+void TestValidatorTierComparison() {
+  using namespace agent::core;
+  // Cloud validating local -> Stronger (LLM validator should run)
+  Check(CompareModelFamilies(ModelFamily::Qwen, ModelFamily::Claude)
+        == ValidatorTier::Stronger,
+        "Claude validating Qwen => Stronger");
+  Check(CompareModelFamilies(ModelFamily::Gemma, ModelFamily::Claude)
+        == ValidatorTier::Stronger,
+        "Claude validating Gemma => Stronger");
+  // Local validating cloud -> Weaker (LLM validator should NOT run)
+  Check(CompareModelFamilies(ModelFamily::Claude, ModelFamily::Qwen)
+        == ValidatorTier::Weaker,
+        "Qwen validating Claude => Weaker");
+  // Same-tier local-local -> Peer (the death-loop scenario)
+  Check(CompareModelFamilies(ModelFamily::Qwen, ModelFamily::Gemma)
+        == ValidatorTier::Peer,
+        "Gemma validating Qwen => Peer (no net benefit)");
+  Check(CompareModelFamilies(ModelFamily::Gemma, ModelFamily::Qwen)
+        == ValidatorTier::Peer,
+        "Qwen validating Gemma => Peer (no net benefit)");
+  Check(CompareModelFamilies(ModelFamily::Qwen, ModelFamily::Qwen)
+        == ValidatorTier::Peer,
+        "Qwen validating Qwen => Peer (self-validation)");
+  // Cloud-cloud -> Peer (conservative)
+  Check(CompareModelFamilies(ModelFamily::Claude, ModelFamily::Claude)
+        == ValidatorTier::Peer,
+        "Claude validating Claude => Peer");
+}
+
 int main() {
   TestExtractOriginalUserGoal();
   TestRequiresDirectTextResponse();
@@ -163,6 +196,7 @@ int main() {
   TestBuildCompactConstraints();
   TestRunLocalToolValidation();
   TestRunLocalFinalTextValidation();
+  TestValidatorTierComparison();
   
   if (failures == 0) {
     std::cout << "All validator tests PASSED" << std::endl;

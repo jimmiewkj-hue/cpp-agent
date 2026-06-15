@@ -1,0 +1,4 @@
+alpha: 42
+beta: 17
+gamma: 89
+delta: 3

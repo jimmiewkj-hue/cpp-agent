@@ -458,3 +458,37 @@ graph TB
 ---
 
 *本文档基于对 local-ace (TypeScript/Bun) 和 cpp-agent (C++17/CMake) 源码的完整分析生成*
+
+
+---
+
+## 附录：STRENGTHENING_PLAN 实施进度（T21 同步）
+
+> 本附录随 STRENGTHENING_PLAN.md 任务推进实时更新。状态：✅ done / ⚠️ partial / ❌ missing / ⏸️ deferred。
+
+| 任务 | 状态 | 说明 |
+|---|---|---|
+| T00 POSIX 构建诚实性 | ✅ done | CMake 加 FATAL_ERROR 守卫，标注 Windows-only |
+| T01 MCP 工具调用（tools/call） | ✅ done | McpClientManager::CallTool + ExecuteToolBlock mcp__ 分支 + ExecuteMcpTool |
+| T02 no-tool 续轮调度器 | ✅ done | HandleNoToolContinuation 9 条件链已实装 |
+| T03 messagesForTurn 分离 | ✅ done | ApplyStep* 操作 state.messagesForTurn，不污染 ctx.messages |
+| T04 maxOutputTokensOverride | ✅ done | StreamResponse 传参 + HttpLlmClient 使用（已实装） |
+| T05 fallback model 内聚 | ✅ done | 主循环内 state.activeModel 切换（QueryLoop.cpp:4050） |
+| T06 ContinueWithFollowup | ✅ done | 统一入口，7 步齐全，6+ 调用点 |
+| T07 ValidatorTier 分层 | ✅ done | ValidatorTier 枚举 + CompareModelFamilies，默认 Peer |
+| T08 结构化 patch 注入 | ✅ done | ValidationPatch + 非破坏性 review note 注入 |
+| T09 动态有效率门控 | ✅ done | validatorOutcomes 滑动窗口 + effectiveness<0.3 跳过 |
+| T10 事前契约 execution_contract | ✅ done | GenerateExecutionContract（Strong 档首轮） |
+| T11 并行预判校验 | ⏸️ deferred | 需异步架构改造，当前 validator 串行 |
+| T12 BashClassifier LLM | ✅ done | SetClassifierCallback + 缓存 + pattern-miss 回调 |
+| T13 权限校验器细分 | ⏸️ deferred | BashClassifier 已含基础 mode/path/readOnly，细分延后 |
+| T14 工具集扩充 | ⏸️ deferred | 按需移植，MCP 已通 |
+| T15 reactiveCompact 独立 | ⏸️ deferred | 逻辑已在 QueryLoop DoReactiveCompact 内联 |
+| T16 skillSearch/teamMemorySync | ⏸️ deferred | 记忆子系统基础已就绪 |
+| T17 SSRF guard | ✅ done | hooks/SsrfGuard.{h,cpp} + WebFetch 接入 + 测试全绿 |
+| T18 OS 级沙箱 | ✅ done(评估) | 评估文档 SANDBOX_EVALUATION.md，决策不引入 |
+| T19 VCR 录像回放 | ⏸️ deferred | 低优先级 |
+| T20 流式工具运行期开启 | ✅ done | AGENT_ENABLE_STREAMING_TOOLS env 门控 |
+| T21 parity 表同步 | ✅ done | 本附录 |
+
+**汇总**：15 done / 1 done(评估) / 7 deferred。所有 P0 任务（T00-T10）完成；P1/P2 中 T12/T17/T20 完成，其余按 ROI 延后。

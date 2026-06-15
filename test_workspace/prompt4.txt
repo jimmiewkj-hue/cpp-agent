@@ -1,0 +1,1 @@
+Read the file calculator.py. Then add a new method called power(self, a, b) that returns a raised to the power b. After adding the method, Read the file again to verify the change was made correctly.

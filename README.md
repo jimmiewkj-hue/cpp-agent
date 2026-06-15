@@ -8,16 +8,34 @@
 
 ## Table of Contents / 目录
 
-- [Architecture Overview / 架构概览](#architecture-overview--架构概览)
-- [System Architecture Diagram / 系统架构图](#system-architecture-diagram--系统架构图)
-- [Data Flow Diagram / 数据流图](#data-flow-diagram--数据流图)
-- [Use Case Diagram / 用例图](#use-case-diagram--用例图)
-- [Module Reference / 模块参考](#module-reference--模块参考)
-- [Feature Parity with local-ace / 与 local-ace 的功能对齐](#feature-parity-with-local-ace--与-local-ace-的功能对齐)
-- [Build & Run / 构建与运行](#build--run--构建与运行)
-- [Configuration / 配置](#configuration--配置)
-- [Testing / 测试](#testing--测试)
-- [Project Structure / 项目结构](#project-structure--项目结构)
+- [cpp-agent / C++ 智能编程代理](#cpp-agent--c-智能编程代理)
+  - [Table of Contents / 目录](#table-of-contents--目录)
+  - [Architecture Overview / 架构概览](#architecture-overview--架构概览)
+    - [Design Principles / 设计原则](#design-principles--设计原则)
+  - [System Architecture Diagram / 系统架构图](#system-architecture-diagram--系统架构图)
+  - [Data Flow Diagram / 数据流图](#data-flow-diagram--数据流图)
+    - [Stage Details / 阶段详情](#stage-details--阶段详情)
+  - [Use Case Diagram / 用例图](#use-case-diagram--用例图)
+    - [Key Use Cases / 关键用例](#key-use-cases--关键用例)
+  - [Module Reference / 模块参考](#module-reference--模块参考)
+    - [Core Layer / 核心层](#core-layer--核心层)
+    - [Tools \& Permissions / 工具与权限层](#tools--permissions--工具与权限层)
+    - [Infrastructure / 基础设施层](#infrastructure--基础设施层)
+    - [API \& Integration / API 与集成层](#api--integration--api-与集成层)
+    - [Compact Engine / 压缩引擎 (10 modules)](#compact-engine--压缩引擎-10-modules)
+  - [Feature Parity with local-ace / 与 local-ace 的功能对齐](#feature-parity-with-local-ace--与-local-ace-的功能对齐)
+  - [Build \& Run / 构建与运行](#build--run--构建与运行)
+    - [Prerequisites / 前置条件](#prerequisites--前置条件)
+    - [Build / 构建](#build--构建)
+    - [Run / 运行](#run--运行)
+    - [Environment Variables / 环境变量](#environment-variables--环境变量)
+  - [Configuration / 配置](#configuration--配置)
+    - [CMake Build Options / CMake 构建选项](#cmake-build-options--cmake-构建选项)
+    - [Session Directory Layout / 会话目录布局](#session-directory-layout--会话目录布局)
+  - [Testing / 测试](#testing--测试)
+  - [Project Structure / 项目结构](#project-structure--项目结构)
+  - [Hook Events / 钩子事件](#hook-events--钩子事件)
+  - [License / 许可证](#license--许可证)
 
 ---
 
@@ -344,7 +362,7 @@ $env:AGENT_MODEL = "gemma-4-31b"
 |---|---|---|
 | `AGENT_API_ENDPOINT` | LLM API endpoint / LLM API 端点 | `https://api.anthropic.com` |
 | `AGENT_API_KEY` | API authentication key / API 密钥 | — |
-| `AGENT_MODEL` | Main model name / 主模型名 | `claude-sonnet-4-20250514` |
+| `AGENT_MODEL` | Main model name / 主模型名 | `gemma-3-27b-it` |
 | `AGENT_FALLBACK_MODEL` | Fallback model on 413/error / 回退模型 | — |
 | `AGENT_VALIDATOR_MODEL` | Validator model / 验证器模型 | — |
 | `CPP_AGENT_CONTEXT_WINDOW` | Override context window size / 覆盖上下文窗口大小 | Model-dependent |

@@ -215,23 +215,6 @@ bool QueryEngine::PrepareForContinuationAfterWallClockTimeout() {
   return true;
 }
 
-bool QueryEngine::HandleFallback() {
-  if (loopCtx_.fallbackModel.empty()) return false;
-  if (loopCtx_.model == loopCtx_.fallbackModel) return false;
-
-  Message warning;
-  warning.role = MessageRole::System;
-  warning.uuid = "fallback-warn";
-  warning.isMeta = true;
-  warning.content.push_back(ContentBlock::MakeText(
-      "Fallback: switching from " + loopCtx_.model +
-      " to " + loopCtx_.fallbackModel));
-  messages_.push_back(warning);
-
-  loopCtx_.model = loopCtx_.fallbackModel;
-  return true;
-}
-
 const std::vector<Message>& QueryEngine::messages() const {
   return messages_;
 }

@@ -1,0 +1,7 @@
+{
+  "model": "Qwen3.6-35B-A3B-UD-Q6_K",
+  "messages": [{"role": "user", "content": "Use the Glob tool to find all .py files in the current directory."}],
+  "tools": [{"type": "function", "function": {"name": "Glob", "description": "Find files by glob pattern", "parameters": {"type": "object", "properties": {"pattern": {"type": "string", "description": "Glob pattern"}}, "required": ["pattern"]}}}],
+  "max_tokens": 4096,
+  "stream": false
+}

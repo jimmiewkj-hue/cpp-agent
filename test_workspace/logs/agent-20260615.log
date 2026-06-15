@@ -1,0 +1,37 @@
+2026-06-15T07:09:07.576 [INFO ] [QRY] Model call start turn=1 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=1 transition=0
+2026-06-15T07:09:09.629 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=1 hasTools=true
+2026-06-15T07:09:12.422 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=67 textEvents=64 toolEvents=1 apiErrors=0 elapsedMs=2793
+2026-06-15T07:09:20.601 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-15T07:09:26.733 [INFO ] [QRY] Model call start turn=2 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=3 transition=9
+2026-06-15T07:09:28.779 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=3 hasTools=true
+2026-06-15T07:09:33.044 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=85 textEvents=82 toolEvents=1 apiErrors=0 elapsedMs=4264
+2026-06-15T07:09:41.213 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-15T07:09:47.345 [INFO ] [QRY] Model call start turn=3 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=6 transition=9
+2026-06-15T07:09:49.394 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=6 hasTools=true
+2026-06-15T07:09:51.282 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=43 textEvents=40 toolEvents=1 apiErrors=0 elapsedMs=1888
+2026-06-15T07:09:59.478 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-15T07:10:05.623 [INFO ] [QRY] Model call start turn=4 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=9 transition=9
+2026-06-15T07:10:07.578 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=9 hasTools=true
+2026-06-15T07:10:11.172 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=203 textEvents=201 toolEvents=0 apiErrors=0 elapsedMs=3593
+2026-06-15T07:10:21.415 [INFO ] [QRY] Model call start turn=5 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=11 transition=8
+2026-06-15T07:10:23.467 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=11 hasTools=true
+2026-06-15T07:10:27.176 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=215 textEvents=213 toolEvents=0 apiErrors=0 elapsedMs=3709
+2026-06-15T07:10:50.790 [INFO ] [QRY] Model call start turn=1 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=1 transition=0
+2026-06-15T07:10:52.835 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=1 hasTools=true
+2026-06-15T07:10:56.676 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=79 textEvents=76 toolEvents=1 apiErrors=0 elapsedMs=3841
+2026-06-15T07:11:04.833 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-15T07:11:10.796 [INFO ] [QRY] Model call start turn=2 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=3 transition=9
+2026-06-15T07:11:12.848 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=3 hasTools=true
+2026-06-15T07:11:18.249 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=135 textEvents=132 toolEvents=1 apiErrors=0 elapsedMs=5400
+2026-06-15T07:11:24.851 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-15T07:11:30.787 [INFO ] [QRY] Model call start turn=3 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=6 transition=9
+2026-06-15T07:11:32.827 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=6 hasTools=true
+2026-06-15T07:11:34.802 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=39 textEvents=36 toolEvents=1 apiErrors=0 elapsedMs=1975
+2026-06-15T07:11:42.791 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-15T07:11:48.848 [INFO ] [QRY] Model call start turn=4 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=9 transition=9
+2026-06-15T07:11:50.789 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=9 hasTools=true
+2026-06-15T07:11:52.911 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=50 textEvents=47 toolEvents=1 apiErrors=0 elapsedMs=2121
+2026-06-15T07:12:02.786 [INFO ] [QRY] Model call start turn=5 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=11 transition=8
+2026-06-15T07:12:04.835 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=11 hasTools=true
+2026-06-15T07:12:06.776 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=63 textEvents=60 toolEvents=1 apiErrors=0 elapsedMs=1941
+2026-06-15T07:12:14.800 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1

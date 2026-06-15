@@ -1,0 +1,38 @@
+2026-06-14T19:55:35.374 [INFO ] [QRY] Model call start turn=1 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=1 transition=0
+2026-06-14T19:55:37.414 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=1 hasTools=true
+2026-06-14T19:55:41.530 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=102 textEvents=99 toolEvents=1 apiErrors=0 elapsedMs=4115
+2026-06-14T19:56:44.437 [INFO ] [QRY] Model call start turn=1 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=1 transition=0
+2026-06-14T19:56:46.479 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=1 hasTools=true
+2026-06-14T19:56:50.081 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=149 textEvents=146 toolEvents=1 apiErrors=0 elapsedMs=3602
+2026-06-14T20:01:07.332 [INFO ] [QRY] Model call start turn=1 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=1 transition=0
+2026-06-14T20:01:09.375 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=1 hasTools=true
+2026-06-14T20:01:12.215 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=148 textEvents=145 toolEvents=1 apiErrors=0 elapsedMs=2839
+2026-06-14T20:01:20.391 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-14T20:01:26.536 [INFO ] [QRY] Model call start turn=2 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=3 transition=9
+2026-06-14T20:01:28.586 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=3 hasTools=true
+2026-06-14T20:01:30.972 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=76 textEvents=73 toolEvents=1 apiErrors=0 elapsedMs=2385
+2026-06-14T20:01:39.142 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-14T20:01:45.266 [INFO ] [QRY] Model call start turn=3 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=5 transition=9
+2026-06-14T20:01:47.313 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=5 hasTools=true
+2026-06-14T20:01:56.344 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=173 textEvents=170 toolEvents=1 apiErrors=0 elapsedMs=9031
+2026-06-14T20:02:08.632 [INFO ] [QRY] Model call start turn=4 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=7 transition=8
+2026-06-14T20:02:10.681 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=7 hasTools=true
+2026-06-14T20:02:18.017 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=45 textEvents=42 toolEvents=1 apiErrors=0 elapsedMs=7336
+2026-06-14T20:02:29.390 [INFO ] [QRY] Model call start turn=5 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=9 transition=8
+2026-06-14T20:02:31.327 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=9 hasTools=true
+2026-06-14T20:02:34.941 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=59 textEvents=56 toolEvents=1 apiErrors=0 elapsedMs=3613
+2026-06-14T20:02:47.222 [INFO ] [QRY] Model call start turn=6 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=11 transition=8
+2026-06-14T20:02:49.285 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=11 hasTools=true
+2026-06-14T20:02:52.435 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=21 textEvents=18 toolEvents=1 apiErrors=0 elapsedMs=3150
+2026-06-14T20:03:04.710 [INFO ] [QRY] Model call start turn=7 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=13 transition=8
+2026-06-14T20:03:06.756 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=13 hasTools=true
+2026-06-14T20:03:09.987 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=21 textEvents=18 toolEvents=1 apiErrors=0 elapsedMs=3230
+2026-06-14T20:03:21.378 [INFO ] [QRY] Model call start turn=8 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=15 transition=8
+2026-06-14T20:03:23.327 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=15 hasTools=true
+2026-06-14T20:03:26.479 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=27 textEvents=24 toolEvents=1 apiErrors=0 elapsedMs=3151
+2026-06-14T20:03:38.715 [INFO ] [QRY] Model call start turn=9 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=17 transition=8
+2026-06-14T20:03:40.769 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=17 hasTools=true
+2026-06-14T20:03:43.924 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=23 textEvents=20 toolEvents=1 apiErrors=0 elapsedMs=3155
+2026-06-14T20:03:55.329 [INFO ] [QRY] Model call start turn=10 model=Qwen3.6-35B-A3B-UD-Q6_K contextMessages=19 transition=8
+2026-06-14T20:03:57.383 [INFO ] [MDL] StreamResponse start model=Qwen3.6-35B-A3B-UD-Q6_K messages=19 hasTools=true
+2026-06-14T20:04:00.583 [INFO ] [MDL] StreamResponse complete model=Qwen3.6-35B-A3B-UD-Q6_K totalEvents=26 textEvents=23 toolEvents=1 apiErrors=0 elapsedMs=3199

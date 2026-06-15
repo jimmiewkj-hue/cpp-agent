@@ -19,6 +19,33 @@ enum class PermissionMode {
   DontAsk
 };
 
+// STRENGTHEN-07: validator capability tier relative to the main model.
+// Drives whether the LLM validator runs at all, to avoid the documented
+// "same-tier net-negative" failure (see QueryLoop.cpp ShouldRunValidation
+// design note). Default behavior is now Peer (rule-only), not Disabled.
+enum class ValidatorTier {
+  Stronger,  // validator meaningfully stronger than main -> run full LLM validation
+  Peer,      // similar capability -> run LocalValidator rules only, skip LLM validator
+  Weaker,    // validator weaker than main -> skip entirely
+  Disabled   // explicitly disabled
+};
+
+// Compare main vs validator model families to pick a tier. Heuristic:
+// Claude/GPT-4o validating a local 30B-class model -> Stronger.
+// Same family or both local-similar-class -> Peer.
+// Local-small validating Claude/GPT-4o -> Weaker.
+inline ValidatorTier CompareModelFamilies(ModelFamily mainFam,
+                                          ModelFamily validatorFam) {
+  // "Cloud-strong" set: Claude (proxy for GPT-4o / Opus class)
+  const bool mainCloud = (mainFam == ModelFamily::Claude);
+  const bool validatorCloud = (validatorFam == ModelFamily::Claude);
+  if (validatorCloud && !mainCloud) return ValidatorTier::Stronger;
+  if (mainCloud && !validatorCloud) return ValidatorTier::Weaker;
+  // Both cloud or both local -> treat as Peer (conservative: don't assume
+  // one local model is reliably smarter than another local model)
+  return ValidatorTier::Peer;
+}
+
 struct LlmConfig {
   std::string apiEndpoint;
   std::string apiKey;
@@ -30,6 +57,16 @@ struct LlmConfig {
   // Model-specific overrides (0 = use model-family defaults)
   int contextWindowOverride = 0;
   int maxOutputTokensOverride = 0;
+  // STRENGTHEN-T25: per-role endpoint/key overrides. The validator may run
+  // on a different provider (e.g. local Gemma main + cloud Claude validator),
+  // so it needs its own endpoint+key. Empty values fall back to the shared
+  // apiEndpoint/apiKey. Loaded from CPP_AGENT_VALIDATOR_ENDPOINT /
+  // CPP_AGENT_VALIDATOR_API_KEY / CPP_AGENT_FALLBACK_ENDPOINT /
+  // CPP_AGENT_FALLBACK_API_KEY env vars (see main.cpp).
+  std::string validatorEndpoint;
+  std::string validatorApiKey;
+  std::string fallbackEndpoint;
+  std::string fallbackApiKey;
 };
 
 struct DenialTrackingState {

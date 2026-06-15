@@ -12,7 +12,11 @@ namespace coordinator {
 // ============================================================================
 
 bool IsCoordinatorMode() {
-  const char* env = std::getenv("CLAUDE_CODE_COORDINATOR_MODE");
+  // STRENGTHEN-T26: prefer the neutral CPP_AGENT_COORDINATOR_MODE env var;
+  // keep CLAUDE_CODE_COORDINATOR_MODE for backward compat with configs
+  // migrated from the upstream local-ace project.
+  const char* env = std::getenv("CPP_AGENT_COORDINATOR_MODE");
+  if (!env) env = std::getenv("CLAUDE_CODE_COORDINATOR_MODE");
   if (!env) return false;
   return std::atoi(env) != 0 || env[0] == '1' || env[0] == 'y' || env[0] == 'Y';
 }
@@ -25,11 +29,13 @@ std::string MatchSessionMode(const std::string& sessionMode) {
 
   if (currentIsCoordinator == sessionIsCoordinator) return std::string();
 
-  // Flip the env var
+  // Flip the env var (set both the neutral and legacy names for consistency)
   if (sessionIsCoordinator) {
+    _putenv("CPP_AGENT_COORDINATOR_MODE=1");
     _putenv("CLAUDE_CODE_COORDINATOR_MODE=1");
     return "Entered coordinator mode to match resumed session.";
   } else {
+    _putenv("CPP_AGENT_COORDINATOR_MODE=");
     _putenv("CLAUDE_CODE_COORDINATOR_MODE=");
     return "Exited coordinator mode to match resumed session.";
   }
@@ -73,7 +79,7 @@ std::string BuildCoordinatorSystemPrompt(const CoordinatorConfig& config) {
   }
 
   std::ostringstream prompt;
-  prompt << R"(You are Claude Code, an AI assistant that orchestrates software engineering tasks across multiple workers.
+  prompt << R"(You are the Cpp-Agent Coordinator, an AI assistant that orchestrates software engineering tasks across multiple workers.
 
 ## 1. Your Role
 

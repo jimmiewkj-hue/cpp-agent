@@ -116,6 +116,12 @@ class ToolOrchestrator {
   std::string ExecuteReadMcpResource(const std::string& inputJson,
                                      int maxResultSize,
                                      std::string* error) const;
+  // STRENGTHEN-01: dispatch mcp__<server>__<tool> calls to the MCP client
+  // manager via tools/call. fullyQualifiedName is the mcp__-prefixed name.
+  std::string ExecuteMcpTool(const std::string& fullyQualifiedName,
+                             const std::string& inputJson,
+                             int maxResultSize,
+                             std::string* error) const;
   std::string ExecuteWebFetch(const std::string& inputJson,
                               int maxResultSize,
                               std::string* error) const;

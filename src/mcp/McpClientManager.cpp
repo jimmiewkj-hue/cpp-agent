@@ -2169,5 +2169,66 @@ bool McpClientManager::ReadResourceFromTransport(const std::string& serverName,
   return true;
 }
 
+// STRENGTHEN-01: tools/call invocation. Structure mirrors
+// ReadResourceFromTransport (above) — find connection, capability-check,
+// build params, transport->Send, propagate error/success.
+bool McpClientManager::CallTool(const std::string& serverName,
+                                const std::string& toolName,
+                                const std::string& argumentsJson,
+                                std::string* resultJson,
+                                std::string* error) {
+  ManagedConnection* connection = FindConnection(serverName);
+  if (!connection || !connection->transport) {
+    if (error) *error = "MCP server '" + serverName + "' is not connected";
+    return false;
+  }
+  if (!connection->state.capabilities.tools) {
+    if (error)
+      *error = "MCP server '" + serverName + "' does not advertise tools capability";
+    return false;
+  }
+
+  // Build "tools/call" params: {"name": "<toolName>", "arguments": <obj>}.
+  // argumentsJson may be empty or a JSON object; default to {} on parse failure
+  // so the call still proceeds (the tool will report its own input errors).
+  json arguments;
+  if (!argumentsJson.empty()) {
+    try {
+      arguments = json::parse(argumentsJson);
+    } catch (...) {
+      // Not valid JSON — wrap as a raw string under a fallback key so the
+      // request still has a well-formed arguments object.
+      arguments = json::object();
+      arguments["_raw_input"] = argumentsJson;
+    }
+  } else {
+    arguments = json::object();
+  }
+
+  json requestParams;
+  requestParams["name"] = toolName;
+  requestParams["arguments"] = arguments;
+  const McpTransportResponse response =
+      connection->transport->Send({"tools/call", requestParams.dump()});
+  connection->transport->PopulateConnectionState(&connection->state);
+  if (!response.ok) {
+    connection->state.error = response.error;
+    if (error) *error = response.error.empty() ? "tools/call failed"
+                                               : response.error;
+    return false;
+  }
+
+  // The MCP spec returns {"content":[{"type":"text","text":"..."}], ...}.
+  // Some servers return the content array directly; others wrap in "result".
+  // We pass the raw body through and let the caller (ExecuteMcpTool) render
+  // it — but as a convenience, if the body has a "content" array of text
+  // blocks, concatenate them into a single readable string.
+  if (resultJson) {
+    *resultJson = response.bodyJson;
+  }
+  connection->state.error.clear();
+  return true;
+}
+
 }  // namespace mcp
 }  // namespace agent

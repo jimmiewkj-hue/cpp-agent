@@ -75,6 +75,7 @@ add_library(agent_core
   src/core/StreamingToolExecutor.cpp
   src/hooks/HookConfig.cpp
   src/hooks/HookExecutor.cpp
+  src/hooks/SsrfGuard.cpp
   src/infra/ProcessRunner.cpp
   src/infra/ProtoLite.cpp
   src/infra/SessionManager.cpp
@@ -145,8 +146,18 @@ target_compile_features(agent_core PUBLIC cxx_std_17)
 if(WIN32)
   target_link_libraries(agent_core PUBLIC winhttp psapi)
 else()
-  find_package(CURL REQUIRED)
-  target_link_libraries(agent_core PUBLIC CURL::libcurl pthread)
+  # STRENGTHEN-T00: POSIX build is NOT yet functional. Core HTTP sources
+  # (src/api/ModelClient.cpp, src/core/QueryLoop.cpp) unconditionally include
+  # <windows.h>/<winhttp.h>. Until a libcurl backend is implemented for
+  # HttpLlmClient, fail the configure with a clear message instead of letting
+  # the build fail mid-compilation with cryptic errors. See
+  # docs/STRENGTHENING_PLAN.md T00 (planned: abstract HttpLlmClient, add
+  # libcurl impl, gate windows.h behind #ifdef _WIN32).
+  message(FATAL_ERROR
+    "cpp-agent currently supports Windows only. The POSIX/libcurl HTTP "
+    "backend is not yet implemented (core sources unconditionally include "
+    "<windows.h>/<winhttp.h>). To enable Linux/macOS, implement the libcurl "
+    "backend per docs/STRENGTHENING_PLAN.md T00, then remove this guard.")
 endif()
 
 add_executable(agent_cli
@@ -315,6 +326,12 @@ if(AGENT_BUILD_TESTS)
   )
   target_link_libraries(agent_test_validator PRIVATE agent_core)
   add_test(NAME agent_test_validator COMMAND agent_test_validator)
+
+  add_executable(agent_test_ssrf_guard
+    tests/unit/test_ssrf_guard.cpp
+  )
+  target_link_libraries(agent_test_ssrf_guard PRIVATE agent_core)
+  add_test(NAME agent_test_ssrf_guard COMMAND agent_test_ssrf_guard)
 
   add_executable(agent_test_auto_compact
     tests/unit/test_auto_compact.cpp

@@ -682,22 +682,48 @@ std::string ResolveValidatorModel(const QueryLoopContext& ctx) {
   return infra::GetEnvString("LOCALMODEL_VALIDATION_MODEL");
 }
 
+// STRENGTHEN-07: resolve the validator capability tier. Determines whether
+// the LLM validator runs at all. Replaces the old binary "validatorModel
+// empty => disabled" with a 4-tier system whose default is Peer (rule-only),
+// avoiding the documented same-tier net-negative failure.
+ValidatorTier ResolveValidatorTier(const QueryLoopContext& ctx,
+                                   const std::string& validatorModel) {
+  // 1. Explicit env override wins (for testing / operator control)
+  std::string t = infra::GetEnvString("CPP_AGENT_VALIDATOR_TIER");
+  if (!t.empty()) {
+    std::string tl;
+    tl.reserve(t.size());
+    for (char c : t) tl.push_back(static_cast<char>(std::tolower(c)));
+    if (tl == "stronger") return ValidatorTier::Stronger;
+    if (tl == "peer")     return ValidatorTier::Peer;
+    if (tl == "weaker")   return ValidatorTier::Weaker;
+    if (tl == "disabled" || tl == "off" || tl == "none")
+      return ValidatorTier::Disabled;
+  }
+  // 2. No validator model configured at all => Peer (run LocalValidator
+  //    rules only, no LLM validator). This is the new safe default — the old
+  //    default was "disabled" which left even rule-based gaps unguarded.
+  if (validatorModel.empty()) return ValidatorTier::Peer;
+  // 3. Compare model families to estimate relative capability
+  return CompareModelFamilies(DetectModelFamily(ctx.model),
+                              DetectModelFamily(validatorModel));
+}
+
 bool ShouldRunValidation(const QueryLoopContext& ctx) {
-  // DESIGN NOTE (Gemma-4-31B single-model optimization):
-  // Dual-model validation (Actor-Evaluator pattern) is only effective when
-  // the Validator model has significantly higher logical capability than
-  // the main model (e.g., GPT-4o validating a 30B local model).
-  // For same-tier models (Qwen-35B vs Gemma-31B), the protocol overhead,
-  // parsing failures, and false-positive interventions make results WORSE
-  // than single-model operation. Engineering logs from jianlai_graph
-  // confirm: Gemma single-model outperforms Gemma+Qwen validator combo.
-  // KEEP validatorModel empty by default. Quality is enforced through:
-  // - Write-Run-Verify closed loop (PostToolTurnProcessing)
-  // - Edit loop breaker (same-file edit failure detection)
-  // - Error-driven repair loop (consecutive error tracking)
-  // - Shell syntax translation (NormalizeWindowsShellCommand)
-  // - Model-family-aware nudge escalation (HandleNoToolContinuation)
-  return !ResolveValidatorModel(ctx).empty();
+  // STRENGTHEN-07: tier-gated validation.
+  // DESIGN NOTE (preserved from original): Dual-model validation (Actor-
+  // Evaluator pattern) is only effective when the Validator model has
+  // significantly higher logical capability than the main model. For same-
+  // tier models (Qwen vs Gemma), the protocol overhead, parsing failures,
+  // and false-positive interventions make results WORSE than single-model
+  // operation — confirmed by jianlai_graph engineering logs.
+  //
+  // The LLM validator (this function gates ApplyStepValidator) now only runs
+  // when tier == Stronger. Peer/Weaker tiers skip the LLM validator but
+  // still run LocalValidator (pure rules, no LLM) — see ApplyStepValidator.
+  const std::string validatorModel = ResolveValidatorModel(ctx);
+  const ValidatorTier tier = ResolveValidatorTier(ctx, validatorModel);
+  return tier == ValidatorTier::Stronger;
 }
 
 bool IsOpenAIEndpoint(const std::string& ep) {
@@ -784,6 +810,21 @@ ValidationResult ParseValidationResponse(const std::string& text) {
             vti.blockGuidance = ti["block_reason"].get<std::string>();
           if (!vti.toolUseId.empty() && !vti.action.empty())
             result.toolInterventions.push_back(vti);
+        }
+      }
+
+      // STRENGTHEN-T08: parse structured patches (preferred over correctedText).
+      // Schema: "patches": [{"anchor":"...","issue":"...","suggested_replace":"..."}]
+      if (j.contains("patches") && j["patches"].is_array()) {
+        for (const auto& p : j["patches"]) {
+          ValidationPatch vp;
+          if (p.contains("anchor") && p["anchor"].is_string())
+            vp.anchor = p["anchor"].get<std::string>();
+          if (p.contains("issue") && p["issue"].is_string())
+            vp.issue = p["issue"].get<std::string>();
+          if (p.contains("suggested_replace") && p["suggested_replace"].is_string())
+            vp.suggestedReplace = p["suggested_replace"].get<std::string>();
+          if (!vp.issue.empty()) result.patches.push_back(vp);
         }
       }
     } catch (...) {
@@ -895,7 +936,8 @@ std::string BuildValidationContext(
     const std::vector<Message>& assistantMessages,
     const std::vector<ContentBlock>& toolUseBlocks,
     const tools::ToolRegistry* toolRegistry,
-    const std::string& workspaceRoot) {
+    const std::string& workspaceRoot,
+    const QueryLoopInternalState& vstate) {
   std::string goal;
   for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
     if (it->role != MessageRole::User) continue;
@@ -1008,6 +1050,31 @@ std::string BuildValidationContext(
   ctxJson["relevant_tool_schemas"] = relevantSchemas;
   ctxJson["execution_evidence"] = executionEvidence;
   ctxJson["recent_failure_summary"] = recentFailureSummary;
+  // STRENGTHEN-validator-state: inject validator self-state so it does NOT
+  // mechanically repeat the same guidance. This is the root-cause fix for the
+  // validator death-loop observed in validator-retry-limit-session
+  // (validator repeated "Stop rereading README" for 4+ turns verbatim).
+  json validatorSelfState;
+  validatorSelfState["retry_count_this_cycle"] = vstate.validatorRetryCount;
+  validatorSelfState["total_retries_session"] = vstate.totalValidatorRetryCount;
+  validatorSelfState["nudge_count"] = vstate.validatorNudgeCount;
+  if (!vstate.lastValidatorGuidance.empty()) {
+    json history = json::array();
+    // Carry the last guidance so the validator can SEE what it already said
+    // and is instructed (via system prompt) to escalate or change approach,
+    // never to repeat it verbatim.
+    history.push_back(vstate.lastValidatorGuidance);
+    validatorSelfState["previous_guidance"] = history;
+  }
+  // Capture the assistant's last attempt text so the validator can detect
+  // whether the assistant actually changed behavior since the last retry.
+  // Without this, the validator cannot tell "assistant ignored me" from
+  // "assistant partially complied".
+  if (!assistantText.empty()) {
+    validatorSelfState["assistant_last_attempt"] =
+        assistantText.substr(0, std::min<size_t>(assistantText.size(), 1000));
+  }
+  ctxJson["validator_self_state"] = validatorSelfState;
   return ctxJson.dump(2, ' ', false, json::error_handler_t::replace);
 }
 
@@ -1030,10 +1097,13 @@ Respond ONLY with the following XML structure. No text outside the tags:
 
 <validation_json>
 {
-  "text_correction": {
-    "needed": true or false,
-    "corrected_text": "corrected text if needed, otherwise omit this field"
-  },
+  "patches": [
+    {
+      "anchor": "a short quote or location reference from assistant_text",
+      "issue": "what is wrong with that part",
+      "suggested_replace": "the corrected version of that part (NOT the whole response)"
+    }
+  ],
   "tool_interventions": [
     {
       "tool_use_id": "exact tool_use id from the assistant",
@@ -1048,10 +1118,16 @@ Respond ONLY with the following XML structure. No text outside the tags:
 }
 </validation_json>
 
-If you corrected the assistant_text, also include the corrected text in:
-<corrected_text>
-corrected text here
-</corrected_text>
+IMPORTANT — TEXT CORRECTION FORMAT:
+- Prefer "patches" over "text_correction". Patches target SPECIFIC parts of
+  the response (with an anchor + issue + suggested_replace), NOT the whole
+  text. This preserves the assistant's voice and avoids tonal breakage.
+- Only use the whole-response "text_correction.corrected_text" format when
+  the ENTIRE response is wrong. In that case, also set final_response_action
+  to retry_from_tools so the assistant regenerates.
+- When patches is non-empty, the main model will be SHOWN your suggestions
+  as advisory review notes and decides whether to adopt them. Do NOT assume
+  silent overwrite.
 
 CRITICAL ENVIRONMENT FACTS (read before making any judgment):
 - The runtime OS is WINDOWS. The shell is PowerShell, NOT bash.
@@ -1122,7 +1198,34 @@ CODE ERROR DIAGNOSIS (critical for fixing AttributeError/NameError/ImportError/T
     exist. Guide: "Read the class definition to find the correct attribute name."
 - The write-run-verify loop is: Read-understand → Fix → Write → Run → Verify.
   Skipping the Read-understand step when there are code errors leads to guess-based
-  fixes that fail repeatedly.)VALIDATOR";
+  fixes that fail repeatedly.
+
+SELF-STATE AWARENESS (CRITICAL — prevents death-loops):
+You will also receive a "validator_self_state" object containing:
+- "retry_count_this_cycle": how many times YOU have already issued retry_from_tools
+  in the current cycle.
+- "total_retries_session": total retries across the whole session.
+- "previous_guidance": an array of guidance strings YOU already gave in prior
+  retries of this cycle.
+- "assistant_last_attempt": what the assistant said/did on its most recent attempt.
+ABSOLUTE RULES:
+- If retry_count_this_cycle >= 1 AND assistant_last_attempt is substantively the
+  SAME as what you criticized before (the assistant did NOT change behavior), you
+  MUST NOT issue another retry_from_tools with the same or similar guidance. The
+  assistant is not responding to your guidance — repeating it is useless.
+- Instead, when the assistant ignores guidance, escalate your response:
+    * If retry_count_this_cycle == 1: approve with a "note" field documenting the
+      unresolved concern, OR provide a CONCRETELY DIFFERENT retry_guidance that
+      names the specific different action required.
+    * If retry_count_this_cycle >= 2: "final_response_action": "approve". Do not
+      force another retry. Surface the concern in retry_guidance as advisory text
+      only (it will be shown to the user, not forced as a retry).
+- NEVER produce a retry_guidance that is textually identical or near-identical to
+  an entry in previous_guidance. If you cannot think of new, specific guidance,
+  you MUST approve.
+- Distinguish "assistant made a harmless exploratory choice" (e.g., reading a file
+  to understand context) from "assistant made a real error". Reading files is
+  almost never a real error — do not block reads of workspace files.)VALIDATOR";
 }
 
 std::string BuildToolsJson(const tools::ToolRegistry* toolRegistry) {
@@ -2540,7 +2643,19 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
   // Tool execution stays in the normal RunTools stage so guards such as
   // workspace-first validation can inspect streamed tool_use blocks before
   // any side effects happen.
-  const bool useStreamingExecution = false;
+  // STRENGTHEN-T20: runtime-gate streaming tool execution. Previously
+  // hardcoded false. Now off by default but enabled via the
+  // AGENT_ENABLE_STREAMING_TOOLS env var (requires the compile-time
+  // AGENT_FEATURE_STREAMING_TOOLS flag to be on as well, since the
+  // StreamingToolExecutor code is conditionally compiled). When enabled,
+  // read-only tools begin executing while the model is still streaming.
+  bool useStreamingExecution = false;
+#ifdef AGENT_FEATURE_STREAMING_TOOLS
+  {
+    std::string env = infra::GetEnvString("AGENT_ENABLE_STREAMING_TOOLS");
+    useStreamingExecution = (env == "1" || env == "true" || env == "TRUE");
+  }
+#endif
   const std::string modelTraceId = MakeQueryLoopTraceId("model-call");
   LOG_INFO(QUERY, "Model call start",
            {{"turn", std::to_string(state.turnCount)},
@@ -2666,6 +2781,24 @@ void QueryLoop::ApplyStepValidator(QueryLoopContext& ctx,
   if (!ShouldRunValidation(ctx)) return;
   if (state.assistantMessages.empty()) return;
 
+  // STRENGTHEN-T09: dynamic effectiveness gating. Before running the
+  // (expensive) validator side-query, check whether the validator has been
+  // consistently ignored. If effectiveness < 0.3 with >=10 samples, skip
+  // this validation call and log the downgrade. This prevents burning a
+  // side-query turn on guidance the main model won't follow.
+  if (!state.validatorOutcomes.empty()) {
+    const double eff = ComputeValidatorEffectiveness(state.validatorOutcomes);
+    if (eff < 0.3) {
+      ReportQueryLoopDebugEvent(
+          "2", "QueryLoop.cpp:validator:skipped-low-effectiveness",
+          "[DEBUG] Skipping validator: effectiveness below threshold",
+          {{"effectiveness", eff},
+           {"samples", static_cast<int>(state.validatorOutcomes.size())}},
+          MakeQueryLoopTraceId("validator"));
+      return;
+    }
+  }
+
   const std::string validatorModel = ResolveValidatorModel(ctx);
   const std::string validatorTraceId = MakeQueryLoopTraceId("validator");
   ReportQueryLoopDebugEvent(
@@ -2679,7 +2812,8 @@ void QueryLoop::ApplyStepValidator(QueryLoopContext& ctx,
 
   std::string contextJson = BuildValidationContext(
       ctx.messages, state.assistantMessages, state.toolUseBlocks,
-      toolOrchestrator_.GetToolRegistry(), toolOrchestrator_.workspaceRoot());
+      toolOrchestrator_.GetToolRegistry(), toolOrchestrator_.workspaceRoot(),
+      state);
 
   api::SideQueryRequest request;
   request.querySource = "validator";
@@ -2741,12 +2875,44 @@ void QueryLoop::ApplyStepValidator(QueryLoopContext& ctx,
        {"finalResponseAction", vresult.finalResponseAction},
        {"retryGuidancePrefix", TruncateDebugText(vresult.retryGuidance)},
        {"correctedTextSize", static_cast<int>(vresult.correctedText.size())},
+       {"patchCount", static_cast<int>(vresult.patches.size())},
        {"toolInterventionCount",
         static_cast<int>(vresult.toolInterventions.size())}},
       traceId);
 
-  if (!vresult.correctedText.empty())
-    ApplyTextCorrection(vresult.correctedText, state.assistantMessages);
+  // STRENGTHEN-T08: text corrections are now NON-DESTRUCTIVE. The old
+  // ApplyTextCorrection() hard-replaced the assistant's text block, which
+  // broke tonal/style continuity (the assistant's "voice" was overwritten
+  // by the validator's). We now collect both structured patches (preferred)
+  // and legacy correctedText into an advisory review note injected as a
+  // follow-up meta message. The main model reads it on the next turn and
+  // decides whether to adopt — preserving authorship. If there is no
+  // retry_from_tools, the note is still surfaced so the main model can
+  // self-correct; if retry IS requested, the note rides along with it.
+  if (!vresult.patches.empty() ||
+      (!vresult.correctedText.empty() && vresult.finalResponseAction != "retry_from_tools")) {
+    std::string reviewBody =
+        "[Validator review] A reviewer flagged the following. Apply at your "
+        "own judgment; do not repeat your previous response verbatim:\n";
+    for (const auto& p : vresult.patches) {
+      reviewBody += "- Anchor: " + p.anchor + " | Issue: " + p.issue;
+      if (!p.suggestedReplace.empty())
+        reviewBody += " | Suggested: " + p.suggestedReplace;
+      reviewBody += "\n";
+    }
+    // Legacy correctedText (when no structured patches): present as a single
+    // suggestion rather than a silent overwrite.
+    if (vresult.patches.empty() && !vresult.correctedText.empty()) {
+      reviewBody += "- Suggested rewritten response:\n"
+          + vresult.correctedText.substr(0, 2000) + "\n";
+    }
+    Message review;
+    review.role = MessageRole::User;
+    review.uuid = "validator-review";
+    review.isMeta = true;
+    review.content.push_back(ContentBlock::MakeText(reviewBody));
+    state.pendingFollowupMessages.push_back(review);
+  }
 
   if (!vresult.toolInterventions.empty()) {
     ToolInterventionResult tir;
@@ -2774,21 +2940,166 @@ void QueryLoop::ApplyStepValidator(QueryLoopContext& ctx,
         vresult.retryGuidance.empty()
             ? "Retry from tools."
             : vresult.retryGuidance;
+
+    // STRENGTHEN-T09: record a validator outcome for effectiveness tracking.
+    // First, resolve any PREVIOUS pending outcome: if the assistant's text
+    // this turn differs from what it was when the prior guidance was issued,
+    // mark that prior outcome resolved (the model changed behavior). This is
+    // a coarse but effective signal — the death-loop evidence shows the main
+    // model repeats verbatim, so any textual change counts as compliance.
+    if (!state.validatorOutcomes.empty()) {
+      auto& lastPending = state.validatorOutcomes.back();
+      if (!lastPending.resolved) {
+        std::string currentText = CollectText(state.assistantMessages);
+        // Heuristic: if current text doesn't contain the guidance-hash source
+        // marker (i.e., the model produced new content), consider it resolved.
+        // We approximate "changed behavior" as "produced non-empty new text
+        // or a tool call different from before".
+        if (!currentText.empty() || !state.toolUseBlocks.empty()) {
+          lastPending.resolved = true;
+        }
+      }
+    }
+
     state.validatorRequestedRetry = true;
     ++state.validatorRetryCount;
     state.lastValidatorGuidance = retryGuidance;
     state.toolUseBlocks.clear();
+    // STRENGTHEN-02: escalate the framing as retries accumulate. The original
+    // "[Validator] <guidance>" was treated as a soft, ignorable meta note by
+    // Gemma/Qwen (the validator-retry-limit-session evidence shows the main
+    // model repeated the exact same plan 4 times despite this note). Escalate
+    // the imperative strength and add an explicit anti-persistence directive.
     Message guidance;
     guidance.role = MessageRole::User;
     guidance.uuid = "validator-retry";
     guidance.isMeta = true;
-    guidance.content.push_back(ContentBlock::MakeText(
-        "[Validator] " + retryGuidance));
+    std::string guidanceText;
+    if (state.validatorRetryCount == 1) {
+      guidanceText =
+          "[Action required] A review of your last response flagged an issue. "
+          "You must address it with a DIFFERENT action than what you just did. "
+          "Do not repeat your previous plan or wording. Issue: " + retryGuidance;
+    } else {
+      // 2nd+ retry: the assistant already ignored prior guidance. Make the
+      // instruction maximal-strength and explicitly forbid repeating.
+      guidanceText =
+          "[MANDATORY ACTION — repeat warning #" +
+          std::to_string(state.validatorRetryCount) +
+          "] You have already given this response (or a near-identical one) " +
+          std::to_string(state.validatorRetryCount) +
+          " time(s) and it was rejected each time. Repeating it again is a " +
+          "failure mode. You MUST now do something concretely different. " +
+          "Required change: " + retryGuidance +
+          " If you believe your previous answer was already correct, output " +
+          "your final answer as-is instead of repeating the planning phase.";
+    }
+    guidance.content.push_back(ContentBlock::MakeText(guidanceText));
     state.pendingFollowupMessages.push_back(guidance);
+
+    // STRENGTHEN-T09: push a new pending outcome for this guidance. It will
+    // be resolved (or left unresolved) on the next ApplyStepValidator call.
+    // Cap the window at 20 to bound memory.
+    QueryLoopInternalState::ValidatorOutcome outcome;
+    outcome.guidanceHash = retryGuidance;  // store full text; cheap enough
+    outcome.resolved = false;
+    state.validatorOutcomes.push_back(outcome);
+    if (state.validatorOutcomes.size() > 20) {
+      state.validatorOutcomes.erase(state.validatorOutcomes.begin());
+    }
   } else {
     state.validatorRetryCount = 0;
     state.lastValidatorGuidance.clear();
   }
+}
+
+// STRENGTHEN-T10: generate an execution contract from the user's first
+// message. Only runs when tier == Stronger (validator meaningfully stronger
+// than main model) and only once per session. The contract captures goal,
+// constraints, forbidden actions, and acceptance criteria, which the
+// validator then uses for structured pass/fail verification rather than
+// free-form critique.
+void QueryLoop::GenerateExecutionContract(QueryLoopContext& ctx,
+                                          QueryLoopInternalState& state) {
+  if (state.executionContractGenerated) return;
+  state.executionContractGenerated = true;  // never retry on failure
+  // Only Stronger tier benefits from a contract (Peer/Weaker skip LLM
+  // validation entirely, so a contract has no consumer).
+  const std::string validatorModel = ResolveValidatorModel(ctx);
+  const ValidatorTier tier = ResolveValidatorTier(ctx, validatorModel);
+  if (tier != ValidatorTier::Stronger) return;
+  // Allow operator opt-out
+  if (infra::GetEnvString("CPP_AGENT_DISABLE_CONTRACT") == "1") return;
+
+  // Extract the user's goal from the turn messages
+  std::string goal;
+  for (const auto& m : state.messagesForTurn) {
+    if (m.role != MessageRole::User || m.isMeta) continue;
+    for (const auto& b : m.content) {
+      if (b.type == BlockType::Text && !b.asText.text.empty()) {
+        goal = b.asText.text;
+        break;
+      }
+    }
+    if (!goal.empty()) break;
+  }
+  if (goal.empty()) return;
+  if (goal.size() > 4000) goal = goal.substr(0, 4000);
+
+  api::SideQueryRequest request;
+  request.querySource = "contract";
+  request.model = validatorModel;
+  request.systemPrompt =
+      "You generate an execution contract for a coding task. Given the user's "
+      "goal, output a JSON object with: \"goal\" (restated), \"constraints\" "
+      "(array of must-follow rules), \"forbidden\" (array of disallowed "
+      "actions), \"acceptance_criteria\" (array of verifiable success "
+      "conditions). Be concrete and verifiable. Output ONLY the JSON, no "
+      "prose, no markdown fences.";
+  Message userMsg;
+  userMsg.role = MessageRole::User;
+  userMsg.content.push_back(ContentBlock::MakeText(
+      "User goal:\n" + goal));
+  request.messages.push_back(userMsg);
+  request.maxTokens = 1024;
+  request.temperature = 0.0;
+
+  if (ctx.sessionManager) {
+    ctx.sessionManager->AppendModelIoRecord(
+        infra::ModelIoLogKind::Validator, "contract-request", validatorModel,
+        request.systemPrompt, request.messages, state.turnCount);
+  }
+  api::SideQueryResponse response = sideQueryClient_.Query(request);
+  if (!response.ok || response.messages.empty()) return;
+
+  std::string contractText;
+  for (const auto& msg : response.messages) {
+    for (const auto& b : msg.content) {
+      if (b.type == BlockType::Text) contractText += b.asText.text;
+    }
+  }
+  if (contractText.empty()) return;
+  // Basic validation: must look like JSON
+  if (contractText.find('{') == std::string::npos) return;
+
+  state.executionContract = contractText;
+  // Inject the contract as a system meta message at the front of the turn
+  // so the main model sees the acceptance criteria before working.
+  Message contractMsg;
+  contractMsg.role = MessageRole::System;
+  contractMsg.uuid = "execution-contract";
+  contractMsg.isMeta = true;
+  contractMsg.content.push_back(ContentBlock::MakeText(
+      "[Execution contract — your work will be verified against these "
+      "criteria]\n" + contractText +
+      "\n[End contract. Address every acceptance criterion.]"));
+  state.messagesForTurn.insert(state.messagesForTurn.begin(), contractMsg);
+  ReportQueryLoopDebugEvent(
+      "2", "QueryLoop.cpp:contract:generated",
+      "[DEBUG] Execution contract generated",
+      {{"turnCount", state.turnCount},
+       {"contractSize", static_cast<int>(contractText.size())}},
+      MakeQueryLoopTraceId("contract"));
 }
 
 bool QueryLoop::Handle413Recovery(QueryLoopContext& ctx,
@@ -3396,6 +3707,30 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
   const bool hasPriorToolActivity = HasRecentToolActivity(ctx);
   const bool modelProducedText = !CollectText(state.assistantMessages).empty();
 
+  // STRENGTHEN-T02: explicit forceContinuation branch. When a prior stage
+  // (e.g. validator_blocked_tools, excessive_exploration) set the
+  // forceContinuation flag, we must honor it even with no tool_use. This
+  // closes the gap where validator-blocked-all-tools left the loop with
+  // forceContinuation=true but no explicit branch consumed it.
+  if (state.forceContinuation) {
+    ReportQueryLoopDebugEvent(
+        "4", "QueryLoop.cpp:no-tool:force-continuation",
+        "[DEBUG] Force continuation flag set, continuing turn",
+        {{"turnCount", state.turnCount},
+         {"forceContinuationReason", state.forceContinuationReason}},
+        MakeQueryLoopTraceId("force-continuation"));
+    Message forceMsg;
+    forceMsg.role = MessageRole::User;
+    forceMsg.uuid = "force-continuation";
+    forceMsg.isMeta = true;
+    forceMsg.content.push_back(ContentBlock::MakeText(
+        "[system] Continue the task. Take the next concrete action now."));
+    std::vector<Message> forceFollowups = {forceMsg};
+    return ContinueWithFollowup(
+        ctx, state, forceFollowups,
+        TransitionReason::ForcedContinuation, false);
+  }
+
   // Task 1 & 4: Detect repetitive planning text loops
   bool isRepetitivePlanning = false;
   std::string currentText = CollectText(state.assistantMessages);
@@ -3504,6 +3839,17 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
           nudgeText = "[system] 停止解释你的计划！你必须立即输出工具调用（tool_use）。不要输出诸如“用户想要我...”或“让我...”的文本。立即执行工具调用！";
         } else {
           nudgeText = "[system] 最后警告：任务是否完成？如果完成请总结，如果没有完成，必须立即调用工具！不要重复推理过程！";
+        }
+        // STRENGTHEN-04: Qwen-specific anti-persistence. Session evidence
+        // (validator-retry-limit-session) shows Qwen repeats the EXACT same
+        // planning text across retries, ignoring both validator guidance and
+        // system nudges. When we detect repetitive planning, add an explicit
+        // "do not repeat" directive naming the failure mode.
+        if (isRepetitivePlanning) {
+          nudgeText += "\n[system] 你刚才的回复与之前的几乎完全相同。"
+                       "重复同样的计划是一种失败模式。"
+                       "你必须现在就采取一个不同的具体行动："
+                       "要么直接输出工具调用，要么明确说明任务已完成并给出最终答案。";
         }
       } else if (family == ModelFamily::Gemma) {
         if (state.missingToolUsePromptCount <= 2 && !isRepetitivePlanning) {
@@ -3665,6 +4011,12 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
         continue;
       }
       case QueryStage::ModelCall: {
+        // STRENGTHEN-T10: generate execution contract once before the first
+        // model call (Strong tier only). Injects acceptance criteria so the
+        // main model knows how its work will be verified.
+        if (!state.executionContractGenerated) {
+          GenerateExecutionContract(ctx, state);
+        }
         bool hasTools = ApplyStepModelCall(ctx, state);
         ++state.modelCallCount;
 

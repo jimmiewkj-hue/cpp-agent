@@ -930,10 +930,15 @@ class AnsiTui {
     {
       std::lock_guard<std::mutex> lock(state_.mutex);
       state_.logLines.push_back({line, cat});
-      while (static_cast<int>(state_.logLines.size()) > 200)
+      // STRENGTHEN-TUI: raised from 200 to 2000 lines. The previous 200-line
+      // cap combined with per-line reply splitting meant a single long
+      // assistant reply (50+ lines) plus a few tool rounds could evict the
+      // earliest conversation content entirely — making it impossible to
+      // PgUp/scroll back to the start of the session.
+      while (static_cast<int>(state_.logLines.size()) > 2000)
         state_.logLines.pop_front();
     }
-    scrollOffset_ = 999999;
+    AutoScrollIfPinned();
     RefreshMessages();
   }
 
@@ -943,11 +948,37 @@ class AnsiTui {
       std::lock_guard<std::mutex> lock(state_.mutex);
       state_.liveResponse += chunk;
     }
-    scrollOffset_ = 999999;
+    AutoScrollIfPinned();
     RefreshMessages();
   }
 
+  // STRENGTHEN-TUI: scroll-pinning guard. Previously every new message or
+  // streaming chunk forced scrollOffset_ = 999999, snapping the view to the
+  // bottom even when the user had scrolled up to read earlier content. Now
+  // we track an explicit "pinned to bottom" flag: when the user scrolls up,
+  // we stop auto-following; when they scroll back to the bottom, we resume.
+  bool userPinnedToBottom_ = true;  // default: follow new output
+
+  bool IsPinnedToBottom() const { return userPinnedToBottom_; }
+
+  void AutoScrollIfPinned() {
+    if (userPinnedToBottom_) {
+      scrollOffset_ = 999999;  // sentinel; clamped to maxOffset in Refresh
+    }
+    // If not pinned (user scrolled up), leave scrollOffset_ alone so the
+    // view stays where the user put it. New content still appends to the
+    // log; the user can scroll down to see it.
+  }
+
   // Commit the live response to the log as a colored entry, then clear it.
+  // STRENGTHEN-TUI: the final assistant reply is committed IN FULL (no
+  // truncation, newlines preserved) as a single logical log entry. The
+  // display layer (BuildDisplayLines -> WrapLineVisually) already handles
+  // embedded \n by breaking into visual rows, so a multi-paragraph reply
+  // renders completely without inflating the log-line count (one entry =
+  // one reply, not one entry per line). The complete conversation is also
+  // persisted to transcript.jsonl by the SessionManager via QueryLoop,
+  // independent of this TUI display.
   void FlushLiveResponse() {
     std::string text;
     {
@@ -956,13 +987,17 @@ class AnsiTui {
       state_.liveResponse.clear();
     }
     if (!text.empty()) {
-      // Trim to first 200 chars for the log entry
-      std::string preview = text.size() > 200
-          ? text.substr(0, 200) + "..."
-          : text;
-      // Replace newlines for compact display
-      std::replace(preview.begin(), preview.end(), '\n', ' ');
-      AppendMessage(preview, LogLineCategory::kAssistantReply);
+      // Trim a single trailing newline if present (common from stream output)
+      // but keep all interior newlines so paragraph structure is preserved.
+      while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+        text.pop_back();
+      if (!text.empty()) {
+        // Mark the reply start with a bullet on the first line only. We
+        // prepend "◎ " to the whole text; WrapLineVisually will put it on
+        // the first visual row and subsequent rows stay un-prefixed.
+        AppendMessage("\xe2\x97\x8e " + text,
+                      LogLineCategory::kAssistantReply);
+      }
     }
   }
 
@@ -1190,14 +1225,25 @@ class AnsiTui {
     if (scrollOffset_ < 0) scrollOffset_ = 0;
     int maxOffset = totalLines - maxVisible;
     if (maxOffset < 0) maxOffset = 0;
+    // STRENGTHEN-TUI: if the user was pinned and the sentinel is set, clamp
+    // to maxOffset (bottom). Detect "scrolled back to bottom" to re-pin.
     if (scrollOffset_ > maxOffset) scrollOffset_ = maxOffset;
+    // Re-pin if the user scrolled down to the bottom.
+    if (scrollOffset_ >= maxOffset) {
+      userPinnedToBottom_ = true;
+    }
     RenderMessageArea(msgTop_, msgHeight_, sz.width);
     SetCursorPosition(2, sz.height - 1);
   }
 
   void ScrollBy(int delta) {
+    // STRENGTHEN-TUI: scrolling up un-pins (stop auto-following); scrolling
+    // down to the bottom re-pins (resume auto-follow).
     scrollOffset_ += delta;
-    RefreshMessages();
+    if (delta < 0) {
+      userPinnedToBottom_ = false;  // user scrolled up -> un-pin
+    }
+    RefreshMessages();  // re-pins if scrollOffset_ lands at maxOffset
   }
 
   void RefreshStatus() {
@@ -1289,12 +1335,17 @@ class AnsiTui {
         continue;
       }
       if (key.wVirtualKeyCode == VK_HOME) {
+        // STRENGTHEN-TUI: Home scrolls to the very top and un-pins so new
+        // output doesn't yank the view away while the user reads history.
         scrollOffset_ = 0;
+        userPinnedToBottom_ = false;
         RefreshMessages();
         continue;
       }
       if (key.wVirtualKeyCode == VK_END) {
+        // End re-pins to bottom (resume auto-follow).
         scrollOffset_ = 999999;
+        userPinnedToBottom_ = true;
         RefreshMessages();
         continue;
       }
@@ -1696,7 +1747,7 @@ int main() {
   llmCfg.apiEndpoint = GetEnvOrDefault(
       "CPP_AGENT_API_ENDPOINT", "http://127.0.0.1:8090/v1/chat/completions");
   llmCfg.mainModel = GetEnvOrDefault(
-      "CPP_AGENT_MAIN_MODEL", "gemma-4-31B-it-Q8_0");
+      "CPP_AGENT_MAIN_MODEL", "Qwopus3.6-27B-v2-MTP-Q8_0");
   llmCfg.validatorModel = GetEnvOrDefault(
       "CPP_AGENT_VALIDATOR_MODEL", "");
   // NOTE: validatorModel intentionally empty by default.
@@ -1709,11 +1760,43 @@ int main() {
   llmCfg.fallbackModel = GetEnvOrDefault(
       "CPP_AGENT_FALLBACK_MODEL", "gemma-4-31B-it-Q8_0");
   llmCfg.apiKey = GetEnvOrDefault("CPP_AGENT_API_KEY", "");
+  // STRENGTHEN-T25: per-role endpoint/key. Validator and fallback may run on
+  // different providers (e.g. local Gemma main + cloud Claude validator).
+  // Empty values fall back to the shared apiEndpoint/apiKey above.
+  llmCfg.validatorEndpoint =
+      GetEnvOrDefault("CPP_AGENT_VALIDATOR_ENDPOINT", "");
+  llmCfg.validatorApiKey =
+      GetEnvOrDefault("CPP_AGENT_VALIDATOR_API_KEY", "");
+  llmCfg.fallbackEndpoint =
+      GetEnvOrDefault("CPP_AGENT_FALLBACK_ENDPOINT", "");
+  llmCfg.fallbackApiKey =
+      GetEnvOrDefault("CPP_AGENT_FALLBACK_API_KEY", "");
+  // STRENGTHEN-T25: optional context window + max output token overrides
+  // (per-session, model-agnostic). 0 = use model-family defaults.
+  llmCfg.contextWindowOverride =
+      GetEnvIntOrDefault("CPP_AGENT_CONTEXT_WINDOW", 0);
+  llmCfg.maxOutputTokensOverride =
+      GetEnvIntOrDefault("CPP_AGENT_MAX_OUTPUT_TOKENS", 0);
   llmCfg.connectTimeoutMs = 30000;
   llmCfg.requestTimeoutMs = 120000;
 
   agent::api::HttpLlmClient httpClient(llmCfg);
   agent::api::SideQueryClient sideQueryClient(httpClient);
+  // STRENGTHEN-T25: if the validator runs on a different endpoint, build a
+  // dedicated HttpLlmClient for it so validator queries hit the right
+  // provider (e.g. local Gemma main + cloud Claude validator).
+  if (!llmCfg.validatorEndpoint.empty()) {
+    agent::core::LlmConfig validatorCfg = llmCfg;
+    validatorCfg.apiEndpoint = llmCfg.validatorEndpoint;
+    if (!llmCfg.validatorApiKey.empty()) {
+      validatorCfg.apiKey = llmCfg.validatorApiKey;
+    }
+    // The validator client's mainModel is irrelevant — SideQuery takes the
+    // model name from the request; just keep it consistent.
+    sideQueryClient.SetValidatorClient(
+        std::unique_ptr<agent::api::HttpLlmClient>(
+            new agent::api::HttpLlmClient(validatorCfg)));
+  }
   agent::agents::SubAgentManager subAgentManager;
   agent::mcp::McpClientManager mcpClientManager;
   std::shared_ptr<agent::hooks::HookConfig> hookConfig =
@@ -1721,6 +1804,16 @@ int main() {
   hookConfig->SetWorkspaceTrusted(workspace.trusted);
   std::vector<std::string> loadedHookFiles;
   if (workspace.trusted && !workspace.trustedRoot.empty()) {
+    // STRENGTHEN-T26: read project-local settings from .cpp-agent (the
+    // canonical cpp-agent project dir) instead of the upstream .claude dir.
+    // Backward-compat: also probe .claude for settings migrated from older
+    // local-ace-derived configs.
+    TryLoadHookSettingsFile(
+        JoinPath(JoinPath(workspace.trustedRoot, ".cpp-agent"), "settings.json"),
+        hookConfig, &loadedHookFiles);
+    TryLoadHookSettingsFile(
+        JoinPath(JoinPath(workspace.trustedRoot, ".cpp-agent"), "settings.local.json"),
+        hookConfig, &loadedHookFiles);
     TryLoadHookSettingsFile(
         JoinPath(JoinPath(workspace.trustedRoot, ".claude"), "settings.json"),
         hookConfig, &loadedHookFiles);
@@ -2186,7 +2279,7 @@ int main() {
     }
     if (line == "/model") {
       tui.AppendMessage("Current model: " + tuiState.modelName);
-      tui.AppendMessage("Usage: /model <name>  (e.g. /model claude-sonnet)");
+      tui.AppendMessage("Usage: /model <name>  (e.g. /model gemma-3-27b-it)");
       continue;
     }
     if (line == "/memory") {

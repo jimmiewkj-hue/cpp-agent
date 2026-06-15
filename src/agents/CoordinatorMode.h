@@ -18,7 +18,8 @@ struct CoordinatorConfig {
   bool simpleMode = false;  // If true, workers only get Bash/Read/Edit
 };
 
-// Check if coordinator mode is active (reads CLAUDE_CODE_COORDINATOR_MODE env).
+// Check if coordinator mode is active (reads CPP_AGENT_COORDINATOR_MODE, or
+// the legacy CLAUDE_CODE_COORDINATOR_MODE for backward compat).
 bool IsCoordinatorMode();
 
 // Match stored session mode with current mode. Returns a warning string if

@@ -3,6 +3,7 @@
 #include "tools/ToolRegistry.h"
 #include "agents/SubAgentManager.h"
 #include "permissions/PermissionEngine.h"
+#include "infra/StringUtil.h"
 #include "third_party/nlohmann_json.hpp"
 
 #include <windows.h>
@@ -13,16 +14,6 @@
 static int failures = 0;
 static void Check(bool condition, const char* label) {
   if (!condition) { std::cerr << "FAIL: " << label << std::endl; ++failures; }
-}
-
-std::wstring Utf8ToWide(const std::string& text) {
-  if (text.empty()) return std::wstring();
-  const int size = MultiByteToWideChar(
-      CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
-  std::wstring wide(static_cast<std::size_t>(size), L'\0');
-  MultiByteToWideChar(
-      CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), &wide[0], size);
-  return wide;
 }
 
 std::string FullPathOf(const std::string& path) {
@@ -765,7 +756,7 @@ void TestUnicodeWorkspaceReadWrite() {
   Check(writeResult.errorCount == 0,
         "Unicode workspace write should succeed");
 
-  DWORD attrs = GetFileAttributesW(Utf8ToWide(expectedPath).c_str());
+  DWORD attrs = GetFileAttributesW(agent::infra::Utf8ToWide(expectedPath).c_str());
   Check(attrs != INVALID_FILE_ATTRIBUTES,
         "Unicode workspace write should create the target file");
 
@@ -790,7 +781,7 @@ void TestUnicodeWorkspaceReadWrite() {
   Check(foundContent,
         "Unicode workspace read should return the written content");
 
-  DeleteFileW(Utf8ToWide(expectedPath).c_str());
+  DeleteFileW(agent::infra::Utf8ToWide(expectedPath).c_str());
 }
 
 void TestTuiTaskPanelLoadsAndPrioritizesTasks() {

@@ -83,11 +83,23 @@ struct ValidationToolIntervention {
   std::string blockGuidance;
 };
 
+// STRENGTHEN-T08: a structured, non-destructive correction suggestion.
+// Unlike correctedText (which hard-replaces the assistant's voice and
+// breaks tonal continuity), patches are injected as advisory review notes
+// the main model decides whether to adopt on the next turn.
+struct ValidationPatch {
+  std::string anchor;            // location/quote the patch refers to
+  std::string issue;             // what's wrong
+  std::string suggestedReplace;  // suggested replacement text
+};
+
 struct ValidationResult {
   std::string correctedText;
   std::vector<ValidationToolIntervention> toolInterventions;
   std::string finalResponseAction;
   std::string retryGuidance;
+  // STRENGTHEN-T08: structured patches (preferred over correctedText)
+  std::vector<ValidationPatch> patches;
 };
 
 class QueryEngine {
@@ -153,7 +165,10 @@ class QueryEngine {
   bool RecoverFromSnapshot();
   void SaveCheckpoint();
   bool RunOneLoopIteration();
-  bool HandleFallback();
+  // STRENGTHEN-T05: HandleFallback() removed. Fallback is now handled
+  // inside the main loop (QueryLoop.cpp ModelCall stage swaps
+  // state.activeModel + ctx.model on api_error). This loop-external
+  // method was dead code (never called) and is deleted to avoid confusion.
 };
 
 }  // namespace core

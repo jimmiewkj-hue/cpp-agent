@@ -69,6 +69,11 @@ void BashClassifier::SetApiKey(const std::string& key) {
   apiKey_ = key;
 }
 
+// STRENGTHEN-T12
+void BashClassifier::SetClassifierCallback(BashClassifierCallback callback) {
+  classifierCallback_ = std::move(callback);
+}
+
 bool BashClassifier::MatchesReadOnlyPattern(const std::string& command) const {
   std::string lower = command;
   std::transform(lower.begin(), lower.end(), lower.begin(),
@@ -134,7 +139,7 @@ std::string BashClassifier::BuildClassifierPrompt(
 
 BashSafetyDecision BashClassifier::Classify(
     const std::string& command,
-    const std::vector<core::Message>& /*context*/) {
+    const std::vector<core::Message>& context) {
   BashSafetyDecision decision;
 
   if (command.empty()) {
@@ -160,6 +165,35 @@ BashSafetyDecision BashClassifier::Classify(
       decision.reason = "matches destructive pattern: " + destructive;
       return decision;
     }
+  }
+
+  // STRENGTHEN-T12: pattern lists missed. Consult the LLM classifier (if
+  // installed) before falling back to deny-by-default. This lets complex but
+  // safe commands (e.g. "Get-ChildItem -Recurse | Where-Object {...") be
+  // auto-approved in auto mode instead of always prompting. Results are
+  // cached per-command for the process lifetime to bound cost.
+  if (classifierCallback_) {
+    // Check cache first
+    {
+      std::lock_guard<std::mutex> lock(cacheMutex_);
+      auto it = cache_.find(command);
+      if (it != cache_.end()) return it->second;
+    }
+    BashSafetyDecision llmDecision;
+    try {
+      llmDecision = classifierCallback_(command, context);
+    } catch (...) {
+      llmDecision.allow = false;
+      llmDecision.reason = "classifier callback threw";
+    }
+    // Cache and return. Cap the cache at 256 entries (LRU-ish: just clear
+    // when over cap — commands repeat little within a session).
+    {
+      std::lock_guard<std::mutex> lock(cacheMutex_);
+      if (cache_.size() > 256) cache_.clear();
+      cache_[command] = llmDecision;
+    }
+    return llmDecision;
   }
 
   decision.allow = false;

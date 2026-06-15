@@ -1,0 +1,1 @@
+First, call Glob with pattern "**/*.py" to find all Python files. Then call Grep with pattern "def area" to find all area methods. Then Read each file that has area(). After exploring, create a file named summary.md listing each class and its area formula. Finally, edit calculator.py to add a power(self, a, b) method.

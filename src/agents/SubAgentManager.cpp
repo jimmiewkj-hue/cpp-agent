@@ -1132,7 +1132,7 @@ SubAgentManager::GetBuiltInAgentDefinitions() {
   }
   {
     BuiltInAgentDef d;
-    d.name = "claude-code-guide";
+    d.name = "cpp-agent-guide";
     d.description = "Guide agent for answering usage questions";
     d.maxTurns = 50;
     d.model = "inherit";

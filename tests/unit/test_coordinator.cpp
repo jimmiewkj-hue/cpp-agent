@@ -14,21 +14,23 @@
 using namespace agent::coordinator;
 
 TEST(is_coordinator_disabled_by_default) {
+    // STRENGTHEN-T26: use the neutral env var name (legacy name still works)
+    _putenv("CPP_AGENT_COORDINATOR_MODE=");
     _putenv("CLAUDE_CODE_COORDINATOR_MODE=");
     CHECK(!IsCoordinatorMode());
 }
 
 TEST(is_coordinator_enabled_with_env) {
-    _putenv("CLAUDE_CODE_COORDINATOR_MODE=1");
+    _putenv("CPP_AGENT_COORDINATOR_MODE=1");
     CHECK(IsCoordinatorMode());
-    _putenv("CLAUDE_CODE_COORDINATOR_MODE=");
+    _putenv("CPP_AGENT_COORDINATOR_MODE=");
 }
 
 TEST(match_session_mode_no_mismatch) {
-    _putenv("CLAUDE_CODE_COORDINATOR_MODE=1");
+    _putenv("CPP_AGENT_COORDINATOR_MODE=1");
     std::string warn = MatchSessionMode("coordinator");
     CHECK(warn.empty());
-    _putenv("CLAUDE_CODE_COORDINATOR_MODE=");
+    _putenv("CPP_AGENT_COORDINATOR_MODE=");
 }
 
 TEST(match_session_mode_empty_input) {
@@ -88,12 +90,12 @@ TEST(parse_task_notification) {
 
 TEST(build_user_context_with_scratchpad) {
     CoordinatorConfig config;
-    _putenv("CLAUDE_CODE_COORDINATOR_MODE=1");
+    _putenv("CPP_AGENT_COORDINATOR_MODE=1");
     config.scratchpadDir = "/tmp/scratch";
     auto ctx = BuildCoordinatorUserContext(config);
     CHECK(ctx.find("workerToolsContext") != ctx.end());
     CHECK(ctx["workerToolsContext"].find("/tmp/scratch") != std::string::npos);
-    _putenv("CLAUDE_CODE_COORDINATOR_MODE=");
+    _putenv("CPP_AGENT_COORDINATOR_MODE=");
 }
 
 TEST(coordination_phase_to_string) {

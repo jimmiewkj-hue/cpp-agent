@@ -1,6 +1,5 @@
 #include "tools/ToolOrchestrator.h"
 #include "hooks/HookExecutor.h"
-#include "hooks/SsrfGuard.h"
 #include "infra/Logger.h"
 #include "infra/StringUtil.h"
 #include "infra/ThreadPool.h"
@@ -38,9 +37,27 @@ static const int kMaxToolResultTruncation = 400000;
 static const long long kMaxFullReadBytes = 256 * 1024;
 static const wchar_t* kWebUserAgent = L"cpp-agent/1.0";
 
-// ParsedUrl and HttpResponse are now in FileHelpers.h (detail namespace)
-using detail::ParsedUrl;
-using detail::HttpResponse;
+std::string JoinPath(const std::string& lhs, const std::string& rhs);
+bool EnsureDirectoryRecursive(const std::string& path);
+std::string ReadFileContent(const std::string& path, std::string* error);
+bool WriteFileContent(const std::string& path,
+                      const std::string& content,
+                      std::string* error);
+std::string ToLowerAscii(std::string value);
+
+struct ParsedUrl {
+  bool secure = false;
+  INTERNET_PORT port = 0;
+  std::string host;
+  std::string path;
+};
+
+struct HttpResponse {
+  int statusCode = 0;
+  std::string body;
+  std::string contentType;
+  std::string location;
+};
 
 // ShellToken, TokenizeShellCommand, NormalizeWindowsShellCommand,
 // QuoteForPowerShellSingleQuoted, StartsWithCaseInsensitive
@@ -61,7 +78,7 @@ std::string Trim(const std::string& value) {
   return infra::Trim(value);
 }
 
-} // anonymous namespace
+
 
 // File/path/glob/search/HTML/fuzzy-match helpers extracted to FileHelpers.h
 using detail::ParentPath;
@@ -95,26 +112,6 @@ using detail::PreserveQuoteStyle;
 using detail::NORM_CRLF;
 using detail::NORM_QUOTES;
 using detail::NORM_WS;
-
-// JSON, task store, HTTP, and line-ending helpers
-using detail::JsonGetString;
-using detail::JsonGetStringMultiKey;
-using detail::JsonGetBool;
-using detail::JsonGetInt;
-using detail::NormalizeLineEndings;
-using detail::GetStateRootForTools;
-using detail::GetTaskStorePath;
-using detail::LoadTaskStore;
-using detail::SaveTaskStore;
-using detail::FindTaskIndex;
-using detail::NextTaskId;
-using detail::RenderTaskSummary;
-using detail::UrlEncode;
-using detail::BuildMarkdownFromHtml;
-using detail::HttpGet;
-using detail::ParseSearchResults;
-using detail::ExtractHtmlTitle;
-using detail::json;
 
 
 // P0-03: Case-insensitive comparison for tool name matching (moved to agent::tools scope)
@@ -294,13 +291,6 @@ std::string ToolOrchestrator::ExecuteToolBlock(
   }
   if (CaseInsensitiveCompare(resolvedName, "WebSearch")) {
     return ExecuteWebSearch(inputJson, maxResultSize, error);
-  }
-
-  // STRENGTHEN-01: dispatch mcp__<server>__<tool> names to the MCP client
-  // manager via tools/call. This closes the most severe parity gap —
-  // previously all mcp__ tool calls hit the "unknown tool" fallback below.
-  if (resolvedName.rfind("mcp__", 0) == 0 && mcpClientManager_) {
-    return ExecuteMcpTool(resolvedName, inputJson, maxResultSize, error);
   }
 
   if (error) {
@@ -825,7 +815,7 @@ ToolOrchestrator::ExecuteResult ToolOrchestrator::Execute(
           if (hookExecutor_) {
             std::string toolOutput;
             if (!r.message.content.empty() &&
-                r.message.content[0].type == core::BlockType::ToolResult) {
+                r.message.content[0].type == core::ContentBlockType::ToolResult) {
               toolOutput = r.message.content[0].asToolResult.content;
             }
             hookExecutor_->RunPostToolUseHooks(
@@ -918,8 +908,7 @@ ToolOrchestrator::ExecuteResult ToolOrchestrator::Execute(
       result.userMessages.push_back(toolMsg);
       if (isError) {
         result.errorCount++;
-        // P0-03: Post-tool-use failure hooks (aligned with local-ace)
-        // Run hooks when a tool fails so that corrective actions can be taken.
+        // Post-tool-use failure hooks (aligned with local-ace)
         if (hookExecutor_) {
           hookExecutor_->RunPostToolUseFailureHooks(
               block.asToolUse.name,
@@ -1881,7 +1870,7 @@ std::string ToolOrchestrator::ExecuteSkill(const std::string& inputJson,
   agentInput["description"] = "skill:" + command;
   const std::string lower = ToLowerAscii(command);
   if (lower == "plan" || lower == "explore" || lower == "verification" ||
-      lower == "general-purpose" || lower == "cpp-agent-guide") {
+      lower == "general-purpose" || lower == "claude-code-guide") {
     agentInput["subagent_type"] = lower;
   } else {
     agentInput["subagent_type"] = "general-purpose";
@@ -1944,84 +1933,6 @@ std::string ToolOrchestrator::ExecuteReadMcpResource(
   return TruncateResult(bodyJson, maxResultSize);
 }
 
-// STRENGTHEN-01: invoke an MCP tool via McpClientManager::CallTool.
-// Parses "mcp__<server>__<tool>" into server+tool, forwards the input JSON
-// as the tool arguments, and renders the returned content array as text.
-std::string ToolOrchestrator::ExecuteMcpTool(
-    const std::string& fullyQualifiedName,
-    const std::string& inputJson,
-    int maxResultSize,
-    std::string* error) const {
-  if (!mcpClientManager_) {
-    if (error) *error = "McpClientManager not configured";
-    return "Error: MCP tool calls require McpClientManager configuration";
-  }
-  // Split "mcp__<server>__<tool>" -> server, tool. Strip the "mcp__" prefix
-  // (5 chars), then split on the FIRST "__" separator. Tool names may
-  // themselves contain underscores, so we only split once.
-  if (fullyQualifiedName.size() <= 5 ||
-      fullyQualifiedName.rfind("mcp__", 0) != 0) {
-    if (error) *error = "malformed MCP tool name: " + fullyQualifiedName;
-    return "Error: malformed MCP tool name";
-  }
-  const std::string body = fullyQualifiedName.substr(5);
-  const auto sep = body.find("__");
-  if (sep == std::string::npos) {
-    if (error) *error = "malformed MCP tool name (no server/tool separator): "
-                        + fullyQualifiedName;
-    return "Error: malformed MCP tool name";
-  }
-  const std::string server = body.substr(0, sep);
-  const std::string tool = body.substr(sep + 2);
-
-  std::string resultJson;
-  std::string callError;
-  if (!mcpClientManager_->CallTool(server, tool, inputJson,
-                                   &resultJson, &callError)) {
-    if (error) *error = callError;
-    return "Error: MCP tool call to '" + server + "/" + tool
-           + "' failed: " + callError;
-  }
-
-  // Render the MCP result as readable text. The MCP spec returns:
-  //   {"content":[{"type":"text","text":"..."}, ...], "isError": false}
-  // We concatenate text blocks; non-text blocks (image, etc.) are summarized.
-  std::ostringstream out;
-  try {
-    auto j = nlohmann::json::parse(resultJson);
-    if (j.contains("content") && j["content"].is_array()) {
-      bool first = true;
-      for (const auto& block : j["content"]) {
-        const std::string type =
-            block.value("type", std::string());
-        if (type == "text") {
-          if (!first) out << "\n";
-          out << block.value("text", std::string());
-          first = false;
-        } else if (type == "image") {
-          if (!first) out << "\n";
-          out << "[image: " << block.value("mimeType", std::string()) << "]";
-          first = false;
-        } else if (!type.empty()) {
-          if (!first) out << "\n";
-          out << "[" << type << " content]";
-          first = false;
-        }
-      }
-      if (j.value("isError", false)) {
-        out << "\n[MCP tool reported an error]";
-      }
-    } else {
-      // No standard content array — emit the raw JSON so the model can see it.
-      out << resultJson;
-    }
-  } catch (...) {
-    // JSON parse failed — return raw text.
-    out << resultJson;
-  }
-  return TruncateResult(out.str(), maxResultSize);
-}
-
 std::string ToolOrchestrator::ExecuteWebFetch(
     const std::string& inputJson,
     int maxResultSize,
@@ -2034,16 +1945,6 @@ std::string ToolOrchestrator::ExecuteWebFetch(
   if (!(StartsWithNoCase(url, "http://") || StartsWithNoCase(url, "https://"))) {
     if (error) *error = "WebFetch only supports http/https URLs";
     return "Error: unsupported URL scheme";
-  }
-
-  // STRENGTHEN-T17: SSRF guard. Block fetches to private/internal/loopback/
-  // cloud-metadata addresses before issuing the HTTP request.
-  {
-    auto ssrf = hooks::CheckUrlForSsrf(url);
-    if (ssrf.verdict == hooks::SsrfVerdict::Block) {
-      if (error) *error = "SSRF blocked: " + ssrf.reason;
-      return "Error: " + ssrf.reason;
-    }
   }
 
   HttpResponse response;
