@@ -1,0 +1,1 @@
+Read the file calculator.py in the current workspace, understand what it does, then create a new file called calculator_test.py that contains 3 simple test cases for the calculator functions. Use Python's assert statements for the tests.

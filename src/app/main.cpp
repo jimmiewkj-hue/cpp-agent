@@ -1747,9 +1747,9 @@ int main() {
   llmCfg.apiEndpoint = GetEnvOrDefault(
       "CPP_AGENT_API_ENDPOINT", "http://127.0.0.1:8090/v1/chat/completions");
   llmCfg.mainModel = GetEnvOrDefault(
-      "CPP_AGENT_MAIN_MODEL", "Qwopus3.6-27B-v2-MTP-Q8_0");
+      "CPP_AGENT_MAIN_MODEL", "Qwen3.6-35B-A3B-UD-Q6_K");
   llmCfg.validatorModel = GetEnvOrDefault(
-      "CPP_AGENT_VALIDATOR_MODEL", "");
+      "CPP_AGENT_VALIDATOR_MODEL", "gemma-4-31B-it-Q8_0.gguf");
   // NOTE: validatorModel intentionally empty by default.
   // Dual-model validation with same-tier local models (e.g., Qwen validating
   // Gemma) produces WORSE results than single-model operation due to protocol
@@ -1758,19 +1758,19 @@ int main() {
   // write-run-verify loop, edit loop breaker, error repair loop, and
   // shell syntax translation. See ShouldRunValidation() in QueryLoop.cpp.
   llmCfg.fallbackModel = GetEnvOrDefault(
-      "CPP_AGENT_FALLBACK_MODEL", "gemma-4-31B-it-Q8_0");
+      "CPP_AGENT_FALLBACK_MODEL", "gemma-4-31B-it-Q8_0.gguf");
   llmCfg.apiKey = GetEnvOrDefault("CPP_AGENT_API_KEY", "");
   // STRENGTHEN-T25: per-role endpoint/key. Validator and fallback may run on
   // different providers (e.g. local Gemma main + cloud Claude validator).
   // Empty values fall back to the shared apiEndpoint/apiKey above.
   llmCfg.validatorEndpoint =
-      GetEnvOrDefault("CPP_AGENT_VALIDATOR_ENDPOINT", "");
+      GetEnvOrDefault("CPP_AGENT_VALIDATOR_ENDPOINT", "http://60.245.209.4/api/chat/completions");
   llmCfg.validatorApiKey =
-      GetEnvOrDefault("CPP_AGENT_VALIDATOR_API_KEY", "");
+      GetEnvOrDefault("CPP_AGENT_VALIDATOR_API_KEY", "sk-9d3990e376f941e884e4a043c3d185f5");
   llmCfg.fallbackEndpoint =
-      GetEnvOrDefault("CPP_AGENT_FALLBACK_ENDPOINT", "");
+      GetEnvOrDefault("CPP_AGENT_FALLBACK_ENDPOINT", "http://60.245.209.4/api/chat/completions");
   llmCfg.fallbackApiKey =
-      GetEnvOrDefault("CPP_AGENT_FALLBACK_API_KEY", "");
+      GetEnvOrDefault("CPP_AGENT_FALLBACK_API_KEY", "sk-9d3990e376f941e884e4a043c3d185f5");
   // STRENGTHEN-T25: optional context window + max output token overrides
   // (per-session, model-agnostic). 0 = use model-family defaults.
   llmCfg.contextWindowOverride =

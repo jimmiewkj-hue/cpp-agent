@@ -24,11 +24,16 @@ struct AutoDreamConfig {
   int minHours = 24;
   int minSessions = 5;
   int scanThrottleMs = 10 * 60 * 1000;  // 10-minute scan throttle
+  // P1-3: Distill phase scheduling (separate from regular dream cycle)
+  int distillMinDays = 30;        // minimum days between distill runs
+  int distillMinSessions = 50;    // minimum sessions between distill runs
 };
 
 struct AutoDreamState {
   long long lastConsolidatedAtMs = 0;
   long long lastScanAtMs = 0;
+  long long lastDistilledAtMs = 0;  // P1-3: last distill phase timestamp
+  int sessionsSinceDistill = 0;      // P1-3: session counter for distill gate
   bool enabled = true;
 
   AutoDreamState() {
@@ -90,6 +95,9 @@ class AutoDreamEngine {
   bool RunGatherPhase(std::string* context);
   bool RunConsolidatePhase(const std::string& context);
   bool RunPrunePhase();
+  // P1-3: Distill phase — skeleton for pattern extraction from historical
+  // sessions. Currently a placeholder; pattern mining logic to be iterated.
+  bool RunDistillPhase();
 
   // P0-03: Session listing (aligned with local-ace listSessionsTouchedSince)
   std::vector<std::string> ListSessionsTouchedSince(long long sinceMs) const;

@@ -20,6 +20,10 @@ struct SessionMemoryEntry {
   long long createdAtMs = 0;
   long long updatedAtMs = 0;
   bool active = true;
+  // P2-2: Memory provenance fields — track where a memory came from.
+  std::string sourceSession;  // session ID that created this memory
+  int sourceTurn = -1;        // turn number (-1 = unknown)
+  std::string origin;         // "human", "model", "dream", or "" (unknown)
 };
 
 // ============================================================================
@@ -58,6 +62,9 @@ class SessionMemory {
 
  private:
   std::string FilePath() const;
+  // P2-1: Markdown serialization helpers
+  bool ParseMarkdown(const std::string& content);
+  bool SaveMarkdown() const;
   std::string sessionDir_;
   std::vector<SessionMemoryEntry> entries_;
   mutable std::mutex mutex_;

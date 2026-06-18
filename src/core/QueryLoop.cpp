@@ -3,6 +3,9 @@
 #include "api/ModelClient.h"
 #include "api/SideQueryClient.h"
 #include "core/StreamingToolExecutor.h"
+#include "core/ValidatorReport.h"
+#include "core/WriterSubAgent.h"
+#include "core/MaxMode.h"
 #include "hooks/HookExecutor.h"
 #include "infra/EnvUtil.h"
 #include "infra/Logger.h"
@@ -46,8 +49,15 @@ static const int kMicroCompactAgeMs = 5 * 60 * 1000;
 namespace {
 
 struct QueryLoopDebugConfig {
-  std::string url = "http://127.0.0.1:7777/event";
-  std::string sessionId = "stream-response-stall";
+  // STRENGTHEN-debug-server: 默认关闭（空 url/sessionId）。原实现把
+  // url="http://127.0.0.1:7777/event"、sessionId="stream-response-stall" 写成
+  // 结构体默认值，导致 LoadQueryLoopDebugConfig 在 .dbg 文件不存在/无 env
+  // 时仍返回非空配置 -> 每个 ReportQueryLoopDebugEvent 都对死端口 7777 发起
+  // 阻塞式 HTTP POST，每次 WinHttp 超时约 6-16s，严重拖慢主循环（工程实测
+  // 每轮多花十几秒，test_core 80+ 轮直接超时）。与 ModelClient.cpp 的
+  // DebugServerConfig 行为对齐：默认关闭，需显式启用。
+  std::string url;
+  std::string sessionId;
 };
 
 std::string TrimDebugValue(const std::string& value) {
@@ -1583,6 +1593,7 @@ void QueryLoop::PostToolTurnProcessing(QueryLoopContext& ctx,
 
   bool hadFileWrite = false;
   bool hadBashRun = false;
+  bool bashFailed = false;  // P0-4: track whether the most recent Bash failed
 
   // Scan recent messages for tool_use blocks from the last turn.
   // The assistant messages were just appended, so scan backwards.
@@ -1605,10 +1616,35 @@ void QueryLoop::PostToolTurnProcessing(QueryLoopContext& ctx,
     if (hadFileWrite && hadBashRun) break;
   }
 
+  // P0-4: determine whether the most recent Bash run actually succeeded.
+  // Previously any Bash tool_use cleared the write-without-verify counter,
+  // even a failed run (non-zero exit), so the model was never nudged to fix
+  // and rerun. Scan the recent User-role tool_result blocks for the latest
+  // Bash result and read its isError flag.
+  if (hadBashRun) {
+    int resultScanned = 0;
+    for (auto it = ctx.messages.rbegin();
+         it != ctx.messages.rend() && resultScanned < 10; ++it, ++resultScanned) {
+      if (it->role != MessageRole::User) continue;
+      bool foundBashResult = false;
+      for (const auto& block : it->content) {
+        if (block.type != BlockType::ToolResult) continue;
+        // The Bash result text carries an "[exit code: N]" marker on failure;
+        // isError is the authoritative flag set by ExecuteBash.
+        if (block.asToolResult.isError) {
+          bashFailed = true;
+        }
+        foundBashResult = true;
+        break;
+      }
+      if (foundBashResult) break;  // most recent tool_result examined
+    }
+  }
+
   if (hadFileWrite && !hadBashRun) {
     ++state.consecutiveWriteWithoutVerifyCount;
-  } else if (hadBashRun) {
-    // Bash was run, which counts as verification
+  } else if (hadBashRun && !bashFailed) {
+    // Bash ran AND succeeded: genuine verification, clear the streak.
     state.consecutiveWriteWithoutVerifyCount = 0;
     state.verificationNudgeCount = 0;  // Reset nudge count after verification
 
@@ -1727,6 +1763,18 @@ void QueryLoop::PostToolTurnProcessing(QueryLoopContext& ctx,
         }
       }
     }
+  } else if (hadBashRun && bashFailed) {
+    // P0-4: Bash ran but FAILED (non-zero exit / isError). This is NOT a
+    // successful verification — do not clear the write-without-verify streak.
+    // Instead keep (or raise) the counter so the verify-nudge stays armed and
+    // the model is driven to fix the error and rerun. This closes the loop:
+    // previously a failed Bash silently satisfied "verification", so the model
+    // could terminate on broken code (e.g. a TypeError in main.py never fixed).
+    if (hadFileWrite) {
+      ++state.consecutiveWriteWithoutVerifyCount;
+    }
+    // Do NOT reset verificationNudgeCount — the nudge budget must remain
+    // available so the model gets another chance to run after fixing.
   } else if (!hadFileWrite) {
     // Neither write nor bash - no change to counters
   }
@@ -1907,10 +1955,9 @@ void QueryLoop::PostToolTurnProcessing(QueryLoopContext& ctx,
   // Inject verification nudge after file writes without subsequent run/verify.
   // GEMMA-ENHANCE: Use model-family-aware thresholds. Gemma tends to write
   // many files without verifying; enforce stricter write-verify cadence.
-  const ModelFamily verifyFamily = DetectModelFamily(ctx.model);
-  const int maxVerifyNudges =
-      (verifyFamily == ModelFamily::Gemma || verifyFamily == ModelFamily::Qwen)
-          ? 3 : 2;
+  // P2-4: Use centralized per-family policy for verify-nudge thresholds.
+  const ModelFamilyPolicy verifyPolicy = GetModelFamilyPolicy(ctx.model);
+  const int maxVerifyNudges = verifyPolicy.maxVerifyNudges;
   const int writeWithoutVerifyThreshold = 1;
 
   if (state.consecutiveWriteWithoutVerifyCount >= writeWithoutVerifyThreshold &&
@@ -1923,20 +1970,13 @@ void QueryLoop::PostToolTurnProcessing(QueryLoopContext& ctx,
     nudge.isMeta = true;
 
     std::string nudgeText;
-    if (state.verificationNudgeCount == 1) {
+    if (state.verificationNudgeCount <= 2) {
+      // R2-4: L1/L2 collapsed into one short prompt. The original multi-line
+      // text overlapped 100% with the system prompt's "always run code after
+      // writing" directive, wasting ~300 tokens per injection. Keep it terse.
       nudgeText =
-          "[Verification Required] You just wrote/modified project files. "
-          "Before marking the task as completed, you MUST verify the code works:\n"
-          "1. If it's a script/program: run it with Bash and check the output\n"
-          "2. If it's a config: validate the syntax\n"
-          "3. If there are tests: run them\n"
-          "4. If it's a library: check it compiles/imports correctly\n\n"
-          "Do NOT mark the task as completed until you have verified the output.";
-    } else if (state.verificationNudgeCount == 2) {
-      nudgeText =
-          "[Verification Still Required] You wrote files but have not yet "
-          "verified they work. Run the code or tests NOW using Bash. "
-          "Do not proceed to the next task without verifying.";
+          "[Verify] You wrote files without running them. "
+          "Run the code/tests with Bash now.";
     } else {
       // GEMMA-ENHANCE: 3rd nudge — hard block style for models that keep
       // writing without verifying (observed in Gemma-4-31B logs where it
@@ -2158,6 +2198,16 @@ bool QueryLoop::ContinueWithFollowup(QueryLoopContext& ctx,
   state.forceContinuationReason.clear();
   state.stage = QueryStage::ToolResultBudget;
   state.transition = reason;
+  // P1: Count ForcedContinuation transitions session-wide. forcedContinuationCount
+  // was declared but never incremented, so HandleMaxOutputTokens' silent-truncation
+  // heuristic (which gates on forcedContinuationCount >= truncationContinuationThreshold)
+  // could never fire. Bumping here makes that detection effective.
+  if (reason == TransitionReason::ForcedContinuation) {
+    ++state.forcedContinuationCount;
+    // R2-2: also track the session-wide total (never reset) so a hard ceiling
+    // can cap runaway nudge cycles regardless of per-cycle budget resets.
+    ++state.totalForcedContinuations;
+  }
   if (resetTurnCount) state.turnCount = 0;
   return true;
 }
@@ -2372,6 +2422,183 @@ void QueryLoop::ApplyStepBudget(QueryLoopContext& ctx,
   }
 }
 
+// P0-1: Checkpoint — incremental progress summary at context thresholds.
+// Aligned with MiMo Code's checkpoint mechanism. When context window usage
+// crosses 25%/50%/75%, generates a structured summary via SideQueryClient
+// and injects it as a meta message. This serves two purposes:
+//   1. Keeps the model focused on the task as context grows.
+//   2. Provides structured state for Writer SubAgent (Goal ⑤) to consume.
+//
+// Switch: CPP_AGENT_CHECKPOINT=1 (default off, cost = 1 side-query per phase).
+void QueryLoop::ApplyStepCheckpoint(QueryLoopContext& ctx,
+                                    QueryLoopInternalState& state) {
+  // Feature gate — opt-in
+  if (!infra::GetEnvBool("CPP_AGENT_CHECKPOINT", false)) return;
+  // All 3 phases done — nothing more to do
+  if (state.checkpointPhase >= 3) return;
+
+  // Estimate current context usage
+  const int estimatedTokens = EstimateMessageTokens(state.messagesForTurn)
+      + kSystemOverheadTokens;
+  const int contextWindow = GetContextWindowForFamily(ctx.model);
+  if (contextWindow <= 0) return;
+
+  // Determine which phase threshold we've crossed
+  const double usageRatio = static_cast<double>(estimatedTokens)
+      / static_cast<double>(contextWindow);
+  int targetPhase = 0;
+  if (usageRatio >= 0.75) targetPhase = 3;
+  else if (usageRatio >= 0.50) targetPhase = 2;
+  else if (usageRatio >= 0.25) targetPhase = 1;
+
+  // Only trigger if we've crossed into a new phase
+  if (targetPhase <= state.checkpointPhase) return;
+
+  // Build a truncated view of the conversation for the summarizer
+  std::string conversationDigest;
+  int fileCount = 0;
+  int toolCount = 0;
+  int errorCount = 0;
+  for (const auto& msg : state.messagesForTurn) {
+    if (msg.isMeta) continue;
+    for (const auto& block : msg.content) {
+      if (block.type == BlockType::ToolUse) {
+        ++toolCount;
+        if (block.asToolUse.name == "Write" || block.asToolUse.name == "Edit" ||
+            block.asToolUse.name == "FileWrite" || block.asToolUse.name == "FileEdit") {
+          ++fileCount;
+        }
+      }
+      if (block.type == BlockType::ToolResult && block.asToolResult.isError) {
+        ++errorCount;
+      }
+    }
+  }
+  // Collect recent assistant text for context (last 3000 chars)
+  for (auto it = state.messagesForTurn.rbegin();
+       it != state.messagesForTurn.rend(); ++it) {
+    if (it->role != MessageRole::Assistant) continue;
+    for (const auto& block : it->content) {
+      if (block.type == BlockType::Text && !block.asText.text.empty()) {
+        conversationDigest = block.asText.text + "\n" + conversationDigest;
+        if (conversationDigest.size() > 3000) break;
+      }
+    }
+    if (conversationDigest.size() > 3000) break;
+  }
+  if (conversationDigest.size() > 3000)
+    conversationDigest = conversationDigest.substr(0, 3000);
+
+  // Side-query for structured summary
+  api::SideQueryRequest request;
+  request.querySource = "checkpoint";
+  request.model = ResolveValidatorModel(ctx);
+  if (request.model.empty()) request.model = ctx.model;
+  request.systemPrompt =
+      "You are a checkpoint summarizer. Given a coding session's state, "
+      "produce a concise structured summary with these fields (JSON):\n"
+      "\"intent\": what the user originally asked for\n"
+      "\"progress\": what has been done so far\n"
+      "\"files_involved\": list of files being worked on\n"
+      "\"errors\": any unresolved errors\n"
+      "\"next_steps\": what should be done next\n"
+      "Output ONLY the JSON, no prose, no markdown fences.";
+  request.temperature = 0.0;
+  request.maxTokens = 512;
+
+  Message userMsg;
+  userMsg.role = MessageRole::User;
+  userMsg.content.push_back(ContentBlock::MakeText(
+      "Session stats: " + std::to_string(toolCount) + " tool calls, "
+      + std::to_string(fileCount) + " file operations, "
+      + std::to_string(errorCount) + " errors.\n"
+      "Context usage: " + std::to_string(estimatedTokens) + "/"
+      + std::to_string(contextWindow) + " tokens ("
+      + std::to_string(static_cast<int>(usageRatio * 100)) + "%).\n"
+      "Phase: " + std::to_string(targetPhase) + "/3.\n\n"
+      "Recent assistant output:\n" + conversationDigest));
+  request.messages.push_back(userMsg);
+
+  if (ctx.sessionManager) {
+    ctx.sessionManager->AppendModelIoRecord(
+        infra::ModelIoLogKind::Validator, "checkpoint-request",
+        request.model, request.systemPrompt, request.messages,
+        state.turnCount);
+  }
+
+  api::SideQueryResponse response = sideQueryClient_.Query(request);
+  std::string summaryText;
+  if (response.ok && !response.messages.empty()) {
+    for (const auto& msg : response.messages) {
+      for (const auto& b : msg.content) {
+        if (b.type == BlockType::Text) summaryText += b.asText.text;
+      }
+    }
+  }
+  if (summaryText.empty()) {
+    // Fallback: generate a minimal local summary
+    summaryText = "{\"progress\":\"Phase " + std::to_string(targetPhase)
+        + " reached, " + std::to_string(toolCount) + " tool calls, "
+        + std::to_string(fileCount) + " file ops, "
+        + std::to_string(errorCount) + " errors\"}";
+  }
+
+  state.checkpointPhase = targetPhase;
+  state.checkpointSummaries.push_back(summaryText);
+
+  // Inject as meta message so the model sees the checkpoint
+  Message checkpointMsg;
+  checkpointMsg.role = MessageRole::System;
+  checkpointMsg.uuid = "checkpoint-" + std::to_string(targetPhase);
+  checkpointMsg.isMeta = true;
+  checkpointMsg.content.push_back(ContentBlock::MakeText(
+      "[Checkpoint phase " + std::to_string(targetPhase)
+      + "/3 — context at " + std::to_string(static_cast<int>(usageRatio * 100))
+      + "%]\n" + summaryText
+      + "\n[Use this checkpoint to stay focused on the original intent."
+        " Do not repeat completed work.]"));
+  state.pendingFollowupMessages.push_back(checkpointMsg);
+
+  ReportQueryLoopDebugEvent(
+      "2", "QueryLoop.cpp:checkpoint:generated",
+      "[DEBUG] Checkpoint summary generated",
+      {{"phase", targetPhase},
+       {"usagePercent", static_cast<int>(usageRatio * 100)},
+       {"toolCalls", toolCount},
+       {"fileOps", fileCount},
+       {"errors", errorCount}},
+      MakeQueryLoopTraceId("checkpoint"));
+  LOG_INFO(QUERY, "Checkpoint generated",
+           {{"phase", std::to_string(targetPhase)},
+            {"usagePercent", std::to_string(static_cast<int>(usageRatio * 100))}});
+
+  // P0-3: Writer SubAgent — if enabled, write session state file
+  // asynchronously. Consumes the checkpoint summary without any LLM cost.
+  if (IsWriterEnabled()) {
+    WriterSessionState writerState;
+    writerState.sessionId = ctx.sessionDir;
+    writerState.turnCount = state.turnCount;
+    writerState.model = ctx.model;
+    writerState.contextUsagePercent = static_cast<int>(usageRatio * 100);
+    writerState.checkpointPhase = targetPhase;
+    // Parse structured fields from checkpoint summary if it's JSON
+    try {
+      auto j = nlohmann::json::parse(summaryText, nullptr, false);
+      if (j.is_object()) {
+        if (j.contains("intent")) writerState.intent = j["intent"].get<std::string>();
+        if (j.contains("progress")) writerState.progress = j["progress"].get<std::string>();
+        if (j.contains("files_involved")) writerState.filesInvolved = j["files_involved"].dump();
+        if (j.contains("errors")) writerState.errors = j["errors"].get<std::string>();
+        if (j.contains("next_steps")) writerState.nextSteps = j["next_steps"].get<std::string>();
+      }
+    } catch (...) {
+      // Non-JSON summary — store as progress
+      writerState.progress = summaryText.substr(0, 500);
+    }
+    WriteSessionStateFile(writerState, ctx.sessionDir);
+  }
+}
+
 void QueryLoop::ApplyStepSnip(QueryLoopContext& ctx,
                               QueryLoopInternalState& state) {
   // Disabled: align with local-ace's snipCompact which is a no-op/disabled
@@ -2486,7 +2713,19 @@ void QueryLoop::ApplyStepCollapse(QueryLoopContext& ctx,
   // This ensures collapse only fires when autoCompact hasn't kept up.
   const int effectiveWindow = contextWindow - kMaxOutputTokensForSummary;
   const int threshold = static_cast<int>(effectiveWindow * 0.95);
-  if (estimatedTokens <= threshold) return;
+  // P0-1: message-count fallback. If autoCompact is disabled (3 consecutive
+  // failures) but messages keep accumulating, collapse must intervene as the
+  // last-resort safety valve. Use 1.5x the compact threshold so collapse only
+  // fires after autoCompact has had its chance.
+  const ModelFamilyPolicy collapsePolicy = GetModelFamilyPolicy(ctx.model);
+  const int collapseMsgThreshold =
+      collapsePolicy.compactMessageThreshold > 0
+          ? collapsePolicy.compactMessageThreshold * 3 / 2
+          : 0;
+  const bool messageCountTriggered =
+      collapseMsgThreshold > 0 &&
+      static_cast<int>(state.messagesForTurn.size()) >= collapseMsgThreshold;
+  if (estimatedTokens <= threshold && !messageCountTriggered) return;
   const int beforeCount = static_cast<int>(state.messagesForTurn.size());
   if (ctx.hookExecutor != nullptr) {
     ctx.hookExecutor->RunPreCompactHooks(
@@ -2546,7 +2785,17 @@ bool QueryLoop::ApplyStepAutocompact(QueryLoopContext& ctx,
   const int contextWindow = GetContextWindowForFamily(ctx.model);
   const int threshold =
       contextWindow - kMaxOutputTokensForSummary - kAutoCompactBufferTokens;
-  if (estimatedTokens <= threshold) return false;
+  // P0-1: message-count trigger. For local quantized models the token estimate
+  // under-counts short CJK messages, so the 167K-token threshold is never
+  // reached and context grew unbounded (observed 1->160 messages on Gemma).
+  // When the per-family compactMessageThreshold is set, exceeding it triggers
+  // compaction regardless of the token estimate.
+  const ModelFamilyPolicy compactPolicy = GetModelFamilyPolicy(ctx.model);
+  const bool messageCountTriggered =
+      compactPolicy.compactMessageThreshold > 0 &&
+      static_cast<int>(state.messagesForTurn.size()) >=
+          compactPolicy.compactMessageThreshold;
+  if (estimatedTokens <= threshold && !messageCountTriggered) return false;
   if (state.consecutiveAutoCompactFailures >= kAutoCompactMaxFailures)
     return false;
   const int beforeCount = static_cast<int>(state.messagesForTurn.size());
@@ -2639,6 +2888,10 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
   currentAssistant.uuid = "stream-asst";
 
   std::ostringstream textBuffer;
+  // P0-2: accumulate reasoning-text length for this turn so we can detect
+  // tool-only turns (tool call with negligible reasoning text). The ModelClient
+  // layer counts textEvents/toolEvents but never surfaces them to QueryLoop.
+  size_t turnTextChars = 0;
 
   // Tool execution stays in the normal RunTools stage so guards such as
   // workspace-first validation can inspect streamed tool_use blocks before
@@ -2679,6 +2932,7 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
       [&](const std::string& event, const std::string& data) {
     if (event == "text_delta") {
       textBuffer << data;
+      turnTextChars += data.size();  // P0-2: track reasoning-text length
       Message streamMessage;
       streamMessage.role = MessageRole::Assistant;
       streamMessage.uuid = "stream-delta";
@@ -2771,6 +3025,37 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
     ctx.sessionManager->AppendModelIoRecord(
         infra::ModelIoLogKind::Main, "response", state.activeModel,
         std::string(), state.assistantMessages, state.turnCount);
+  }
+
+  // P0-2: Track consecutive tool-only turns (tool call with negligible
+  // reasoning text). Gemma/Qwen on local quantized inference emit turns with
+  // textEvents=0 toolEvents=1, and the loop kept ForceContinuing with no
+  // backstop. A turn counts as "tool-only" when it produced tool_use blocks
+  // but very little reasoning text. The threshold is per-family-tunable via
+  // maxToolOnlyTurns; HandleNoToolContinuation hard-terminates when it is
+  // exceeded.
+  state.lastTurnTextChars = static_cast<int>(turnTextChars);
+  const ModelFamilyPolicy policy = GetModelFamilyPolicy(ctx.model);
+  if (!state.toolUseBlocks.empty()) {
+    const int kMinReasoningChars = 20;  // below this a tool turn is "silent"
+    if (state.lastTurnTextChars < kMinReasoningChars) {
+      ++state.consecutiveToolOnlyTurns;
+    } else {
+      state.consecutiveToolOnlyTurns = 0;
+    }
+    // A tool-calling turn is never an oversized plan.
+    state.lastTurnWasOversizedPlan = false;
+  } else {
+    // No tools this turn: reset the tool-only streak (the no-tool path has
+    // its own bounded-nudge handling).
+    state.consecutiveToolOnlyTurns = 0;
+    // R2-1: detect oversized planning monologues. A tool-less turn that
+    // emitted a large amount of reasoning text is a planning loop that
+    // nudges fail to break (33% failure rate per log analysis). Flag it so
+    // HandleNoToolContinuation can hard-terminate instead of nudging again.
+    state.lastTurnWasOversizedPlan =
+        policy.maxTextOnlyOutputChars > 0 &&
+        state.lastTurnTextChars >= policy.maxTextOnlyOutputChars;
   }
 
   return !state.toolUseBlocks.empty();
@@ -3193,12 +3478,10 @@ bool QueryLoop::HandleMaxOutputTokens(QueryLoopContext& ctx,
   if (!isMaxTokens && state.toolUseBlocks.empty() &&
       !lastMsg.isApiErrorMessage) {
     std::string lastText = CollectText(state.assistantMessages);
-    // Lower threshold for cloud models that tend to truncate silently
-    ModelFamily family = DetectModelFamily(ctx.model);
-    int textThreshold = (family == ModelFamily::MiMo ||
-                         family == ModelFamily::Qwen) ? 1500 : 2000;
-    int continuationThreshold = (family == ModelFamily::MiMo ||
-                                 family == ModelFamily::Qwen) ? 2 : 3;
+    // P2-4: Use centralized per-family policy for truncation thresholds.
+    const ModelFamilyPolicy truncPolicy = GetModelFamilyPolicy(ctx.model);
+    int textThreshold = truncPolicy.truncationTextThreshold;
+    int continuationThreshold = truncPolicy.truncationContinuationThreshold;
     if (static_cast<int>(lastText.size()) > textThreshold &&
         state.forcedContinuationCount >= continuationThreshold) {
       isMaxTokens = true;
@@ -3473,6 +3756,159 @@ bool QueryLoop::ApplyStepRunTools(QueryLoopContext& ctx,
   return !execResult.userMessages.empty();
 }
 
+// P0-2: Goal Verifier — independent completion check before termination.
+// Aligned with MiMo Code's Goal mechanism. Uses SideQueryClient to ask an
+// independent LLM whether the user's goal is truly satisfied by the work
+// done so far. Prevents "false completion" where the agent prematurely
+// declares done without actually meeting the acceptance criteria.
+//
+// Returns true if the agent should CONTINUE (goal not yet met),
+// false if it's OK to terminate (goal met, or verifier skipped).
+bool QueryLoop::VerifyGoalCompletion(QueryLoopContext& ctx,
+                                     QueryLoopInternalState& state) {
+  // 1. Feature gate — opt-in via env var
+  if (!infra::GetEnvBool("CPP_AGENT_GOAL_VERIFIER", false)) return false;
+
+  auto& gv = state.goalVerifier;
+
+  // 2. Anti-loop: hard cap on verification attempts
+  if (gv.verificationAttempts >= gv.maxAttempts) return false;
+
+  // 3. Extract goal condition (cached after first extraction)
+  if (!gv.goalSpecified && gv.goalCondition.empty()) {
+    // 3a. Try execution contract first (most structured source)
+    if (!state.executionContract.empty()) {
+      gv.goalCondition = state.executionContract;
+      gv.goalSpecified = true;
+    } else {
+      // 3b. Fall back to last non-meta user message (same pattern as
+      //     ExtractOriginalUserGoal in LocalValidator.cpp)
+      for (auto it = ctx.messages.rbegin(); it != ctx.messages.rend(); ++it) {
+        if (it->role != MessageRole::User) continue;
+        if (it->isMeta) continue;
+        for (const auto& block : it->content) {
+          if (block.type == BlockType::Text && !block.asText.text.empty()) {
+            gv.goalCondition = block.asText.text;
+            gv.goalSpecified = true;
+            break;
+          }
+        }
+        if (gv.goalSpecified) break;
+      }
+    }
+    // Truncate to keep side-query prompt manageable
+    if (gv.goalCondition.size() > 4000)
+      gv.goalCondition = gv.goalCondition.substr(0, 4000);
+    // If no goal found at all, mark so we don't re-scan every termination
+    if (gv.goalCondition.empty()) {
+      gv.goalSpecified = false;
+      return false;  // nothing to verify — allow termination
+    }
+  }
+  // If we previously found no goal, don't re-scan
+  if (gv.goalCondition.empty()) return false;
+
+  ++gv.verificationAttempts;
+
+  // 4. Collect recent assistant output for verification
+  std::string assistantOutput;
+  for (const auto& msg : state.assistantMessages) {
+    for (const auto& block : msg.content) {
+      if (block.type == BlockType::Text && !block.asText.text.empty()) {
+        if (!assistantOutput.empty()) assistantOutput += "\n";
+        assistantOutput += block.asText.text;
+      }
+    }
+  }
+  if (assistantOutput.size() > 6000)
+    assistantOutput = assistantOutput.substr(0, 6000);
+
+  // 5. Build verification side-query (reuses ExecutionContract prompt pattern)
+  api::SideQueryRequest request;
+  request.querySource = "goal-verifier";
+  request.model = ResolveValidatorModel(ctx);
+  if (request.model.empty()) request.model = ctx.model;
+  request.systemPrompt =
+      "You are an independent goal verifier. You receive the user's original "
+      "goal/acceptance criteria and the agent's most recent output. Determine "
+      "whether the goal is TRULY satisfied. Reply with exactly one of:\n"
+      "PASS — goal is met, the agent can stop.\n"
+      "FAIL — goal is NOT met, explain briefly what is missing.\n"
+      "Be strict: incomplete work, untested code, or missing deliverables "
+      "should FAIL.";
+  request.temperature = 0.0;
+  request.maxTokens = 512;
+
+  Message userMsg;
+  userMsg.role = MessageRole::User;
+  userMsg.content.push_back(ContentBlock::MakeText(
+      "=== Goal / Acceptance Criteria ===\n" + gv.goalCondition +
+      "\n\n=== Agent's Recent Output ===\n" + assistantOutput +
+      "\n\n=== Verdict? (PASS or FAIL) ==="));
+  request.messages.push_back(userMsg);
+
+  if (ctx.sessionManager) {
+    ctx.sessionManager->AppendModelIoRecord(
+        infra::ModelIoLogKind::Validator, "goal-verifier-request",
+        request.model, request.systemPrompt, request.messages,
+        state.turnCount);
+  }
+
+  api::SideQueryResponse response = sideQueryClient_.Query(request);
+  if (!response.ok || response.messages.empty()) {
+    // Side-query failure — fail open, allow termination
+    ReportQueryLoopDebugEvent(
+        "3", "QueryLoop.cpp:goal-verifier:fail-open",
+        "[DEBUG] Goal verifier side-query failed, allowing termination",
+        {{"attempt", gv.verificationAttempts}},
+        MakeQueryLoopTraceId("goal-verifier"));
+    return false;
+  }
+
+  // 6. Parse verdict
+  std::string verdictText;
+  for (const auto& msg : response.messages) {
+    for (const auto& b : msg.content) {
+      if (b.type == BlockType::Text) verdictText += b.asText.text;
+    }
+  }
+  bool passed = verdictText.find("PASS") != std::string::npos &&
+                verdictText.find("FAIL") == std::string::npos;
+  gv.lastVerificationPassed = passed;
+
+  if (passed) {
+    ReportQueryLoopDebugEvent(
+        "3", "QueryLoop.cpp:goal-verifier:passed",
+        "[DEBUG] Goal verifier: PASS — allowing termination",
+        {{"attempt", gv.verificationAttempts}},
+        MakeQueryLoopTraceId("goal-verifier"));
+    return false;  // OK to stop
+  }
+
+  // 7. FAIL — inject a continuation nudge with verifier feedback
+  ReportQueryLoopDebugEvent(
+      "3", "QueryLoop.cpp:goal-verifier:failed",
+      "[DEBUG] Goal verifier: FAIL — injecting continuation",
+      {{"attempt", gv.verificationAttempts},
+       {"verdict", verdictText.substr(0, 300)}},
+      MakeQueryLoopTraceId("goal-verifier"));
+
+  Message nudge;
+  nudge.role = MessageRole::User;
+  nudge.uuid = "goal-verifier-nudge-" + std::to_string(gv.verificationAttempts);
+  nudge.isMeta = true;
+  std::string nudgeText =
+      "[system] An independent verifier determined that the user's goal is "
+      "NOT yet complete. Verifier feedback:\n" + verdictText +
+      "\n\nPlease address the missing items above and verify your work "
+      "before finishing.";
+  nudge.content.push_back(ContentBlock::MakeText(nudgeText));
+  std::vector<Message> nudgeFollowups = {nudge};
+  return ContinueWithFollowup(
+      ctx, state, nudgeFollowups,
+      TransitionReason::ForcedContinuation, false);
+}
+
 bool QueryLoop::ApplyStepTerminate(QueryLoopContext& ctx,
                                    QueryLoopInternalState& state) {
   state.toolUseBlocks = CollectToolUseBlocks(state.assistantMessages);
@@ -3512,6 +3948,13 @@ bool QueryLoop::ApplyStepTerminate(QueryLoopContext& ctx,
           TransitionReason::ForcedContinuation, false);
     }
 
+    // P0-2: Goal Verifier — independent completion check before final
+    // termination. If the goal is not met, this injects a continuation
+    // nudge and returns true (continue the loop).
+    if (VerifyGoalCompletion(ctx, state)) {
+      return true;
+    }
+
     AppendTurnArtifacts(
         ctx, state.assistantMessages, state.toolResultMessages,
         state.pendingFollowupMessages);
@@ -3545,6 +3988,24 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
        {"forceContinuation", state.forceContinuation},
        {"forceContinuationReason", state.forceContinuationReason}},
       MakeQueryLoopTraceId("no-tool"));
+  // R2-1: Hard-terminate on oversized planning monologues. When a tool-less
+  // turn emitted reasoning text >= policy.maxTextOnlyOutputChars, nudging has
+  // a 33% failure rate (per log analysis) and just wastes another 60-90s turn.
+  // Terminate immediately so the user can intervene, rather than burning the
+  // nudge budget on a model that is stuck narrating plans.
+  if (state.lastTurnWasOversizedPlan) {
+    ReportQueryLoopDebugEvent(
+        "2", "QueryLoop.cpp:no-tool:oversized-plan-breaker",
+        "[WARN] Terminating: oversized planning text with no tool call",
+        {{"lastTurnTextChars", state.lastTurnTextChars},
+         {"turnCount", state.turnCount}},
+        MakeQueryLoopTraceId("oversized-plan"));
+    AppendTurnArtifacts(ctx, state.assistantMessages,
+                        state.toolResultMessages, {});
+    state.completed = true;
+    state.terminalReason = "oversized_planning_text";
+    return false;
+  }
   if (state.validatorRequestedRetry &&
       state.validatorRetryCount >= kMaxValidatorRetryContinuations) {
     if (state.validatorNudgeCount >= 1) {
@@ -3692,18 +4153,10 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
   // with 20+ tool calls could have 20+ text-only turns, so the budget must
   // be large enough to accommodate productive alternating patterns while
   // still preventing infinite death spirals.
-  int maxNoToolNudges = 10;
+  // P2-4: Use centralized per-family policy for no-tool nudge budget.
+  const ModelFamilyPolicy noToolPolicy = GetModelFamilyPolicy(ctx.model);
+  int maxNoToolNudges = noToolPolicy.maxNoToolNudges;
   ModelFamily family = DetectModelFamily(ctx.model);
-  if (family == ModelFamily::Qwen) {
-    maxNoToolNudges = 15;
-  } else if (family == ModelFamily::Gemma) {
-    // Gemma-4-31B has a strong tendency to produce long reasoning text
-    // before tool calls, and frequently alternates between text-only and
-    // tool-call turns. Engineering tests (jianlai_graph2) show 9+ text-only
-    // turns in a 21-turn session. Budget of 30 allows ~60 total turns
-    // with alternating pattern, sufficient for complex tasks.
-    maxNoToolNudges = 30;
-  }
   const bool hasPriorToolActivity = HasRecentToolActivity(ctx);
   const bool modelProducedText = !CollectText(state.assistantMessages).empty();
 
@@ -3748,7 +4201,9 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
         lowerText.find("i will ") < 20 ||
         currentText.find("用户想要") < 20 ||
         currentText.find("让我") < 20 ||
-        currentText.find("我需要") < 20) {
+        currentText.find("我需要") < 20 ||
+        currentText.find("我先") < 20 ||
+        currentText.find("好的，我") < 20) {
       isPlanning = true;
     }
 
@@ -3771,7 +4226,7 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
           const std::string& text = block.asText.text;
           if (text.find("search string not found") != std::string::npos ||
               text.find("Error: cannot read file") != std::string::npos ||
-              text.find("old_string") != std::string::npos) {
+              text.find("old_string did not match") != std::string::npos) {
             ++recentEditFailCount;
           }
         }
@@ -3786,7 +4241,20 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
     hasRecentEditFailures = (recentEditFailCount >= 2);
   }
 
-  if ((hasPriorToolActivity && modelProducedText) || isRepetitivePlanning) {
+  // STRENGTHEN-no-prior-tool: 当本轮是纯文本回复且此前没有任何工具活动时，
+  // 只要文本较长且不像是真实完成（IsLikelyCompletionResponse 为假），就应当
+  // 注入 nudge 逼模型落到 tool_use，而不是直接终止。
+  // 修复 gemma4 "首轮纯计划文本（约 500B 的'让我先探索…'）-> 直接 completed
+  // -> 退到 IDLE" 的缺陷。长度阈值 400B 用于排除短问答式纯文本（如 "4"、
+  // "答案"），这类纯聊天不应被 nudge；nudge 次数仍受 maxNoToolNudges 封顶，
+  // 不会死循环。
+  const bool noPriorToolTaskText =
+      !hasPriorToolActivity && modelProducedText &&
+      currentText.size() >= 400 &&
+      !IsLikelyCompletionResponse(currentText);
+
+  if ((hasPriorToolActivity && modelProducedText) || isRepetitivePlanning ||
+      noPriorToolTaskText) {
     // CRITICAL: Before injecting a nudge, check if the model's response
     // indicates genuine task completion. This prevents unnecessary repeated
     // prompts when the model has legitimately finished the task but didn't
@@ -3852,7 +4320,15 @@ bool QueryLoop::HandleNoToolContinuation(QueryLoopContext& ctx,
                        "要么直接输出工具调用，要么明确说明任务已完成并给出最终答案。";
         }
       } else if (family == ModelFamily::Gemma) {
-        if (state.missingToolUsePromptCount <= 2 && !isRepetitivePlanning) {
+        // STRENGTHEN-no-prior-tool: 首轮纯计划文本（此前无任何工具活动）是
+        // gemma4 的典型模式——它倾向先输出"让我先探索…"的文字、下一步才调
+        // 工具。用更直接的中文引导，明确要求落到 tool_use，避免被误判为完成。
+        if (!hasPriorToolActivity && state.missingToolUsePromptCount == 1) {
+          nudgeText =
+              "[system] 你的回复只包含计划文字，没有执行任何工具调用。"
+              "本工作区是一个需要实际改动的工程任务，请立即调用 Glob 或 Read "
+              "工具探索目录/文件，不要只用文字描述你打算做什么。";
+        } else if (state.missingToolUsePromptCount <= 2 && !isRepetitivePlanning) {
           nudgeText = "[system] Execute a tool call immediately. Do not stop at planning.";
         } else if (state.missingToolUsePromptCount <= 5) {
           nudgeText = "[system] STOP planning. You must emit a tool call NOW. Do not describe what you will do. Execute the tool call!";
@@ -3954,7 +4430,56 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
           state.terminalReason = "max_turns";
           continue;
         }
+        // P0-2: Hard circuit-breaker for zero-reasoning tool-call loops.
+        // consecutiveToolOnlyTurns is incremented in ApplyStepModelCall when a
+        // turn produced tool_use blocks but negligible reasoning text. If this
+        // streak exceeds the per-family cap, terminate instead of looping.
+        // Observed in real runs: Gemma emitted 21 turns of textEvents=0
+        // toolEvents=1 while the loop kept ForceContinuing with no backstop.
+        {
+          const ModelFamilyPolicy policy = GetModelFamilyPolicy(ctx.model);
+          if (policy.maxToolOnlyTurns > 0 &&
+              state.consecutiveToolOnlyTurns >= policy.maxToolOnlyTurns) {
+            ReportQueryLoopDebugEvent(
+                "2", "QueryLoop.cpp:tool-only-loop-breaker",
+                "[WARN] Terminating: consecutive tool-only turns exceeded cap",
+                {{"consecutiveToolOnlyTurns",
+                  state.consecutiveToolOnlyTurns},
+                 {"maxToolOnlyTurns", policy.maxToolOnlyTurns},
+                 {"turnCount", state.turnCount},
+                 {"lastTurnTextChars", state.lastTurnTextChars}},
+                MakeQueryLoopTraceId("tool-only-loop"));
+            AppendTurnArtifacts(ctx, state.assistantMessages,
+                                state.toolResultMessages, {});
+            state.completed = true;
+            state.terminalReason = "tool_only_loop";
+            continue;
+          }
+          // R2-2: Session-wide ForcedContinuation ceiling. totalForcedContinuations
+          // never resets, so a model that keeps getting nudged (e.g. Gemma's
+          // 30-per-cycle maxNoToolNudges × multiple cycles) is capped hard.
+          // Observed: 19 forced continuations / ~23 min of planning loops.
+          if (policy.maxForcedContinuations > 0 &&
+              state.totalForcedContinuations >= policy.maxForcedContinuations) {
+            ReportQueryLoopDebugEvent(
+                "2", "QueryLoop.cpp:forced-continuation-budget-breaker",
+                "[WARN] Terminating: session forced-continuation budget exhausted",
+                {{"totalForcedContinuations",
+                  state.totalForcedContinuations},
+                 {"maxForcedContinuations", policy.maxForcedContinuations},
+                 {"turnCount", state.turnCount}},
+                MakeQueryLoopTraceId("fc-budget"));
+            AppendTurnArtifacts(ctx, state.assistantMessages,
+                                state.toolResultMessages, {});
+            state.completed = true;
+            state.terminalReason = "forced_continuation_budget_exhausted";
+            continue;
+          }
+        }
         ApplyStepBudget(ctx, state);
+        // P0-1: Checkpoint — check if we've crossed a context threshold
+        // and generate an incremental progress summary if so.
+        ApplyStepCheckpoint(ctx, state);
         // Emit context usage update event for TUI display
         {
           const int estimatedTokens = EstimateMessageTokens(state.messagesForTurn)
@@ -4016,6 +4541,47 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
         // main model knows how its work will be verified.
         if (!state.executionContractGenerated) {
           GenerateExecutionContract(ctx, state);
+        }
+        // P1-2: Max Mode — at critical decision points in the first N
+        // turns, fire parallel side queries and inject diverse approaches
+        // as a meta message for the main model to judge.
+        if (ShouldActivateMaxMode(state.turnCount, state.modelCallCount)) {
+          std::string goal;
+          for (const auto& m : state.messagesForTurn) {
+            if (m.role != MessageRole::User || m.isMeta) continue;
+            for (const auto& b : m.content) {
+              if (b.type == BlockType::Text && !b.asText.text.empty()) {
+                goal = b.asText.text; break;
+              }
+            }
+            if (!goal.empty()) break;
+          }
+          std::string context;
+          if (!state.messagesForTurn.empty()) {
+            const auto& last = state.messagesForTurn.back();
+            for (const auto& b : last.content) {
+              if (b.type == BlockType::Text) context += b.asText.text;
+            }
+          }
+          MaxModeResult mmResult = RunMaxModeSampling(
+              goal, context, sideQueryClient_, ctx.model);
+          if (mmResult.activated && !mmResult.judgePrompt.empty()) {
+            Message maxModeMsg;
+            maxModeMsg.role = MessageRole::System;
+            maxModeMsg.uuid = "max-mode-judge-"
+                + std::to_string(state.modelCallCount);
+            maxModeMsg.isMeta = true;
+            maxModeMsg.content.push_back(ContentBlock::MakeText(
+                mmResult.judgePrompt));
+            state.messagesForTurn.push_back(maxModeMsg);
+            ReportQueryLoopDebugEvent(
+                "3", "QueryLoop.cpp:max-mode:activated",
+                "[DEBUG] Max Mode: injected judge prompt",
+                {{"modelCallCount", state.modelCallCount},
+                 {"candidates",
+                  static_cast<int>(mmResult.candidates.size())}},
+                MakeQueryLoopTraceId("max-mode"));
+          }
         }
         bool hasTools = ApplyStepModelCall(ctx, state);
         ++state.modelCallCount;
@@ -4193,6 +4759,10 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
   EmitQueryLoopEvent(
       ctx, QueryLoopEvent::Type::LoopCompleted, QueryStage::Completed, nullptr,
       state.terminalReason);
+
+  // P2-3: Emit validator effectiveness report at session end.
+  // Pure observability — no side effects on loop state.
+  EmitValidatorReport(state, ctx.sessionManager);
 
   // Fire Notification hooks when query loop completes (aligned with local-ace)
   if (ctx.hookExecutor != nullptr) {

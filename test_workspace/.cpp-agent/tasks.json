@@ -1,0 +1,14 @@
+[
+  {
+    "acceptance_criteria": "calculator_test.py exists and contains 3 test cases using assert statements.",
+    "activeForm": "creating calculator_test.py",
+    "content": "Create calculator_test.py with 3 simple test cases for Calculator functions.",
+    "status": "completed"
+  },
+  {
+    "acceptance_criteria": "calculator_test.py runs without errors.",
+    "activeForm": "verifying calculator_test.py",
+    "content": "Run calculator_test.py to verify the tests pass.",
+    "status": "completed"
+  }
+]

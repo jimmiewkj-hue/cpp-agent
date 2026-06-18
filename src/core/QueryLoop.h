@@ -85,6 +85,27 @@ struct QueryLoopInternalState {
   // to fix one line without success.
   std::string lastEditedFilePath;
   int consecutiveSameFileEditFailures = 0;
+  // P0-2: Zero-reasoning tool-call loop breaker. The agent log shows Gemma
+  // emitting turns with textEvents=0 toolEvents=1 (tool call, zero reasoning
+  // text) repeatedly while the loop keeps ForceContinuing. The textEvents/
+  // toolEvents counts live only in ModelClient and never reached QueryLoop,
+  // so there was no backstop. lastTurnTextChars captures the reasoning text
+  // length of the most recent model call; consecutiveToolOnlyTurns counts
+  // how many turns in a row produced tool calls with negligible reasoning.
+  // HandleNoToolContinuation hard-terminates ("tool_only_loop") when this
+  // exceeds the per-family maxToolOnlyTurns policy.
+  int lastTurnTextChars = 0;
+  int consecutiveToolOnlyTurns = 0;
+  // R2-1: set in ApplyStepModelCall when a turn produced NO tool_use blocks
+  // but emitted reasoning text >= policy.maxTextOnlyOutputChars. Such turns
+  // are oversized planning monologues (observed 1432 events / 75s on Gemma);
+  // nudging them has a 33% failure rate, so HandleNoToolContinuation
+  // hard-terminates ("oversized_planning_text") instead of nudging again.
+  bool lastTurnWasOversizedPlan = false;
+  // R2-2: session-wide ForcedContinuation counter (never reset, mirroring
+  // totalValidatorRetryCount). Capped by policy.maxForcedContinuations to
+  // prevent runaway nudge cycles (observed 19 forced continuations / 23 min).
+  int totalForcedContinuations = 0;
   // STRENGTHEN-T09: validator effectiveness sliding window. Records whether
   // each validator intervention was accepted by the main model on the next
   // turn. When effectiveness drops below 0.3, the tier auto-downgrades to
@@ -100,6 +121,26 @@ struct QueryLoopInternalState {
   // rather than free-form critique. Empty when not generated.
   std::string executionContract;
   bool executionContractGenerated = false;
+
+  // P0-2: Goal Verifier state (aligned with MiMo Code Goal mechanism).
+  // Independent completion verification before the agent terminates.
+  // Prevents "false completion" where the agent prematurely declares done.
+  struct GoalVerifierState {
+    std::string goalCondition;       // extracted from user prompt or contract
+    int verificationAttempts = 0;    // how many times we've checked
+    int maxAttempts = 5;             // hard cap to prevent infinite loops
+    bool goalSpecified = false;      // whether a goal condition was found
+    bool lastVerificationPassed = false;  // last check result
+  };
+  GoalVerifierState goalVerifier;
+
+  // P0-1: Checkpoint incremental mechanism (aligned with MiMo Code checkpoint).
+  // At 25%/50%/75% of context window usage, generates a structured summary
+  // of progress so far (intent, files touched, errors) and injects it as a
+  // meta message. This keeps the model focused and enables Writer SubAgent
+  // (Goal ⑤) to consume checkpoint state asynchronously.
+  int checkpointPhase = 0;                // 0=none, 1=25%, 2=50%, 3=75%
+  std::vector<std::string> checkpointSummaries;  // collected summaries
 };
 
 // STRENGTHEN-T09: compute validator effectiveness from the sliding window.
@@ -135,6 +176,9 @@ class QueryLoop {
  private:
   void ApplyStepBudget(QueryLoopContext& ctx,
                        QueryLoopInternalState& state);
+  // P0-1: Checkpoint — incremental progress summary at context thresholds.
+  void ApplyStepCheckpoint(QueryLoopContext& ctx,
+                           QueryLoopInternalState& state);
   void ApplyStepSnip(QueryLoopContext& ctx,
                      QueryLoopInternalState& state);
   void ApplyStepMicrocompact(QueryLoopContext& ctx,
@@ -198,6 +242,11 @@ class QueryLoop {
   bool ShouldTerminateOnDuplicates(
       QueryLoopContext& ctx,
       QueryLoopInternalState& state) const;
+  // P0-2: Goal Verifier — independent completion check before termination.
+  // Uses SideQueryClient to verify if the user's goal is truly satisfied.
+  // Returns true if the agent should CONTINUE (goal not met), false if OK to stop.
+  bool VerifyGoalCompletion(QueryLoopContext& ctx,
+                            QueryLoopInternalState& state);
   // P0-02: Wall-clock budget check
   bool IsWallClockExpired(QueryLoopContext& ctx) const;
 

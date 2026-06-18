@@ -110,6 +110,7 @@ int main(int argc, char** argv) {
       "CPP_AGENT_VALIDATOR_MODEL", "");
   llmCfg.fallbackModel = GetEnvOrDefault(
       "CPP_AGENT_FALLBACK_MODEL", "gemma-4-31B-it-Q8_0");
+  llmCfg.apiKey = GetEnvOrDefault("CPP_AGENT_API_KEY", "");
   llmCfg.connectTimeoutMs = 30000;
   llmCfg.requestTimeoutMs = 180000;
   std::cout << "smoke_endpoint=" << llmCfg.apiEndpoint << std::endl;

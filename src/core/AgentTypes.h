@@ -67,6 +67,90 @@ inline bool ModelPrefersOpenAIFormat(const std::string& model) {
          fam == ModelFamily::MiMo || fam == ModelFamily::Generic;
 }
 
+// P2-4: Centralized per-family policy. Consolidates the 8+ scattered
+// DetectModelFamily switch/if branches in QueryLoop.cpp and ModelClient.cpp
+// into a single lookup point. Each field has a sensible default that matches
+// the Generic/Claude baseline.
+struct ModelFamilyPolicy {
+  int maxVerifyNudges = 2;            // write-verify nudge budget
+  int maxNoToolNudges = 10;           // no-tool-use continuation nudges
+  int truncationTextThreshold = 2000; // bytes before suspecting max-tokens
+  int truncationContinuationThreshold = 3;  // forced continuations before escalation
+  double defaultTemperature = -1.0;   // -1 = not set (caller decides)
+  int maxOutputTokens = 8192;         // default max output tokens
+  bool preferChineseNudges = false;   // use Chinese no-tool nudge text
+  // P0-2: max consecutive tool-only turns (tool call with negligible reasoning
+  // text) before hard-terminating with "tool_only_loop". Local quantized models
+  // (Gemma/Qwen) get a tighter cap than cloud models.
+  int maxToolOnlyTurns = 2;
+  // P0-1: message-count threshold to trigger autocompact/collapse proactively.
+  // 0 = disabled (rely on token-estimate threshold only). Local quantized
+  // models with a real n_ctx far below the nominal 200K context window need a
+  // message-count trigger because the token estimate under-counts short CJK
+  // messages, leaving context to grow unbounded (observed 1->160 messages).
+  int compactMessageThreshold = 0;
+  // RPT-1: max chars of text-only output (no tool_use) in a single turn before
+  // hard-terminating with "oversized_planning_text". Logs show Gemma emitting
+  // 1432-event / 75s planning monologues with zero tool calls; nudges failed to
+  // break these 33% of the time. 0 = disabled.
+  int maxTextOnlyOutputChars = 0;
+  // RPT-2: session-wide cap on ForcedContinuation transitions. The per-cycle
+  // maxNoToolNudges budget resets each turn, so without a global ceiling the
+  // loop can ForceContinue 19+ times (observed). 0 = disabled.
+  int maxForcedContinuations = 0;
+};
+
+// Get the centralized policy for a given model string.
+inline ModelFamilyPolicy GetModelFamilyPolicy(const std::string& model) {
+  ModelFamilyPolicy p;
+  const ModelFamily fam = DetectModelFamily(model);
+  switch (fam) {
+    case ModelFamily::Qwen:
+      p.maxVerifyNudges = 3;
+      p.maxNoToolNudges = 15;
+      p.truncationTextThreshold = 1500;
+      p.truncationContinuationThreshold = 2;
+      p.defaultTemperature = 0.7;
+      p.maxOutputTokens = 16384;
+      p.preferChineseNudges = true;
+      p.maxToolOnlyTurns = 3;
+      p.compactMessageThreshold = 60;
+      p.maxTextOnlyOutputChars = 5000;
+      p.maxForcedContinuations = 10;
+      break;
+    case ModelFamily::Gemma:
+      p.maxVerifyNudges = 3;
+      p.maxNoToolNudges = 30;
+      p.truncationTextThreshold = 2000;
+      p.truncationContinuationThreshold = 3;
+      p.defaultTemperature = 0.6;
+      p.maxOutputTokens = 16384;
+      p.maxToolOnlyTurns = 4;
+      p.compactMessageThreshold = 80;
+      p.maxTextOnlyOutputChars = 6000;
+      p.maxForcedContinuations = 12;
+      break;
+    case ModelFamily::MiMo:
+      p.maxVerifyNudges = 2;
+      p.maxNoToolNudges = 10;
+      p.truncationTextThreshold = 1500;
+      p.truncationContinuationThreshold = 2;
+      p.defaultTemperature = 0.7;
+      p.maxOutputTokens = 16384;
+      p.maxToolOnlyTurns = 3;
+      p.compactMessageThreshold = 50;
+      p.maxTextOnlyOutputChars = 4000;
+      p.maxForcedContinuations = 8;
+      break;
+    case ModelFamily::Claude:
+    case ModelFamily::Generic:
+    default:
+      // Defaults already set in struct init
+      break;
+  }
+  return p;
+}
+
 enum class QueryStage {
   ToolResultBudget,
   Snip,

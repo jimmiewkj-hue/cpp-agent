@@ -514,6 +514,59 @@ bool AutoDreamEngine::RunPrunePhase() {
 }
 
 // =============================================================================
+// P1-3: RunDistillPhase — skeleton for pattern extraction from history
+// =============================================================================
+// Aligned with MiMo Code's Distill mechanism. This phase runs on a separate,
+// slower schedule (30 days / 50 sessions) and aims to extract reusable
+// patterns from accumulated session history. Currently a skeleton — the
+// actual pattern mining logic will be iterated in future sprints.
+//
+// The distill phase:
+//   1. Checks scheduling gate (30 days OR 50 sessions since last distill)
+//   2. Lists historical sessions since last distill
+//   3. Placeholder: logs the number of sessions to review
+//   4. Future: extract common patterns, anti-patterns, tool usage sequences
+bool AutoDreamEngine::RunDistillPhase() {
+  if (!state_.enabled) return true;  // skip silently when disabled
+
+  // Scheduling gate
+  long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+  long long daysSinceLast = (nowMs - state_.lastDistilledAtMs) /
+      (24LL * 60 * 60 * 1000);
+
+  bool timeGatePassed = (daysSinceLast >= config_.distillMinDays);
+
+  // P1-3: Compute session count since last distill for scheduling gate
+  std::vector<std::string> sessionsSinceDistill =
+      ListSessionsTouchedSince(state_.lastDistilledAtMs);
+  state_.sessionsSinceDistill = static_cast<int>(sessionsSinceDistill.size());
+  bool sessionGatePassed = (state_.sessionsSinceDistill >= config_.distillMinSessions);
+
+  if (!timeGatePassed && !sessionGatePassed) {
+    return true;  // not time yet, not a failure
+  }
+
+  if (sessionsSinceDistill.empty()) {
+    return true;  // nothing to distill
+  }
+
+  // SKELETON: Log what would be processed. Pattern mining is future work.
+  // In the future, this phase will:
+  //   - Read session transcripts from the listed sessions
+  //   - Identify recurring tool call patterns (e.g., Read→Edit→Bash cycles)
+  //   - Detect common failure modes and recovery sequences
+  //   - Extract reusable "recipes" that can be injected as system prompts
+  //   - Write distilled patterns to the MemoryIndex with origin="dream"
+  // sessionsSinceDistill contains the sessions to process
+
+  state_.lastDistilledAtMs = nowMs;
+  state_.sessionsSinceDistill = 0;
+
+  return true;
+}
+
+// =============================================================================
 // Execute (main entry point)
 // =============================================================================
 bool AutoDreamEngine::Execute() {
@@ -535,6 +588,10 @@ bool AutoDreamEngine::Execute() {
   }
   if (!RunPrunePhase()) { ReleaseLock(); return false; }
 
+  // P1-3: Distill phase — runs on a separate schedule from the regular
+  // dream cycle. Currently a skeleton; pattern mining to be iterated later.
+  RunDistillPhase();
+
   // P0-03: Release lock on success ? mtime stays at now (aligned with local-ace)
   ReleaseLock();
   return true;
@@ -542,3 +599,4 @@ bool AutoDreamEngine::Execute() {
 
 }  // namespace memory
 }  // namespace agent
+

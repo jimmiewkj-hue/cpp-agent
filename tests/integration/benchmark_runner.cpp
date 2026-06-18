@@ -202,6 +202,9 @@ struct EngineBundle {
     cfg.mainModel = mainModel;
     cfg.validatorModel = validatorModel;
     cfg.fallbackModel = fallbackModel;
+    char keyBuf[512] = {0};
+    DWORD keyLen = GetEnvironmentVariableA("CPP_AGENT_API_KEY", keyBuf, sizeof(keyBuf));
+    if (keyLen > 0 && keyLen < sizeof(keyBuf)) cfg.apiKey = std::string(keyBuf, keyLen);
     cfg.connectTimeoutMs = 30000;
     cfg.requestTimeoutMs = 180000;
     return cfg;

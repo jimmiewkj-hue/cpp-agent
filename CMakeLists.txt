@@ -73,6 +73,9 @@ add_library(agent_core
   src/core/StateTypes.cpp
   src/core/AppStateStore.cpp
   src/core/StreamingToolExecutor.cpp
+  src/core/ValidatorReport.cpp
+  src/core/WriterSubAgent.cpp
+  src/core/MaxMode.cpp
   src/hooks/HookConfig.cpp
   src/hooks/HookExecutor.cpp
   src/hooks/SsrfGuard.cpp

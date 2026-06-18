@@ -54,10 +54,16 @@ SessionMemory::SessionMemory(const std::string& sessionDir)
 }
 
 // ============================================================================
-// FilePath
+// FilePath — P2-1: now returns .md extension (was .json).
+// Old JSON files are auto-migrated on Load().
 // ============================================================================
 std::string SessionMemory::FilePath() const {
-  return sessionDir_ + "\\session-memory.json";
+  return sessionDir_ + "\\session-memory.md";
+}
+
+// Legacy JSON path for backward-compatible migration.
+static std::string LegacyJsonPath(const std::string& sessionDir) {
+  return sessionDir + "\\session-memory.json";
 }
 
 // ============================================================================
@@ -270,17 +276,28 @@ void SessionMemory::Consolidate() {
 }
 
 // ============================================================================
-// Load / Save (JSON persistence)
+// Load / Save (P2-1: Markdown persistence with JSON backward compatibility)
 // ============================================================================
 bool SessionMemory::Load() {
   std::lock_guard<std::mutex> lock(mutex_);
-  std::string path = FilePath();
 
-  std::ifstream in(path, std::ios::binary);
-  if (!in) return false;
+  // 1. Try loading new Markdown format first
+  std::string mdPath = FilePath();
+  std::ifstream mdIn(mdPath, std::ios::binary);
+  if (mdIn) {
+    std::string content((std::istreambuf_iterator<char>(mdIn)),
+                        std::istreambuf_iterator<char>());
+    mdIn.close();
+    if (ParseMarkdown(content)) return true;
+  }
+
+  // 2. Fallback: try loading legacy JSON format
+  std::string jsonPath = LegacyJsonPath(sessionDir_);
+  std::ifstream jsonIn(jsonPath, std::ios::binary);
+  if (!jsonIn) return false;
 
   try {
-    json j = json::parse(in);
+    json j = json::parse(jsonIn);
     entries_.clear();
 
     if (j.contains("entries") && j["entries"].is_array()) {
@@ -302,6 +319,11 @@ bool SessionMemory::Load() {
       nextId_ = j["next_id"].get<long long>();
     }
 
+    // Auto-migrate: save as Markdown and remove legacy JSON
+    jsonIn.close();
+    SaveMarkdown();
+    // Best-effort removal of legacy file
+    std::remove(jsonPath.c_str());
     return true;
   } catch (...) {
     entries_.clear();
@@ -309,30 +331,145 @@ bool SessionMemory::Load() {
   }
 }
 
-bool SessionMemory::Save() const {
-  std::string path = FilePath();
-
-  json j;
-  j["next_id"] = nextId_;
-  j["entries"] = json::array();
-
-  for (const auto& entry : entries_) {
-    json je;
-    je["id"] = entry.id;
-    je["content"] = entry.content;
-    je["type"] = entry.type;
-    je["scope"] = entry.scope;
-    je["priority"] = entry.priority;
-    je["created_at_ms"] = entry.createdAtMs;
-    je["updated_at_ms"] = entry.updatedAtMs;
-    je["active"] = entry.active;
-    j["entries"].push_back(je);
+// Parse Markdown format back into entries_.
+bool SessionMemory::ParseMarkdown(const std::string& content) {
+  entries_.clear();
+  // Extract next_id from HTML comment
+  auto nextIdPos = content.find("<!-- next_id:");
+  if (nextIdPos != std::string::npos) {
+    auto valStart = nextIdPos + 13;  // length of "<!-- next_id:"
+    auto valEnd = content.find("-->", valStart);
+    if (valEnd != std::string::npos) {
+      std::string valStr = content.substr(valStart, valEnd - valStart);
+      // Trim whitespace
+      while (!valStr.empty() && valStr.front() == ' ') valStr.erase(valStr.begin());
+      while (!valStr.empty() && valStr.back() == ' ') valStr.pop_back();
+      nextId_ = std::stoll(valStr);
+    }
   }
 
+  // Parse each ## Memory: section
+  std::istringstream stream(content);
+  std::string line;
+  SessionMemoryEntry* current = nullptr;
+  bool inContent = false;
+  std::string contentBuf;
+
+  while (std::getline(stream, line)) {
+    if (line.substr(0, 11) == "## Memory: ") {
+      // Save previous entry's content
+      if (current && inContent) {
+        while (!contentBuf.empty() && contentBuf.back() == '\n')
+          contentBuf.pop_back();
+        current->content = contentBuf;
+      }
+      entries_.push_back(SessionMemoryEntry());
+      current = &entries_.back();
+      current->id = line.substr(11);
+      // Trim whitespace from id
+      while (!current->id.empty() && current->id.back() == '\r')
+        current->id.pop_back();
+      inContent = false;
+      contentBuf.clear();
+    } else if (current && !inContent) {
+      // Parse metadata lines
+      if (line.substr(0, 9) == "- **Type*") {
+        auto pos = line.find("**: ");
+        if (pos != std::string::npos) current->type = line.substr(pos + 4);
+      } else if (line.substr(0, 10) == "- **Scope*") {
+        auto pos = line.find("**: ");
+        if (pos != std::string::npos) current->scope = line.substr(pos + 4);
+      } else if (line.substr(0, 12) == "- **Priority") {
+        auto pos = line.find("**: ");
+        if (pos != std::string::npos) {
+          try { current->priority = std::stoi(line.substr(pos + 4)); } catch (...) {}
+        }
+      } else if (line.substr(0, 12) == "- **Created*") {
+        auto pos = line.find("**: ");
+        if (pos != std::string::npos) {
+          try { current->createdAtMs = std::stoll(line.substr(pos + 4)); } catch (...) {}
+        }
+      } else if (line.substr(0, 12) == "- **Updated*") {
+        auto pos = line.find("**: ");
+        if (pos != std::string::npos) {
+          try { current->updatedAtMs = std::stoll(line.substr(pos + 4)); } catch (...) {}
+        }
+      } else if (line.substr(0, 11) == "- **Active*") {
+        auto pos = line.find("**: ");
+        if (pos != std::string::npos) {
+          current->active = (line.substr(pos + 4) == "true");
+        }
+      // P2-2: Parse provenance fields
+      } else if (line.substr(0, 11) == "- **Source*") {
+        auto pos = line.find("**: ");
+        if (pos != std::string::npos) current->sourceSession = line.substr(pos + 4);
+      } else if (line.substr(0, 10) == "- **Turn**") {
+        auto pos = line.find("**: ");
+        if (pos != std::string::npos) {
+          try { current->sourceTurn = std::stoi(line.substr(pos + 4)); } catch (...) {}
+        }
+      } else if (line.substr(0, 12) == "- **Origin**") {
+        auto pos = line.find("**: ");
+        if (pos != std::string::npos) current->origin = line.substr(pos + 4);
+      } else if (line.empty() && !current->type.empty()) {
+        // Blank line after metadata = start of content
+        inContent = true;
+        contentBuf.clear();
+      }
+    } else if (current && inContent) {
+      contentBuf += line + "\n";
+    }
+  }
+  // Save last entry's content
+  if (current && inContent) {
+    while (!contentBuf.empty() && contentBuf.back() == '\n')
+      contentBuf.pop_back();
+    current->content = contentBuf;
+  }
+
+  // Remove entries with empty IDs (parsing errors)
+  entries_.erase(
+      std::remove_if(entries_.begin(), entries_.end(),
+          [](const SessionMemoryEntry& e) { return e.id.empty(); }),
+      entries_.end());
+
+  return true;
+}
+
+// Write entries_ as Markdown.
+bool SessionMemory::SaveMarkdown() const {
+  std::string path = FilePath();
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   if (!out) return false;
-  out << j.dump(2, ' ', false, json::error_handler_t::replace);
+
+  out << "# Session Memory\n\n";
+  out << "<!-- next_id: " << nextId_ << " -->\n\n";
+
+  for (const auto& entry : entries_) {
+    out << "## Memory: " << entry.id << "\n";
+    out << "- **Type**: " << entry.type << "\n";
+    out << "- **Scope**: " << entry.scope << "\n";
+    out << "- **Priority**: " << entry.priority << "\n";
+    out << "- **Created**: " << entry.createdAtMs << "\n";
+    out << "- **Updated**: " << entry.updatedAtMs << "\n";
+    out << "- **Active**: " << (entry.active ? "true" : "false") << "\n";
+    // P2-2: Write provenance fields
+    if (!entry.sourceSession.empty())
+      out << "- **Source**: " << entry.sourceSession << "\n";
+    if (entry.sourceTurn >= 0)
+      out << "- **Turn**: " << entry.sourceTurn << "\n";
+    if (!entry.origin.empty())
+      out << "- **Origin**: " << entry.origin << "\n";
+    out << "\n";
+    out << entry.content << "\n\n";
+  }
+
   return out.good();
+}
+
+bool SessionMemory::Save() const {
+  // P2-1: Save in Markdown format
+  return SaveMarkdown();
 }
 
 }  // namespace memory
