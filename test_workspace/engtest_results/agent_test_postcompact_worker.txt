@@ -1,0 +1,2 @@
+=== PostCompactCleanup + SubAgentWorkerProtocol Tests ===
+Failures: 0

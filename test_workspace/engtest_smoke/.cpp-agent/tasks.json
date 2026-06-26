@@ -1,0 +1,14 @@
+[
+  {
+    "acceptance_criteria": "File anchor_probe.py exists with content print('ANCHOR')",
+    "activeForm": "creating anchor_probe.py",
+    "content": "Create anchor_probe.py with print('ANCHOR')",
+    "status": "pending"
+  },
+  {
+    "acceptance_criteria": "Running python anchor_probe.py outputs 'ANCHOR'",
+    "activeForm": "verifying anchor_probe.py",
+    "content": "Verify anchor_probe.py output",
+    "status": "pending"
+  }
+]

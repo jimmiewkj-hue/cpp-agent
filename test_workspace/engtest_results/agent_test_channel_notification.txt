@@ -1,0 +1,12 @@
+=== Channel Notification Tests ===
+  disabled_by_default... PASSED
+  enabled_with_channels... PASSED
+  send_permission_request... PASSED
+  send_disabled_returns_empty... PASSED
+  handle_incoming_response... PASSED
+  handle_unknown_response... PASSED
+  cancel_all_pending... PASSED
+  unsubscribe_cleans_up... PASSED
+  send_elicitation_request... PASSED
+
+All channel notification tests PASSED

@@ -5,6 +5,7 @@
 #include "agents/SubAgentManager.h"
 #include "core/QueryLoop.h"
 #include "hooks/HookExecutor.h"
+#include "infra/Logger.h"
 #include "infra/SessionManager.h"
 #include "infra/StabilityWatchdog.h"
 #include "memory/MemoryIndex.h"
@@ -194,7 +195,26 @@ bool QueryEngine::RunTurnWithRecovery() {
     SaveCheckpoint();
     RunTurn();
     return true;
-  } catch (const std::exception&) {
+  } catch (const std::exception& e) {
+    // R4: Previously this catch block silently swallowed ALL exceptions — no
+    // logging, no terminalReason, just return false. This made tool-execution
+    // crashes invisible: graph3 showed sessions ending right after
+    // "textEvents=0 toolEvents=1" with no Execute-tools log and no terminal
+    // reason, because the exception was eaten here. Log the exception message
+    // so failures are diagnosable.
+    LOG_ERROR(QUERY, "RunTurn threw exception (recovery catch)",
+              {{"what", std::string(e.what())},
+               {"messageCount", std::to_string(messages_.size())}});
+    if (stabilityWatchdog_) {
+      stabilityWatchdog_->SignalTurnComplete(false);
+    }
+    sessionManager_.PersistSnapshot();
+    return false;
+  } catch (...) {
+    // R4: Catch non-std exceptions too (e.g. from C libraries / SEH) so they
+    // don't terminate the process silently.
+    LOG_ERROR(QUERY, "RunTurn threw non-std exception (recovery catch)",
+              {{"messageCount", std::to_string(messages_.size())}});
     if (stabilityWatchdog_) {
       stabilityWatchdog_->SignalTurnComplete(false);
     }

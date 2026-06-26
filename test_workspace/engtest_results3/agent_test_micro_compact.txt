@@ -1,0 +1,13 @@
+=== Micro Compact Tests ===
+  rough_token_count... PASSED
+  estimate_tokens_positive... PASSED
+  estimate_message_tokens_positive... PASSED
+  is_compactable_true... PASSED
+  is_compactable_false... PASSED
+  is_tool_result_true... PASSED
+  micro_compact_runs... PASSED
+  time_based_triggers_with_gap... PASSED
+  time_based_no_trigger_recent... PASSED
+  clear_results_runs... PASSED
+
+All micro compact tests PASSED

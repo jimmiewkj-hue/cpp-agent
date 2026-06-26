@@ -1,0 +1,1 @@
+Use the TodoWrite tool to create a todo list with exactly three items: "smoke-connectivity", "smoke-toolcall", "smoke-done". Then reply with the single word OK and stop.

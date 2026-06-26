@@ -56,6 +56,22 @@ class HookConfig {
   // Clear all hooks
   void Clear();
 
+  // ===== FIX-B: permission rules from settings.json =====
+  // Mirrors local-ace settings.permissions.{allow,deny,defaultMode}. Parsed
+  // alongside the "hooks" array in LoadFromJson so a single settings file can
+  // configure both hooks and the permission allow/deny lists that the
+  // PermissionEngine consults. Rule strings use the local-ace "Tool" or
+  // "Tool(content)" spelling (e.g. "Bash", "Bash(git:*)", "FileEdit").
+  const std::vector<std::string>& GetPermissionAllowRules() const {
+    return permissionAllowRules_;
+  }
+  const std::vector<std::string>& GetPermissionDenyRules() const {
+    return permissionDenyRules_;
+  }
+  const std::string& GetPermissionDefaultMode() const {
+    return permissionDefaultMode_;
+  }
+
   // Session-level hook registration (mirrors sessionHooks.ts)
   using SessionHookCallback = std::function<HookResult(
       const HookInput& input,
@@ -73,6 +89,10 @@ class HookConfig {
 
   std::vector<HookDefinition> hooks_;
   std::vector<std::pair<HookEventType, SessionHookCallback>> sessionHooks_;
+  // FIX-B: permission rules parsed from settings.json "permissions" section.
+  std::vector<std::string> permissionAllowRules_;
+  std::vector<std::string> permissionDenyRules_;
+  std::string permissionDefaultMode_;
   bool workspaceTrusted_ = false;
   bool globallyDisabled_ = false;
   bool simpleMode_ = false;

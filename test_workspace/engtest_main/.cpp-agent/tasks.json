@@ -1,0 +1,38 @@
+[
+  {
+    "acceptance_criteria": "Project structure defined and tasks listed",
+    "activeForm": "Planning the project structure",
+    "content": "Plan the project structure and features",
+    "status": "completed"
+  },
+  {
+    "acceptance_criteria": "task_manager_logic.py implemented with add, list, complete, delete, save, load functions",
+    "activeForm": "Implementing the task manager logic",
+    "content": "Implement core logic in task_manager_logic.py",
+    "status": "completed"
+  },
+  {
+    "acceptance_criteria": "task_manager_cli.py implemented and connects to task_manager_logic.py",
+    "activeForm": "Implementing the CLI interface",
+    "content": "Implement CLI in task_manager_cli.py",
+    "status": "completed"
+  },
+  {
+    "acceptance_criteria": "main.py implemented and starts the CLI",
+    "activeForm": "Implementing the entry point",
+    "content": "Implement main.py",
+    "status": "completed"
+  },
+  {
+    "acceptance_criteria": "test_task_manager.py implemented and covers core functionality",
+    "activeForm": "Writing tests for the manager",
+    "content": "Implement tests in test_task_manager.py",
+    "status": "completed"
+  },
+  {
+    "acceptance_criteria": "Explicitly state that verification is not possible due to tool restrictions",
+    "activeForm": "Reporting completion and limitations",
+    "content": "Verify the project (or state inability to run)",
+    "status": "completed"
+  }
+]

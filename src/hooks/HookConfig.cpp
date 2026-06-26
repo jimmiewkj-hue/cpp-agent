@@ -12,11 +12,37 @@ namespace hooks {
 bool HookConfig::LoadFromJson(const std::string& jsonStr) {
   try {
     auto root = json::parse(jsonStr);
-    if (!root.contains("hooks") || !root["hooks"].is_array()) {
-      return false;
+    // FIX-B: parse the local-ace "permissions" block alongside "hooks". A
+    // settings file may contain either or both; missing "hooks" is no longer
+    // fatal so a permissions-only settings.json still loads. The rules are
+    // forwarded to PermissionEngine by main.cpp.
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (root.contains("permissions") &&
+        root["permissions"].is_object()) {
+      const auto& perms = root["permissions"];
+      if (perms.contains("allow") && perms["allow"].is_array()) {
+        for (const auto& r : perms["allow"]) {
+          if (r.is_string()) permissionAllowRules_.push_back(r.get<std::string>());
+        }
+      }
+      if (perms.contains("deny") && perms["deny"].is_array()) {
+        for (const auto& r : perms["deny"]) {
+          if (r.is_string()) permissionDenyRules_.push_back(r.get<std::string>());
+        }
+      }
+      if (perms.contains("defaultMode") &&
+          perms["defaultMode"].is_string()) {
+        permissionDefaultMode_ = perms["defaultMode"].get<std::string>();
+      }
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (!root.contains("hooks") || !root["hooks"].is_array()) {
+      // No hooks section: still a successful load if permissions were parsed.
+      return !permissionAllowRules_.empty() ||
+             !permissionDenyRules_.empty() ||
+             !permissionDefaultMode_.empty();
+    }
+
     for (const auto& entry : root["hooks"]) {
       HookDefinition hook;
 

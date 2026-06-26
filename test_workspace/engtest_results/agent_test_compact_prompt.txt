@@ -1,0 +1,2 @@
+=== CompactPrompt Tests ===
+=== 0 failure(s) ===

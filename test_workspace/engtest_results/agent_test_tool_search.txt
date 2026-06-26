@@ -1,0 +1,23 @@
+=== ToolSearch Tests ===
+[Relevance Scoring]
+  exact_name_match_gets_highest_score... PASSED
+  prefix_match_gets_high_score... PASSED
+  name_contains_query... PASSED
+  description_match_gets_score... PASSED
+  multi_word_query_scores_each_word... PASSED
+  case_insensitive_matching... PASSED
+  no_match_returns_zero... PASSED
+  single_char_word_skipped... PASSED
+[Formatting]
+  format_empty_results... PASSED
+  format_with_matches... PASSED
+  format_with_deferred_tools... PASSED
+[SelectDeferredTool]
+  select_deferred_tool_returns_false... PASSED
+[Real-World Scenarios]
+  real_world_ambiguous_tool_search... PASSED
+  real_world_bash_tool_search... PASSED
+  real_world_lsp_tool_search... PASSED
+  real_world_partial_name_match... PASSED
+
+All ToolSearch tests PASSED

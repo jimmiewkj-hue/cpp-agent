@@ -1,0 +1,17 @@
+=== Compact Engine Tests ===
+  build_post_compact_messages_order... PASSED
+  build_post_compact_empty... PASSED
+  annotate_boundary_empty_keep... PASSED
+  annotate_boundary_with_keep... PASSED
+  merge_hook_instructions_both... PASSED
+  merge_hook_instructions_user_only... PASSED
+  merge_hook_instructions_hook_only... PASSED
+  strip_images... PASSED
+  strip_reinjected_attachments... PASSED
+  truncate_head_for_ptl... PASSED
+  plan_attachment... PASSED
+  plan_attachment_empty... PASSED
+  skill_attachment... PASSED
+  error_messages... PASSED
+
+All compact engine tests PASSED

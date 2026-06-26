@@ -1,0 +1,2 @@
+=== AutoCompact Tests ===
+=== 0 failure(s) ===

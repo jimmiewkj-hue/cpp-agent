@@ -1,6 +1,8 @@
 #include "app/RuntimePolicy.h"
+#include "core/AgentTypes.h"
 #include "third_party/nlohmann_json.hpp"
 
+#include <algorithm>
 #include <sstream>
 
 namespace agent {
@@ -53,6 +55,15 @@ void RegisterSessionBaseTools(tools::ToolRegistry* registry,
 
 std::string BuildWorkspaceSystemPrompt(const std::string& workspaceRoot,
                                        bool workspaceTrusted) {
+  // Delegate to the model-aware overload with no model name — preserves the
+  // historical prompt for all existing callers (tests, runners).
+  return BuildWorkspaceSystemPrompt(workspaceRoot, workspaceTrusted,
+                                    std::string());
+}
+
+std::string BuildWorkspaceSystemPrompt(const std::string& workspaceRoot,
+                                       bool workspaceTrusted,
+                                       const std::string& modelName) {
   std::ostringstream prompt;
   prompt
       << "You are a helpful coding agent. Use the available tools to inspect "
@@ -162,6 +173,46 @@ std::string BuildWorkspaceSystemPrompt(const std::string& workspaceRoot,
         << "This runtime is on Windows and shell commands execute in "
         << "PowerShell.";
   }
+
+  // ============================================================
+  // FIX-E2 (weak-model support): model-family-aware prescriptive section.
+  // Weak local models (Gemma/Qwen/MiMo) benefit from longer, more imperative,
+  // more explicit constraints — mirroring MiMo-Code's per-model prompt files
+  // (session/prompt/{kimi,default}.txt). Claude/strong models keep the concise
+  // prompt above unchanged. Empty modelName → treated as strong (no extra
+  // section), preserving behavior for all pre-existing callers.
+  // ============================================================
+  const core::ModelFamily family = modelName.empty()
+      ? core::ModelFamily::Claude
+      : core::DetectModelFamily(modelName);
+  if (family == core::ModelFamily::Gemma ||
+      family == core::ModelFamily::Qwen ||
+      family == core::ModelFamily::MiMo ||
+      family == core::ModelFamily::Generic) {
+    prompt
+        << "\n\n# Strict Task Discipline (required for this model)\n"
+        << "You are running on a smaller model with limited instruction-following. "
+           "To compensate, follow these hard rules:\n"
+        << "1. STAY ON TASK. Re-read the user's original request every turn. "
+           "Create EXACTLY the files, names, and paths the task specifies. "
+           "Do not substitute a different project, module, or goal. If the task "
+           "says 'md2html', every file you create must be part of md2html — "
+           "never start a different project.\n"
+        << "2. ACT, DON'T NARRATE. Do not spend turns describing what you will "
+           "do. Call a tool (Write/Read/Bash/Grep/Glob/TodoWrite) on your very "
+           "next turn. Planning text without a tool call wastes your turn.\n"
+        << "3. ONE TASK AT A TIME. Use TodoWrite to lay out the steps, then do "
+           "them in order. Mark each completed only when verifiably done.\n"
+        << "4. NO RETRY OF DENIED ACTIONS. If a tool call is denied or errors, "
+           "do NOT call the same tool with the same arguments again. Either fix "
+           "the inputs, switch to a different approach, or report the blocker.\n"
+        << "5. VERIFY BEFORE CLAIMING DONE. Run the code/tests; report the real "
+           "output. Never claim success without running it. If you cannot run it "
+           "(tool blocked), say so explicitly instead of asserting it works.\n"
+        << "6. When you have finished the requested work, give a brief summary "
+           "of what you created and what you verified, then stop.\n";
+  }
+
   return prompt.str();
 }
 

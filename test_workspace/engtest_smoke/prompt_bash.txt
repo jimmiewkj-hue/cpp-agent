@@ -1,0 +1,1 @@
+Use the Bash tool to run this exact command: echo SMOKE_BASH_OK. Then report the command output and stop.

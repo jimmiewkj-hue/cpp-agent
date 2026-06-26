@@ -1,0 +1,31 @@
+You are an autonomous coding agent. Build a COMPLETE, RUNNABLE Python 3 project from scratch using ONLY these tools (the only ones available in this non-interactive session): FileWrite, FileRead, Grep, Glob, TodoWrite.
+
+IMPORTANT CONSTRAINT: The Bash, FileEdit, TaskCreate and NotebookEdit tools are NOT available in this session (any call to them will be denied with "requires confirmation"). Do NOT attempt to use them. Use FileWrite to create files and FileRead/Grep/Glob to inspect them. Plan the work with TodoWrite.
+
+TASK: Create a self-contained Python package `md2html` — a Markdown-to-HTML static site generator — inside the current workspace directory (create a subfolder named `md2html` containing all files). The project MUST be runnable with the system `python` (Python 3.8+) using ONLY the standard library (no third-party dependencies, no pip install needed).
+
+Required structure and behavior:
+1. `md2html/__init__.py` — package marker, exposes version "1.0.0".
+2. `md2html/parser.py` — a block + inline Markdown parser supporting: headings (#..######), paragraphs, unordered lists (- or *), ordered lists (1.), code fences (```), blockquotes (>), horizontal rules (---), bold (**text**), italic (*text* or _text_), inline code (`code`), and links ([text](url)). Pure stdlib, no markdown library.
+3. `md2html/renderer.py` — converts the parser AST to an HTML string, escaping raw HTML in inline code/code fences.
+4. `md2html/template.py` — a minimal HTML page template engine (title + body injection, reads an optional `md2html/template.html` if present, else uses a built-in default).
+5. `md2html/cli.py` — a CLI with argparse: `python -m md2html <input.md> [-o output.html] [--title T]`. Reads a .md file, writes the rendered HTML. If -o omitted, prints HTML to stdout.
+6. `md2html/__main__.py` — entry point so `python -m md2html ...` works.
+7. `md2html/tests/__init__.py`
+8. `md2html/tests/test_parser.py` — stdlib unittest tests covering each block type and at least 3 inline cases. Must pass with `python -m unittest md2html.tests.test_parser -v`.
+9. `md2html/sample.md` — a sample markdown file exercising every supported feature.
+10. `md2html/README.md` — usage instructions and feature list.
+11. `md2html/run_selfcheck.py` — a script at the package root (NOT inside the package) that imports the package, runs the unittest suite programmatically, converts `md2html/sample.md` to HTML, and prints exactly `SELF_CHECK_OK` on success or `SELF_CHECK_FAIL: <reason>` on failure. It must exit code 0 on success, non-zero on failure.
+
+WORK METHOD:
+- First call TodoWrite with a concrete plan (one todo per file + a final verify todo).
+- Create each file with FileWrite. Keep each file correct and complete.
+- After creating all files, use FileRead to re-read at least parser.py and cli.py to confirm they are well-formed, then call TodoWrite to mark the verify todo in_progress, then completed.
+- Do NOT use Bash. Do NOT use FileEdit. Do NOT call any unavailable tool.
+
+A reviewer will run, in this exact order, to judge whether your system is complete and runnable:
+  python -m unittest md2html.tests.test_parser -v
+  python md2html/run_selfcheck.py
+  python -m md2html md2html/sample.md -o sample_out.html
+
+All three must succeed with exit code 0, and run_selfcheck.py must print SELF_CHECK_OK. Begin now.

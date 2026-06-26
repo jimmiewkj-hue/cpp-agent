@@ -1,0 +1,26 @@
+[
+  {
+    "acceptance_criteria": "task.py is created with a Task class containing id, title, description, and completed status.",
+    "activeForm": "Defining the project structure and creating the Task data model",
+    "content": "Create task.py",
+    "status": "pending"
+  },
+  {
+    "acceptance_criteria": "task_store.py is created with functions to save and load tasks from a JSON file.",
+    "activeForm": "Implementing the persistence layer for tasks",
+    "content": "Create task_store.py",
+    "status": "pending"
+  },
+  {
+    "acceptance_criteria": "main.py is created with a menu-driven interface to add, list, mark complete, and delete tasks.",
+    "activeForm": "Developing the main CLI entry point",
+    "content": "Create main.py",
+    "status": "pending"
+  },
+  {
+    "acceptance_criteria": "Glob confirms all 3 files exist; Read confirms their content is syntactically correct.",
+    "activeForm": "Verifying the project structure and content",
+    "content": "Verify project files",
+    "status": "pending"
+  }
+]

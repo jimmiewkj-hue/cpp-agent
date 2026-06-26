@@ -146,7 +146,18 @@ core::PermissionDecision PermissionEngine::Evaluate(
     return pending;
   };
 
-  // Step 0: mode-based shortcuts
+  // Step 0: mode-based shortcuts.
+  // SECURITY: deny rules are evaluated BEFORE bypass (aligned with local-ace
+  // permissions.ts:1252-1260 "bypass-immune" semantics). An explicit deny rule
+  // or deny-pattern must override bypass mode so a workspace cannot grant
+  // itself arbitrary command execution via CPP_AGENT_PERMISSION_MODE=bypass.
+  // Plan mode short-circuits to Allow because plan mode never actually
+  // executes tools (the orchestrator treats plan as a dry run).
+  if (MatchesAny(toolUse.asToolUse.name, denyRules_) ||
+      MatchesAny(toolUse, denyRules_)) {
+    denialState_.RecordDenial();
+    return {core::PermissionBehavior::Deny, "matched deny rule"};
+  }
   if (permissionMode_ == core::PermissionMode::BypassPermissions) {
     return {core::PermissionBehavior::Allow, "bypass permissions mode"};
   }
@@ -154,28 +165,21 @@ core::PermissionDecision PermissionEngine::Evaluate(
     return {core::PermissionBehavior::Allow, "plan mode — tools not actually executed"};
   }
 
-  // Step 1: always deny rules
-  if (MatchesAny(toolUse.asToolUse.name, denyRules_) ||
-      MatchesAny(toolUse, denyRules_)) {
-    denialState_.RecordDenial();
-    return {core::PermissionBehavior::Deny, "matched deny rule"};
-  }
-
-  // Step 2: always allow rules
+  // Step 1: always allow rules
   if (MatchesAny(toolUse.asToolUse.name, allowRules_) ||
       MatchesAny(toolUse, allowRules_)) {
     denialState_.RecordApproval();
     return {core::PermissionBehavior::Allow, "matched allow rule"};
   }
 
-  // Step 3: safe allowlist — skip classifier
+  // Step 2: safe allowlist — skip classifier
   if (MatchesAny(toolUse.asToolUse.name, autoModeAllowlistedTools_) ||
       MatchesAny(toolUse, autoModeAllowlistedTools_)) {
     denialState_.RecordApproval();
     return {core::PermissionBehavior::Allow, "in auto-mode safe allowlist"};
   }
 
-  // Step 4: circuit breaker
+  // Step 3: circuit breaker
   if (denialState_.IsCircuitBroken()) {
     return resolveAsk(
         "circuit broken — maxConsecutive=" +
@@ -185,7 +189,7 @@ core::PermissionDecision PermissionEngine::Evaluate(
         " — manual confirmation required");
   }
 
-  // Step 5: classifier callback (auto-mode YOLO classifier)
+  // Step 4: classifier callback (auto-mode YOLO classifier)
   if (classifierCallback_) {
     try {
       core::PermissionDecision decision =

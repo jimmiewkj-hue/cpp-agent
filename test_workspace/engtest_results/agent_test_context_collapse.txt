@@ -1,0 +1,13 @@
+=== Context Collapse Tests ===
+  should_collapse_when_over_limit... PASSED
+  should_not_collapse_under_limit... PASSED
+  collapse_preserves_recent... PASSED
+  collapse_no_collapse_needed... PASSED
+  make_collapse_boundary... PASSED
+  message_grouper_basic... PASSED
+  message_grouper_complete_tool_chain... PASSED
+  post_compact_cleanup_empty... PASSED
+  post_compact_cleanup_duplicates... PASSED
+  merge_compactable_groups... PASSED
+
+All context collapse tests PASSED

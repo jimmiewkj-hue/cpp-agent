@@ -1,0 +1,13 @@
+=== Extract Memories + MemDir Tests ===
+  extract_user_preference... PASSED
+  extract_project_context... PASSED
+  extract_feedback... PASSED
+  extract_reference... PASSED
+  ignore_short_text... PASSED
+  priority_scoring... PASSED
+  extract_multiple_from_text... PASSED
+  max_memories_per_pass... PASSED
+  memdir_resolve_paths... PASSED
+  memdir_get_session_memory_path... PASSED
+
+All extract memories + memdir tests PASSED

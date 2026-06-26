@@ -1,0 +1,2 @@
+=== CompactWarningState Tests ===
+=== 0 failure(s) ===

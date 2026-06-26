@@ -1402,9 +1402,50 @@ bool QueryLoop::HandleExcessiveExploration(
 
   ++state.consecutiveExplorationOnlyTurns;
 
+  // FIX-D: tighten the exploration-only ceiling when execution tools are
+  // permission-blocked. If Bash/FileEdit are denied, an exploration-only loop
+  // can never progress to action, so the default 12-turn ceiling just burns
+  // ~3.5 min on Gemma. Drop to the doom-loop threshold (default 3, env-tunable
+  // via CPP_AGENT_DOOM_LOOP_THRESHOLD, mirroring MiMo-Code) and skip the nudge
+  // (which would demand "run a verification command" — impossible here).
   static const int kMaxExplorationOnlyTurns = 12;
-  if (state.consecutiveExplorationOnlyTurns < kMaxExplorationOnlyTurns) {
+  static const int kDoomLoopThreshold = [] {
+    const char* env = std::getenv("CPP_AGENT_DOOM_LOOP_THRESHOLD");
+    if (env && *env) {
+      int v = std::atoi(env);
+      if (v >= 1) return v;
+    }
+    return 3;  // MiMo-Code DOOM_LOOP_THRESHOLD default
+  }();
+  const int effectiveMax = (state.totalPermissionDeniedCount > 0)
+                               ? kDoomLoopThreshold
+                               : kMaxExplorationOnlyTurns;
+  const bool execBlocked = state.totalPermissionDeniedCount > 0;
+  if (state.consecutiveExplorationOnlyTurns < effectiveMax) {
     return false;
+  }
+  // When exec tools are blocked, skip the action nudge (it demands Bash/Write
+  // which are denied) and hard-terminate immediately.
+  if (execBlocked) {
+    Message terminationMsg;
+    terminationMsg.role = MessageRole::System;
+    terminationMsg.uuid = "exploration-blocked-terminate";
+    terminationMsg.isMeta = true;
+    terminationMsg.content.push_back(ContentBlock::MakeText(
+        "[system] Terminating: " +
+        std::to_string(state.consecutiveExplorationOnlyTurns) +
+        " consecutive exploration-only turns while execution tools "
+        "(Bash/FileEdit) are blocked by the permission gate. The agent "
+        "cannot make progress without execution capability. Set "
+        "CPP_AGENT_PERMISSION_MODE=bypass or run interactively to approve "
+        "commands."));
+    ctx.messages.push_back(terminationMsg);
+    if (ctx.sessionManager) {
+      ctx.sessionManager->AppendMessageToTranscript(terminationMsg);
+    }
+    state.completed = true;
+    state.terminalReason = "excessive_exploration_blocked";
+    return true;
   }
 
   static const int kMaxExplorationActionNudges = 1;
@@ -1546,10 +1587,168 @@ bool QueryLoop::ShouldTerminateOnDuplicates(
   return false;
 }
 
+// FIX-E4 (weak-model support): normalize assistant text for loop detection.
+// Strips case, whitespace, and common filler leads ("let me", "i'll", "let's",
+// "now", "ok", "so") that weak models prefix differently each turn while
+// repeating the same substance. Mirrors MiMo-Code normalizeForLoopDetection.
+std::string NormalizeAssistantTextForLoop(const std::string& raw) {
+  std::string s;
+  s.reserve(raw.size());
+  for (char c : raw) {
+    if (c >= 'A' && c <= 'Z') s += static_cast<char>(c - 'A' + 'a');
+    else if (std::isspace(static_cast<unsigned char>(c))) continue;
+    else s += c;
+  }
+  // Strip common filler prefixes repeatedly.
+  const std::vector<std::string> fillers = {
+      "letme", "i'll", "ill", "lets", "let's", "now", "ok", "so", "well",
+      "actually", "hmm", "alright"};
+  bool changed = true;
+  int guard = 0;
+  while (changed && guard++ < 8) {
+    changed = false;
+    for (const auto& f : fillers) {
+      if (s.size() >= f.size() && s.compare(0, f.size(), f) == 0) {
+        s.erase(0, f.size());
+        changed = true;
+      }
+    }
+  }
+  // Truncate to a signature window — only the substance matters.
+  if (s.size() > 200) s = s.substr(0, 200);
+  return s;
+}
+
+bool QueryLoop::HandleTextLoop(QueryLoopContext& ctx,
+                               QueryLoopInternalState& state) {
+  // Only consider turns that produced assistant text.
+  std::string text = CollectText(state.assistantMessages);
+  if (text.empty()) return false;
+  std::string fp = NormalizeAssistantTextForLoop(text);
+  if (fp.size() < 30) {
+    // Too short to be a meaningful repetition signature; don't fingerprint.
+    return false;
+  }
+  state.recentAssistantTextFingerprints.push_back(fp);
+  if (state.recentAssistantTextFingerprints.size() > 5)
+    state.recentAssistantTextFingerprints.erase(
+        state.recentAssistantTextFingerprints.begin());
+
+  static const int kTriggerCount = 3;      // MiMo-Code TEXT_LOOP_TRIGGER_COUNT
+  static const int kMaxRecovery = 2;       // mild + strong, then terminate
+  if (state.recentAssistantTextFingerprints.size() < kTriggerCount) return false;
+  // Check last N are all identical.
+  const auto& buf = state.recentAssistantTextFingerprints;
+  size_t n = buf.size();
+  bool allSame = true;
+  for (size_t i = n - kTriggerCount + 1; i < n; ++i) {
+    if (buf[i] != buf[n - kTriggerCount]) { allSame = false; break; }
+  }
+  if (!allSame) return false;
+
+  ++state.textLoopRecoveryAttempts;
+  if (state.textLoopRecoveryAttempts > kMaxRecovery) {
+    // Hard terminate: the model is degenerate-looping and recovery failed.
+    Message terminationMsg;
+    terminationMsg.role = MessageRole::System;
+    terminationMsg.uuid = "text-loop-terminate";
+    terminationMsg.isMeta = true;
+    terminationMsg.content.push_back(ContentBlock::MakeText(
+        "[system] Terminating: assistant text has repeated identically across "
+        + std::to_string(kTriggerCount) + "+ turns after "
+        + std::to_string(kMaxRecovery) + " recovery attempts. The model "
+        "appears stuck in a degenerate text loop."));
+    ctx.messages.push_back(terminationMsg);
+    if (ctx.sessionManager)
+      ctx.sessionManager->AppendMessageToTranscript(terminationMsg);
+    state.completed = true;
+    state.terminalReason = "text_loop";
+    ReportQueryLoopDebugEvent(
+        "2", "QueryLoop.cpp:text-loop:terminate",
+        "[WARN] Terminating: degenerate text loop", {},
+        MakeQueryLoopTraceId("text-loop"));
+    return false;
+  }
+
+  // Inject an escalating recovery nudge.
+  Message nudge;
+  nudge.role = MessageRole::User;
+  nudge.uuid = "text-loop-recovery-" + std::to_string(state.textLoopRecoveryAttempts);
+  nudge.isMeta = true;
+  if (state.textLoopRecoveryAttempts == 1) {
+    nudge.content.push_back(ContentBlock::MakeText(
+        "[system] LOOP DETECTED: your last few responses are nearly identical. "
+        "You are repeating yourself without progress. Take a DIFFERENT approach "
+        "now: call a tool you have not tried, or state a concrete next action. "
+        "Do not repeat your previous response."));
+  } else {
+    nudge.content.push_back(ContentBlock::MakeText(
+        "[system] CRITICAL: you are STILL repeating the same output. Abandon "
+        "your current approach entirely. Either (1) take a concrete tool action "
+        "different from your recent ones, or (2) if you are genuinely blocked, "
+        "state the blocker and stop. If you repeat the same output again the "
+        "session will be terminated."));
+  }
+  ctx.messages.push_back(nudge);
+  if (ctx.sessionManager) ctx.sessionManager->AppendMessageToTranscript(nudge);
+  // Clear the current turn's assistant output so the next ModelCall starts
+  // fresh with the recovery nudge in context (mirrors HandleExcessiveExploration).
+  state.assistantMessages.clear();
+  state.toolResultMessages.clear();
+  state.pendingFollowupMessages.clear();
+  state.toolUseBlocks.clear();
+  state.forceContinuation = true;
+  state.forceContinuationReason = "text_loop_recovery";
+  state.stage = QueryStage::ToolResultBudget;
+  state.transition = TransitionReason::ForcedContinuation;
+  ReportQueryLoopDebugEvent(
+      "3", "QueryLoop.cpp:text-loop:recovery",
+      "[DEBUG] Text-loop recovery nudge injected",
+      {{"attempt", state.textLoopRecoveryAttempts}},
+      MakeQueryLoopTraceId("text-loop"));
+  return true;
+}
+
 std::vector<Message> QueryLoop::BuildMessagesForTurn(
     const QueryLoopContext& ctx,
-    const QueryLoopInternalState& state) const {
+    QueryLoopInternalState& state) const {
   std::vector<Message> messages = ctx.messages;
+  // FIX-E1 (weak-model support): task anchor. Capture the user's original goal
+  // once (first non-meta user message) and re-inject it at the front of every
+  // turn so weak models stay on-task instead of drifting to a different
+  // project/goal. Mirrors MiMo-Code's goal gate + local-ace plan reminders.
+  // Gated by env (default on) so it can be disabled for cases where the
+  // repeated injection is unwanted.
+  if (!infra::GetEnvBool("CPP_AGENT_DISABLE_TASK_ANCHOR", false)) {
+    if (!state.taskAnchorCaptured) {
+      state.taskAnchorCaptured = true;
+      for (const auto& m : ctx.messages) {
+        if (m.role != MessageRole::User || m.isMeta) continue;
+        for (const auto& b : m.content) {
+          if (b.type == BlockType::Text && !b.asText.text.empty()) {
+            std::string goal = b.asText.text;
+            if (goal.size() > 1500) goal = goal.substr(0, 1500);
+            state.cachedTaskAnchor = goal;
+            break;
+          }
+        }
+        if (!state.cachedTaskAnchor.empty()) break;
+      }
+    }
+    if (!state.cachedTaskAnchor.empty()) {
+      Message anchor;
+      anchor.role = MessageRole::System;
+      anchor.uuid = "task-anchor";
+      anchor.isMeta = true;
+      anchor.content.push_back(ContentBlock::MakeText(
+          "[Task Anchor — your single task for this session]\n"
+          + state.cachedTaskAnchor +
+          "\nStay focused on THIS task. Create exactly the files, names, and "
+          "paths it specifies. Do not substitute a different project or goal. "
+          "Every tool call you make must advance THIS task."));
+      messages.insert(messages.begin(), anchor);
+    }
+  }
   const std::string executionMemory = BuildRecentExecutionMemory(ctx, state);
   if (!executionMemory.empty()) {
     Message memory;
@@ -2796,12 +2995,44 @@ bool QueryLoop::ApplyStepAutocompact(QueryLoopContext& ctx,
       static_cast<int>(state.messagesForTurn.size()) >=
           compactPolicy.compactMessageThreshold;
   if (estimatedTokens <= threshold && !messageCountTriggered) return false;
-  if (state.consecutiveAutoCompactFailures >= kAutoCompactMaxFailures)
-    return false;
   const int beforeCount = static_cast<int>(state.messagesForTurn.size());
+  // R3-1: When the LLM summarizer has failed repeatedly, do NOT permanently
+  // disable compaction — that leaves context to grow unbounded (observed 193
+  // messages on Gemma after 3 summary failures). Instead, skip the LLM summary
+  // and fall through to deterministic truncation (DoCollapseCompact) below.
+  const bool skipLlmSummary =
+      state.consecutiveAutoCompactFailures >= kAutoCompactMaxFailures;
+  if (skipLlmSummary) {
+    ReportQueryLoopDebugEvent(
+        "3", "QueryLoop.cpp:autocompact:llm-summary-disabled",
+        "[DEBUG] LLM summary disabled after repeated failures; using deterministic truncation",
+        {{"consecutiveAutoCompactFailures",
+          state.consecutiveAutoCompactFailures},
+         {"messageCount", beforeCount}},
+        MakeQueryLoopTraceId("autocompact-det"));
+  }
   if (ctx.hookExecutor != nullptr) {
     ctx.hookExecutor->RunPreCompactHooks(
         "autocompact", beforeCount, 15000);
+  }
+
+  // R3-2: Emit a StageChanged event before the (potentially long) LLM summary
+  // call so the TUI does not go silent for 90-144s. The GenerateResponse side
+  // call emits no QueryLoopEvents of its own, leaving the user unsure whether
+  // the agent is working or hung.
+  if (ctx.eventCallback && !skipLlmSummary) {
+    QueryLoopEvent stageEvent;
+    stageEvent.type = QueryLoopEvent::Type::StageChanged;
+    stageEvent.stage = QueryStage::Autocompact;
+    Message stageMsg;
+    stageMsg.role = MessageRole::System;
+    stageMsg.uuid = "autocompact-status";
+    stageMsg.isMeta = true;
+    stageMsg.content.push_back(ContentBlock::MakeText(
+        "Compacting context (" + std::to_string(beforeCount) +
+        " messages)..."));
+    stageEvent.message = stageMsg;
+    ctx.eventCallback(stageEvent);
   }
 
   // Aligned with local-ace compactConversation: send the full message history
@@ -2809,15 +3040,44 @@ bool QueryLoop::ApplyStepAutocompact(QueryLoopContext& ctx,
   // the last message was sent, which produced a useless summary.
   std::vector<Message> compactInput = state.messagesForTurn;
 
-  std::vector<Message> summaryResponse =
-      modelClient_.GenerateResponse(compactInput,
-          "Summarize this conversation concisely as a bulleted list. "
-          "Focus on key decisions, files modified, unresolved issues. "
-          "Under 500 words.", ctx.model);
+  std::vector<Message> summaryResponse;
+  if (!skipLlmSummary) {
+    summaryResponse =
+        modelClient_.GenerateResponse(compactInput,
+            "Summarize this conversation concisely as a bulleted list. "
+            "Focus on key decisions, files modified, unresolved issues. "
+            "Under 500 words.", ctx.model);
+  }
 
   if (summaryResponse.empty()) {
+    // R3-1: LLM summary failed (or skipped). Fall back to deterministic
+    // truncation instead of giving up. DoCollapseCompact keeps the first user
+    // message + a boundary marker + the recent half of the conversation — no
+    // LLM call, instant, always succeeds. This guarantees context is bounded
+    // even when the summarizer model is too slow/broken (Gemma on 193 msgs).
     ++state.consecutiveAutoCompactFailures;
-    return false;
+    ReportQueryLoopDebugEvent(
+        "3", "QueryLoop.cpp:autocompact:fallback-truncate",
+        "[DEBUG] LLM summary empty/failed; falling back to deterministic truncation",
+        {{"consecutiveAutoCompactFailures",
+          state.consecutiveAutoCompactFailures},
+         {"beforeCount", beforeCount}},
+        MakeQueryLoopTraceId("autocompact-fallback"));
+    // keepRecent = half the conversation, preserving the original user message.
+    const int keepRecent = std::max(5, beforeCount / 2);
+    state.messagesForTurn =
+        DoCollapseCompact(state.messagesForTurn, keepRecent);
+    if (ctx.hookExecutor != nullptr) {
+      ctx.hookExecutor->RunPostCompactHooks(
+          beforeCount,
+          static_cast<int>(state.messagesForTurn.size()),
+          std::max(0, estimatedTokens - EstimateMessageTokens(state.messagesForTurn)),
+          15000);
+    }
+    ctx.autoCompactTracking.compacted = true;
+    ctx.autoCompactTracking.turnCounter = 0;
+    ctx.autoCompactTracking.consecutiveFailures = 0;
+    return true;
   }
 
   std::string summaryText = "Auto-compact summary (exceeded " +
@@ -2848,14 +3108,47 @@ bool QueryLoop::ApplyStepAutocompact(QueryLoopContext& ctx,
   if (firstUserIdx >= 0 && static_cast<size_t>(firstUserIdx) >= keepCount) {
     keepCount = static_cast<size_t>(firstUserIdx) + 1;
   }
+
+  // R5 (CRITICAL): Truncation compaction, not insertion. The previous code
+  // inserted the summary into the middle but KEPT every original message:
+  //   for (i in [0, keepCount)) push; push(summary); for (i in [keepCount, end)) push;
+  // This meant message count grew by 1 every compaction (170+ observed),
+  // context never shrank, per-turn latency degraded 3s->99s, and the process
+  // eventually crashed from memory exhaustion. Now we genuinely DELETE the
+  // middle history, keeping only: [original user msg] + [summary] + [recent N].
+  const size_t total = state.messagesForTurn.size();
+  // Keep the most recent messages so the model retains immediate context
+  // (recent tool calls/results, the current sub-task).
+  const size_t kRecentKeep = 10;
+  const size_t recentStart = (total > keepCount + kRecentKeep)
+      ? (total - kRecentKeep) : keepCount;
   std::vector<Message> compacted;
+  // 1. Preserve leading messages up to keepCount (includes original user msg).
   for (size_t i = 0; i < keepCount; ++i)
     compacted.push_back(state.messagesForTurn[i]);
+  // 2. Insert the summary, REPLACING the deleted middle history.
   compacted.push_back(summary);
-  for (size_t i = keepCount; i < state.messagesForTurn.size(); ++i)
+  // 3. Append only the recent tail (recentStart .. end), dropping everything
+  //    between keepCount and recentStart. This is the actual compaction.
+  for (size_t i = recentStart; i < total; ++i)
     compacted.push_back(state.messagesForTurn[i]);
 
+  ReportQueryLoopDebugEvent(
+      "2", "QueryLoop.cpp:autocompact:truncated",
+      "[INFO] Compacted context via truncation",
+      {{"beforeCount", static_cast<int>(beforeCount)},
+       {"afterCount", static_cast<int>(compacted.size())},
+       {"droppedCount", static_cast<int>(recentStart - keepCount)},
+       {"summaryChars", static_cast<int>(summaryText.size())}},
+      MakeQueryLoopTraceId("autocompact-trunc"));
+
   state.messagesForTurn = compacted;
+  // R5 (CRITICAL): Sync ctx.messages so the compaction PERSISTS. Previously
+  // only state.messagesForTurn was updated, but ApplyStepModelCall rebuilds
+  // messagesForTurn from ctx.messages every turn via BuildMessagesForTurn —
+  // so the compaction was silently undone next turn and context grew forever.
+  // Mirror Handle413Recovery's approach (it writes ctx.messages directly).
+  ctx.messages = compacted;
   if (ctx.hookExecutor != nullptr) {
     ctx.hookExecutor->RunPostCompactHooks(
         beforeCount,
@@ -2882,6 +3175,10 @@ bool QueryLoop::ApplyStepModelCall(QueryLoopContext& ctx,
   state.validatorRequestedRetry = false;
   state.forceContinuation = false;
   state.forceContinuationReason.clear();
+  // FIX-C: a new model call starts a fresh turn — reset the per-turn
+  // permission-denied tally (the session-wide totalPermissionDeniedCount is
+  // intentionally NOT reset).
+  state.recentPermissionDeniedCount = 0;
 
   Message currentAssistant;
   currentAssistant.role = MessageRole::Assistant;
@@ -3308,13 +3605,30 @@ void QueryLoop::GenerateExecutionContract(QueryLoopContext& ctx,
                                           QueryLoopInternalState& state) {
   if (state.executionContractGenerated) return;
   state.executionContractGenerated = true;  // never retry on failure
-  // Only Stronger tier benefits from a contract (Peer/Weaker skip LLM
-  // validation entirely, so a contract has no consumer).
-  const std::string validatorModel = ResolveValidatorModel(ctx);
-  const ValidatorTier tier = ResolveValidatorTier(ctx, validatorModel);
-  if (tier != ValidatorTier::Stronger) return;
   // Allow operator opt-out
   if (infra::GetEnvString("CPP_AGENT_DISABLE_CONTRACT") == "1") return;
+  const std::string validatorModel = ResolveValidatorModel(ctx);
+  const ValidatorTier tier = ResolveValidatorTier(ctx, validatorModel);
+  // FIX-E3 (weak-model support): historically only Stronger tier generated a
+  // contract (it had a validator consumer). But the contract also serves as a
+  // structured goal restatement that the task anchor re-injects every turn —
+  // exactly what weak models need to stay on-task. So for weak local model
+  // families (Gemma/Qwen/MiMo/Generic), generate the contract with the MAIN
+  // model itself (temperature=0) even without a stronger validator. Strong
+  // models keep the original Stronger-tier path. The env opt-out above still
+  // applies.
+  std::string contractModel = validatorModel;
+  if (tier != ValidatorTier::Stronger) {
+    const core::ModelFamily fam = core::DetectModelFamily(ctx.model);
+    if (fam != core::ModelFamily::Claude) {
+      // Weak/local model without a stronger validator: use the main model.
+      contractModel = ctx.model;
+    } else {
+      // Strong model, no stronger validator: skip (Claude doesn't need the
+      // crutch, and the extra call adds latency without a validator consumer).
+      return;
+    }
+  }
 
   // Extract the user's goal from the turn messages
   std::string goal;
@@ -3333,7 +3647,7 @@ void QueryLoop::GenerateExecutionContract(QueryLoopContext& ctx,
 
   api::SideQueryRequest request;
   request.querySource = "contract";
-  request.model = validatorModel;
+  request.model = contractModel;
   request.systemPrompt =
       "You generate an execution contract for a coding task. Given the user's "
       "goal, output a JSON object with: \"goal\" (restated), \"constraints\" "
@@ -3351,7 +3665,7 @@ void QueryLoop::GenerateExecutionContract(QueryLoopContext& ctx,
 
   if (ctx.sessionManager) {
     ctx.sessionManager->AppendModelIoRecord(
-        infra::ModelIoLogKind::Validator, "contract-request", validatorModel,
+        infra::ModelIoLogKind::Validator, "contract-request", contractModel,
         request.systemPrompt, request.messages, state.turnCount);
   }
   api::SideQueryResponse response = sideQueryClient_.Query(request);
@@ -3364,10 +3678,22 @@ void QueryLoop::GenerateExecutionContract(QueryLoopContext& ctx,
     }
   }
   if (contractText.empty()) return;
-  // Basic validation: must look like JSON
-  if (contractText.find('{') == std::string::npos) return;
+  // FIX-E3: weak models may not produce strict JSON. If it looks like JSON
+  // (has '{') keep it verbatim; otherwise still use the text as a structured
+  // goal restatement — the task anchor re-injects it every turn, and even a
+  // loose restatement keeps a weak model on-task better than nothing.
+  if (contractText.find('{') == std::string::npos &&
+      contractText.size() < 20) {
+    // Too short and not JSON — likely a refusal or error. Discard.
+    return;
+  }
 
   state.executionContract = contractText;
+  // FIX-E3: also seed the task anchor with the contract so every turn's
+  // anchor reflects the structured goal, not just the raw user message.
+  if (!contractText.empty() && contractText.size() <= 4000) {
+    state.cachedTaskAnchor = contractText;
+  }
   // Inject the contract as a system meta message at the front of the turn
   // so the main model sees the acceptance criteria before working.
   Message contractMsg;
@@ -3634,7 +3960,12 @@ StopHookResult QueryLoop::ExecuteStopHooks(QueryLoopContext& ctx,
   // that leverages the model's own self-correction capability.
   if (result.followupMessages.empty() && !result.preventContinuation &&
       state.consecutiveWriteWithoutVerifyCount >= 2 &&
-      state.completionNudgeCount < 1) {
+      state.completionNudgeCount < 1 &&
+      // FIX-C: skip this nudge when execution tools are permission-blocked;
+      // it demands "run with Bash" which the agent cannot do, so nudging
+      // only prolongs a death loop. ApplyStepTerminate will emit the
+      // verification_blocked_no_exec_tools termination instead.
+      state.totalPermissionDeniedCount == 0) {
     ++state.completionNudgeCount;
     Message verifyNudge;
     verifyNudge.role = MessageRole::System;
@@ -3691,9 +4022,50 @@ bool QueryLoop::ApplyStepRunTools(QueryLoopContext& ctx,
   }
 
   auto canUseTool = permissionEngine_.BuildCanUseTool();
-  tools::ToolOrchestrator::ExecuteResult execResult =
-      toolOrchestrator_.Execute(state.toolUseBlocks, canUseTool,
-                                ctx.messages);
+  tools::ToolOrchestrator::ExecuteResult execResult;
+  // R4-3: Third line of defense. ExecuteToolBlock is already wrapped (R4-2),
+  // but Execute itself (partitioning, permission, hooks) can still throw.
+  // Catch here so a crash doesn't escape to RunTurnWithRecovery's silent
+  // catch — instead synthesize an error result so the model can react.
+  bool executeCrashed = false;
+  try {
+    execResult = toolOrchestrator_.Execute(state.toolUseBlocks, canUseTool,
+                                          ctx.messages);
+  } catch (const std::exception& e) {
+    executeCrashed = true;
+    LOG_ERROR(QUERY, "ToolOrchestrator::Execute threw exception",
+              {{"what", std::string(e.what())},
+               {"turnCount", std::to_string(state.turnCount)},
+               {"toolCount",
+                std::to_string(state.toolUseBlocks.size())}});
+    // Synthesize one error result per requested tool so the model sees feedback.
+    for (const auto& block : state.toolUseBlocks) {
+      Message errMsg;
+      errMsg.role = MessageRole::User;
+      errMsg.content.push_back(ContentBlock::MakeToolResult(
+          block.asToolUse.id,
+          std::string("[Tool orchestrator crashed] internal error: ") +
+              e.what() + "\nTool: " + block.asToolUse.name,
+          true));
+      execResult.userMessages.push_back(errMsg);
+      execResult.errorCount++;
+    }
+  } catch (...) {
+    executeCrashed = true;
+    LOG_ERROR(QUERY, "ToolOrchestrator::Execute threw non-std exception",
+              {{"turnCount", std::to_string(state.turnCount)}});
+    for (const auto& block : state.toolUseBlocks) {
+      Message errMsg;
+      errMsg.role = MessageRole::User;
+      errMsg.content.push_back(ContentBlock::MakeToolResult(
+          block.asToolUse.id,
+          std::string("[Tool orchestrator crashed] unknown internal error") +
+              "\nTool: " + block.asToolUse.name,
+          true));
+      execResult.userMessages.push_back(errMsg);
+      execResult.errorCount++;
+    }
+  }
   ReportQueryLoopDebugEvent(
       "3", "QueryLoop.cpp:run-tools:result",
       "[DEBUG] Tool execution finished",
@@ -3702,6 +4074,7 @@ bool QueryLoop::ApplyStepRunTools(QueryLoopContext& ctx,
        {"toolResultCount", static_cast<int>(execResult.userMessages.size())},
        {"deniedCount", execResult.deniedCount},
        {"errorCount", execResult.errorCount},
+       {"executeCrashed", executeCrashed},
        {"firstToolResultIsError",
         !execResult.userMessages.empty() &&
             !execResult.userMessages.front().content.empty() &&
@@ -3721,6 +4094,11 @@ bool QueryLoop::ApplyStepRunTools(QueryLoopContext& ctx,
                                     .asToolResult.content)
             : std::string()}},
       MakeQueryLoopTraceId("tools"));
+  // FIX-C: tally permission-denied tool results for this turn + session. The
+  // completion-nudge path consults recentPermissionDeniedCount to avoid
+  // looping "you MUST run tests, use Bash" while Bash is permission-blocked.
+  state.recentPermissionDeniedCount += execResult.deniedCount;
+  state.totalPermissionDeniedCount += execResult.deniedCount;
   for (const auto& msg : state.assistantMessages)
     ctx.messages.push_back(msg);
   for (const auto& rm : execResult.userMessages)
@@ -3751,6 +4129,41 @@ bool QueryLoop::ApplyStepRunTools(QueryLoopContext& ctx,
     if (hasProductiveTool) {
       state.forcedContinuationCount = 0;
     }
+  }
+  // FIX-D: session-wide permission-denial guard. When the model keeps trying
+  // different Bash/exec tool variants that are all blocked by the permission
+  // gate (observed: 12 distinct Bash commands tried, each denied, no two
+  // fingerprints identical so the duplicate detector never fires), terminate
+  // once the cumulative denial count crosses the threshold. This is the
+  // MiMo-Code DOOM_LOOP_THRESHOLD spirit applied to permission rejections.
+  static const int kPermissionDenialCap = [] {
+    const char* env = std::getenv("CPP_AGENT_PERMISSION_DENIAL_CAP");
+    if (env && *env) {
+      int v = std::atoi(env);
+      if (v >= 1) return v;
+    }
+    return 5;
+  }();
+  if (state.totalPermissionDeniedCount >= kPermissionDenialCap) {
+    Message terminationMsg;
+    terminationMsg.role = MessageRole::System;
+    terminationMsg.uuid = "permission-denial-cap-terminate";
+    terminationMsg.isMeta = true;
+    terminationMsg.content.push_back(ContentBlock::MakeText(
+        "[system] Terminating: " +
+        std::to_string(state.totalPermissionDeniedCount) +
+        " tool calls have been denied by the permission gate this session. "
+        "Execution tools (Bash/FileEdit) are not available in this "
+        "non-interactive session. To allow them, re-run with "
+        "CPP_AGENT_PERMISSION_MODE=bypass or in interactive mode."));
+    ctx.messages.push_back(terminationMsg);
+    if (ctx.sessionManager) {
+      ctx.sessionManager->AppendMessageToTranscript(terminationMsg);
+    }
+    state.completed = true;
+    state.terminalReason = "permission_denial_cap";
+    state.toolUseBlocks.clear();
+    return false;
   }
   state.toolUseBlocks.clear();
   return !execResult.userMessages.empty();
@@ -3918,6 +4331,47 @@ bool QueryLoop::ApplyStepTerminate(QueryLoopContext& ctx,
     // to give the model one last chance to run/test/verify.
     // This prevents the "wrote files then silently exited" pattern.
     static const int kMaxCompletionNudges = 1;
+    // FIX-C: if the session has written files it never verified AND at least
+    // one tool call was denied by the permission gate this session, the
+    // completion-nudge ("you MUST run tests, use Bash") is unactionable — the
+    // agent cannot execute Bash/FileEdit, so nudging just burns turns in a
+    // death loop (observed: 9 min / 33 turns of repeated Glob/Read). Terminate
+    // cleanly with an actionable reason instead. The user can re-run in
+    // interactive mode or set CPP_AGENT_PERMISSION_MODE=bypass.
+    if (state.consecutiveWriteWithoutVerifyCount > 0 &&
+        state.totalPermissionDeniedCount > 0) {
+      Message blocked;
+      blocked.role = MessageRole::System;
+      blocked.uuid = "verification-blocked-no-exec-tools";
+      blocked.isMeta = true;
+      blocked.content.push_back(ContentBlock::MakeText(
+          "[system] Terminating: project files were written but could not be "
+          "verified because execution tools (Bash/FileEdit) are blocked by "
+          "the permission gate in this non-interactive session (" +
+          std::to_string(state.totalPermissionDeniedCount) +
+          " permission-denied tool result(s)). To enable self-verification, "
+          "re-run with CPP_AGENT_PERMISSION_MODE=bypass or in interactive "
+          "mode and approve the commands. The written files remain on disk."));
+      ctx.messages.push_back(blocked);
+      if (ctx.sessionManager) {
+        ctx.sessionManager->AppendMessageToTranscript(blocked);
+      }
+      AppendTurnArtifacts(
+          ctx, state.assistantMessages, state.toolResultMessages,
+          state.pendingFollowupMessages);
+      state.completed = true;
+      state.terminalReason = "verification_blocked_no_exec_tools";
+      ReportQueryLoopDebugEvent(
+          "2", "QueryLoop.cpp:terminate:verification-blocked",
+          "[WARN] Terminating: verification blocked (exec tools permission-denied)",
+          {{"turnCount", state.turnCount},
+           {"consecutiveWriteWithoutVerifyCount",
+            state.consecutiveWriteWithoutVerifyCount},
+           {"totalPermissionDeniedCount",
+            state.totalPermissionDeniedCount}},
+          MakeQueryLoopTraceId("verification-blocked"));
+      return false;
+    }
     if (state.consecutiveWriteWithoutVerifyCount > 0 &&
         state.completionNudgeCount < kMaxCompletionNudges &&
         HasRecentToolActivity(ctx)) {
@@ -4730,6 +5184,10 @@ void QueryLoop::RunFull(QueryLoopContext& ctx) {
           state.terminalReason = "duplicate_tool_loop";
           continue;
         }
+        // FIX-E4: Check for degenerate text loops (repeated prose across
+        // turns). Returns true if a recovery nudge was injected (continue the
+        // loop) — state.completed is set when recovery is exhausted.
+        if (HandleTextLoop(ctx, state)) continue;
         bool hasToolResults = ApplyStepRunTools(ctx, state);
         if (!hasToolResults) {
           state.completed = true;

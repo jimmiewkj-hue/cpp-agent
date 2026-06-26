@@ -1,0 +1,35 @@
+=== AppStateStore Tests ===
+[Task Lifecycle]
+  register_task_creates_idle_task... PASSED
+  get_nonexistent_task_returns_null... PASSED
+  update_task_status... PASSED
+  complete_task_sets_status_and_tokens... PASSED
+  failed_task_sets_status... PASSED
+  list_tasks_all... PASSED
+  list_tasks_by_status... PASSED
+  active_task_count... PASSED
+  has_running_tasks... PASSED
+  update_task_activity... PASSED
+[Completion Boundaries]
+  record_completion_boundary... PASSED
+  recent_boundaries_limit... PASSED
+  bash_boundary_stores_command... PASSED
+  edit_boundary_stores_file_path... PASSED
+  denied_tool_boundary_stores_detail... PASSED
+  clear_boundaries... PASSED
+[Compact Tracking]
+  record_compaction_increments_counters... PASSED
+  record_time_based_compaction... PASSED
+  reset_compact_tracking... PASSED
+[Memory State]
+  record_memory_extraction... PASSED
+  record_memory_consolidation... PASSED
+  session_memory_initialized_flag... PASSED
+[Session Metadata]
+  session_metadata_crud... PASSED
+  session_metadata_nonexistent_returns_empty... PASSED
+  session_metadata_overwrite... PASSED
+[Real-World Scenario]
+  real_world_full_session_lifecycle... PASSED
+
+All AppStateStore tests PASSED

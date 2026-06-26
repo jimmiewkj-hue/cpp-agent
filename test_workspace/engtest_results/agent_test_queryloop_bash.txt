@@ -1,0 +1,9 @@
+[32m2026-06-20T16:49:30.257 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1[0m
+[32m2026-06-20T16:49:30.502 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1[0m
+[32m2026-06-20T16:49:30.736 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1[0m
+[32m2026-06-20T16:49:30.974 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1[0m
+[32m2026-06-20T16:49:31.205 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1[0m
+[32m2026-06-20T16:49:32.212 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1[0m
+[32m2026-06-20T16:49:33.280 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1[0m
+[test_queryloop_bash] Failures: 0
+All tests passed.

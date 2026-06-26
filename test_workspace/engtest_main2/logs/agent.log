@@ -1,0 +1,65 @@
+2026-06-20T17:42:37.338 [INFO ] [QRY] Model call start turn=1 model=gemma-4-31B-it-Q8_0.gguf contextMessages=1 transition=0
+2026-06-20T17:42:37.341 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=3 hasTools=true
+2026-06-20T17:43:02.247 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=1069 textEvents=1066 toolEvents=1 apiErrors=0 elapsedMs=24906
+2026-06-20T17:43:02.248 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-20T17:43:02.249 [INFO ] [QRY] Model call start turn=2 model=gemma-4-31B-it-Q8_0.gguf contextMessages=3 transition=9
+2026-06-20T17:43:02.250 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=4 hasTools=true
+2026-06-20T17:43:10.258 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=3 textEvents=0 toolEvents=1 apiErrors=0 elapsedMs=8008
+2026-06-20T17:43:10.260 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-20T17:43:10.261 [INFO ] [QRY] Model call start turn=3 model=gemma-4-31B-it-Q8_0.gguf contextMessages=6 transition=9
+2026-06-20T17:43:10.262 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=7 hasTools=true
+2026-06-20T17:43:32.697 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=731 textEvents=728 toolEvents=1 apiErrors=0 elapsedMs=22434
+2026-06-20T17:43:32.697 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-20T17:43:32.698 [INFO ] [QRY] Model call start turn=4 model=gemma-4-31B-it-Q8_0.gguf contextMessages=9 transition=9
+2026-06-20T17:43:32.699 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=10 hasTools=true
+2026-06-20T17:43:59.199 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=742 textEvents=739 toolEvents=1 apiErrors=0 elapsedMs=26500
+2026-06-20T17:43:59.200 [INFO ] [QRY] Model call start turn=5 model=gemma-4-31B-it-Q8_0.gguf contextMessages=11 transition=8
+2026-06-20T17:43:59.201 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=12 hasTools=true
+2026-06-20T17:44:16.509 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=256 textEvents=253 toolEvents=1 apiErrors=0 elapsedMs=17307
+2026-06-20T17:44:16.509 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-20T17:44:16.510 [INFO ] [QRY] Model call start turn=6 model=gemma-4-31B-it-Q8_0.gguf contextMessages=15 transition=9
+2026-06-20T17:44:16.511 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=16 hasTools=true
+2026-06-20T17:44:30.233 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=308 textEvents=305 toolEvents=1 apiErrors=0 elapsedMs=13721
+2026-06-20T17:44:30.233 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-20T17:44:30.449 [INFO ] [QRY] Model call start turn=7 model=gemma-4-31B-it-Q8_0.gguf contextMessages=17 transition=9
+2026-06-20T17:44:30.450 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=18 hasTools=true
+2026-06-20T17:44:41.048 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=65 textEvents=62 toolEvents=1 apiErrors=0 elapsedMs=10598
+2026-06-20T17:44:41.049 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-20T17:44:41.049 [INFO ] [QRY] Model call start turn=8 model=gemma-4-31B-it-Q8_0.gguf contextMessages=19 transition=9
+2026-06-20T17:44:41.050 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=21 hasTools=true
+2026-06-20T17:44:53.855 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=152 textEvents=149 toolEvents=1 apiErrors=0 elapsedMs=12805
+2026-06-20T17:44:53.856 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-20T17:44:53.856 [INFO ] [QRY] Model call start turn=9 model=gemma-4-31B-it-Q8_0.gguf contextMessages=23 transition=9
+2026-06-20T17:44:53.857 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=25 hasTools=true
+2026-06-20T17:45:05.497 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=72 textEvents=69 toolEvents=1 apiErrors=0 elapsedMs=11640
+2026-06-20T17:45:05.497 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-20T17:45:05.498 [INFO ] [QRY] Model call start turn=10 model=gemma-4-31B-it-Q8_0.gguf contextMessages=26 transition=9
+2026-06-20T17:45:05.499 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=28 hasTools=true
+2026-06-20T17:45:26.182 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=208 textEvents=205 toolEvents=1 apiErrors=0 elapsedMs=20683
+2026-06-20T17:45:26.182 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-20T17:45:26.183 [INFO ] [QRY] Model call start turn=11 model=gemma-4-31B-it-Q8_0.gguf contextMessages=30 transition=9
+2026-06-20T17:45:26.184 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=32 hasTools=true
+2026-06-20T17:45:41.102 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=173 textEvents=170 toolEvents=1 apiErrors=0 elapsedMs=14918
+2026-06-20T17:45:41.103 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-20T17:45:41.103 [INFO ] [QRY] Model call start turn=12 model=gemma-4-31B-it-Q8_0.gguf contextMessages=33 transition=9
+2026-06-20T17:45:41.104 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=35 hasTools=true
+2026-06-20T17:45:53.419 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=3 textEvents=0 toolEvents=1 apiErrors=0 elapsedMs=12314
+2026-06-20T17:45:53.420 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-20T17:45:53.420 [INFO ] [QRY] Model call start turn=13 model=gemma-4-31B-it-Q8_0.gguf contextMessages=36 transition=9
+2026-06-20T17:45:53.421 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=38 hasTools=true
+2026-06-20T17:46:08.977 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=162 textEvents=159 toolEvents=1 apiErrors=0 elapsedMs=15555
+2026-06-20T17:46:08.977 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-20T17:46:09.187 [INFO ] [QRY] Model call start turn=14 model=gemma-4-31B-it-Q8_0.gguf contextMessages=38 transition=9
+2026-06-20T17:46:09.188 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=40 hasTools=true
+2026-06-20T17:46:22.202 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=3 textEvents=0 toolEvents=1 apiErrors=0 elapsedMs=13014
+2026-06-20T17:46:22.203 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-20T17:46:22.448 [INFO ] [QRY] Model call start turn=15 model=gemma-4-31B-it-Q8_0.gguf contextMessages=40 transition=9
+2026-06-20T17:46:22.449 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=42 hasTools=true
+2026-06-20T17:46:40.962 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=327 textEvents=325 toolEvents=0 apiErrors=0 elapsedMs=18513
+2026-06-20T17:46:40.963 [INFO ] [QRY] Model call start turn=16 model=gemma-4-31B-it-Q8_0.gguf contextMessages=42 transition=8
+2026-06-20T17:46:40.964 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=44 hasTools=true
+2026-06-20T17:46:54.102 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=3 textEvents=0 toolEvents=1 apiErrors=0 elapsedMs=13138
+2026-06-20T17:46:54.103 [INFO ] [TOL] Execute tools toolBlocks=1 batches=1
+2026-06-20T17:46:54.380 [INFO ] [QRY] Model call start turn=17 model=gemma-4-31B-it-Q8_0.gguf contextMessages=44 transition=9
+2026-06-20T17:46:54.381 [INFO ] [MDL] StreamResponse start model=gemma-4-31B-it-Q8_0.gguf messages=46 hasTools=true
+2026-06-20T17:47:12.026 [INFO ] [MDL] StreamResponse complete model=gemma-4-31B-it-Q8_0.gguf totalEvents=313 textEvents=311 toolEvents=0 apiErrors=0 elapsedMs=17645

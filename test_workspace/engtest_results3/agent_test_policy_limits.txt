@@ -1,0 +1,15 @@
+=== Policy Limits Tests ===
+  default_no_restrictions... PASSED
+  disabled_config_allows_all... PASSED
+  restrict_bash_execution... PASSED
+  restrict_network_access... PASSED
+  restrict_file_write... PASSED
+  restrict_subprocess... PASSED
+  remove_restriction... PASSED
+  get_restriction_details... PASSED
+  get_nonexistent_restriction... PASSED
+  multiple_restrictions... PASSED
+  load_default_restrictions... PASSED
+  format_summary... PASSED
+
+All policy limits tests PASSED

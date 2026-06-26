@@ -1,0 +1,29 @@
+=== Compact Module Tests ===
+[TimeBasedMCConfig]
+  default_config_is_disabled... PASSED
+  should_not_trigger_when_disabled... PASSED
+  should_not_trigger_with_zero_timestamp... PASSED
+  should_trigger_when_gap_exceeded... PASSED
+  should_not_trigger_when_gap_not_exceeded... PASSED
+  should_trigger_with_custom_threshold... PASSED
+  should_not_trigger_below_custom_threshold... PASSED
+  env_var_config_parsing... PASSED
+[SessionMemoryCompact]
+  sm_compact_default_config... PASSED
+  should_not_use_when_disabled... PASSED
+  should_not_use_when_memory_empty... PASSED
+  should_use_when_enabled_and_memory_not_empty... PASSED
+  build_injection_null_session_memory... PASSED
+  truncate_empty_content... PASSED
+  truncate_small_content... PASSED
+  truncate_large_content... PASSED
+[SessionMemory Integration]
+  session_memory_crud_lifecycle... PASSED
+  session_memory_context_injection... PASSED
+  session_memory_priority_sorting... PASSED
+  session_memory_search_case_insensitive... PASSED
+[Real-World Scenarios]
+  real_world_timeout_loop_protection... PASSED
+  real_world_memory_injection_with_truncation... PASSED
+
+All compact module tests PASSED

@@ -1,0 +1,10 @@
+=== HookTypes Tests ===
+  HookTypes tests done.
+=== HookConfig Tests ===
+  HookConfig tests done.
+=== HookExecutor Tests ===
+  HookExecutor tests done.
+=== Hook Types & Fields Tests ===
+  Types & fields tests done.
+
+All hook tests PASSED

@@ -1,0 +1,36 @@
+=== MCP Channel Permissions Tests ===
+[Basic]
+  default_config_allows_all... PASSED
+  disabled_config_allows_all... PASSED
+[Global Blocklist]
+  global_blocklist_blocks_tool... PASSED
+  global_blocklist_with_fqn... PASSED
+  global_blocklist_does_not_block_other... PASSED
+[Global Allowlist]
+  global_allowlist_only_allows_listed... PASSED
+[Server Blocklist]
+  server_blocklist_overrides_global_allow... PASSED
+  server_blocklist_does_not_affect_other_server... PASSED
+[Server Allowlist]
+  server_allowlist_restricts_tools... PASSED
+[Read-Only/Destructive]
+  auto_approve_readonly_tool... PASSED
+  require_approval_for_destructive... PASSED
+  destructive_readonly_not_auto_approved... PASSED
+  safe_readonly_tool_auto_approved... PASSED
+[Approval Logic]
+  should_require_approval_when_permission_says_so... PASSED
+  should_not_require_approval_when_permission_says_no... PASSED
+  should_not_require_approval_when_disabled... PASSED
+[Formatting]
+  format_summary_disabled... PASSED
+  format_summary_enabled_with_lists... PASSED
+[Edge Cases]
+  empty_tool_name_handled... PASSED
+  empty_server_name_handled... PASSED
+  blocklist_takes_priority_over_allowlist... PASSED
+  duplicate_entries_handled... PASSED
+[Real-World Scenario]
+  real_world_github_mcp_server... PASSED
+
+All MCP channel permissions tests PASSED

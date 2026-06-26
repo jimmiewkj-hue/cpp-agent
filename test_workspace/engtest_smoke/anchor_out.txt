@@ -1,0 +1,17 @@
+[stage] ToolBudget
+[context] 2090 tokens (1%)
+[stage] ModelCall
+[tool_call] TodoWrite {"todos":[{"acceptance_criteria":"File anchor_probe.py exists with content print('ANCHOR')","activeForm":"creating an...
+[stage] StopHooks
+[stage] RunTools
+[tool_result] received
+[stage] ToolBudget
+[context] 2592 tokens (1%)
+[stage] ModelCall
+[tool_call] Write {"content":"print('ANCHOR')","file_path":"anchor_probe.py"}
+[stage] StopHooks
+[stage] RunTools
+[tool_result] received
+[stage] ToolBudget
+[loop_completed] max_turns
+Session saved. Bye.

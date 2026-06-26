@@ -75,6 +75,30 @@ struct QueryLoopInternalState {
   std::string lastErrorSummary;
   // P0-3: Track completion nudges to prevent silent termination
   int completionNudgeCount = 0;
+  // FIX-C: Track how many tool calls this turn were denied/ask-blocked by the
+  // permission gate (e.g. "requires confirmation" in non-interactive mode).
+  // Reset at the start of each model call. When the agent has written files
+  // but cannot run them (Bash blocked), the completion-nudge ("you MUST run
+  // tests, use Bash") would otherwise loop forever; this counter lets
+  // ApplyStepTerminate detect that and terminate cleanly instead.
+  int recentPermissionDeniedCount = 0;
+  // FIX-C: session-wide count of permission-denied tool results, so a runaway
+  // nudge loop is bounded even across turns.
+  int totalPermissionDeniedCount = 0;
+  // FIX-E1 (weak-model support): cached original user goal for the task anchor.
+  // Captured once from the first non-meta user message and re-injected at the
+  // front of every turn so weak models do not drift off-task (observed: Gemma
+  // built a 'task_manager' project instead of the requested 'md2html'). Empty
+  // = not yet captured or no user goal found (anchor suppressed).
+  std::string cachedTaskAnchor;
+  bool taskAnchorCaptured = false;
+  // FIX-E4 (weak-model support): text-loop detection. Weak models sometimes
+  // emit near-identical prose turn after turn (paraphrased repetition) while
+  // taking no productive action — the existing duplicate-TOOL detector misses
+  // this because the tool calls differ. We keep a small ring buffer of
+  // normalized assistant text and terminate when repetition persists.
+  std::vector<std::string> recentAssistantTextFingerprints;
+  int textLoopRecoveryAttempts = 0;
   // P0-3: Track result-check nudges for suspicious output after Bash runs
   int resultCheckNudgeCount = 0;
   // P0-4: Give one forced-action nudge before hard-stopping exploration loops
@@ -211,7 +235,7 @@ class QueryLoop {
                             bool resetTurnCount);
   std::vector<Message> BuildMessagesForTurn(
       const QueryLoopContext& ctx,
-      const QueryLoopInternalState& state) const;
+      QueryLoopInternalState& state) const;
   void PostToolTurnProcessing(QueryLoopContext& ctx,
                               QueryLoopInternalState& state);
   void AppendTurnArtifacts(QueryLoopContext& ctx,
@@ -242,6 +266,13 @@ class QueryLoop {
   bool ShouldTerminateOnDuplicates(
       QueryLoopContext& ctx,
       QueryLoopInternalState& state) const;
+  // FIX-E4: detect near-identical assistant prose repeated across turns and
+  // escalate (mild nudge → strong nudge → terminate). Returns true if a
+  // recovery nudge was injected (caller should continue the loop) or false
+  // when no action taken / hard-termination was applied (caller checks
+  // state.completed).
+  bool HandleTextLoop(QueryLoopContext& ctx,
+                      QueryLoopInternalState& state);
   // P0-2: Goal Verifier — independent completion check before termination.
   // Uses SideQueryClient to verify if the user's goal is truly satisfied.
   // Returns true if the agent should CONTINUE (goal not met), false if OK to stop.

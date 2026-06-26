@@ -759,6 +759,31 @@ const char* PermissionModeLabel(agent::core::PermissionMode mode) {
   return "unknown";
 }
 
+// Parse a permission-mode string (case-insensitive) into a PermissionMode.
+// Returns the fallback when the string is empty or unrecognized. Mirrors the
+// spellings accepted by the TUI /permission command plus the local-ace
+// --permission-mode choices (default|acceptEdits|plan|bypassPermissions).
+// Used to honor CPP_AGENT_PERMISSION_MODE and settings.permissions.defaultMode.
+agent::core::PermissionMode ParsePermissionMode(
+    const std::string& raw, agent::core::PermissionMode fallback) {
+  std::string s = Trim(TrimWhitespace(raw));
+  // Lowercase ASCII for stable comparison.
+  for (char& c : s) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  }
+  if (s == "default") return agent::core::PermissionMode::Default;
+  if (s == "auto") return agent::core::PermissionMode::Auto;
+  if (s == "bypass" || s == "bypasspermissions" ||
+      s == "yolo" || s == "dangerously-skip-permissions")
+    return agent::core::PermissionMode::BypassPermissions;
+  if (s == "plan") return agent::core::PermissionMode::Plan;
+  if (s == "acceptedits" || s == "accept-edits")
+    return agent::core::PermissionMode::AcceptEdits;
+  if (s == "dontask" || s == "dont-ask")
+    return agent::core::PermissionMode::DontAsk;
+  return fallback;
+}
+
 std::string MakePermissionPreview(const agent::core::ContentBlock& toolUse) {
   if (toolUse.type != agent::core::BlockType::ToolUse) return "";
   std::string preview = toolUse.asToolUse.inputJson;
@@ -1848,6 +1873,37 @@ int main() {
     permissionEngine.AddAutoModeAllowlistedTool(toolName);
   }
 
+  // ===== FIX-A/B: permission rules + mode from settings.json + env =====
+  // Mirrors local-ace settings.permissions.{allow,deny,defaultMode} and adds
+  // a CPP_AGENT_PERMISSION_MODE env override (the non-interactive equivalent
+  // of local-ace --permission-mode / --dangerously-skip-permissions, and of
+  // MiMo-Code --dangerously-skip-permissions / MIMOCODE_PERMISSION). Without
+  // this, pipe mode had no way to let Bash/FileEdit execute, so the agent
+  // could write code but never build/run/verify it.
+  for (const std::string& rule : hookConfig->GetPermissionAllowRules()) {
+    permissionEngine.AddAlwaysAllowRule(rule);
+  }
+  for (const std::string& rule : hookConfig->GetPermissionDenyRules()) {
+    permissionEngine.AddAlwaysDenyRule(rule);
+  }
+  // Priority (ascending): settings.defaultMode < CPP_AGENT_PERMISSION_MODE.
+  // The env var wins so CI/headless runs can force bypass without editing
+  // project settings. Interactive mode keeps TUI control via /permission.
+  agent::core::PermissionMode resolvedPermissionMode =
+      agent::core::PermissionMode::Default;
+  const std::string settingsDefaultMode = hookConfig->GetPermissionDefaultMode();
+  if (!settingsDefaultMode.empty()) {
+    resolvedPermissionMode =
+        ParsePermissionMode(settingsDefaultMode, resolvedPermissionMode);
+  }
+  const std::string envPermissionMode =
+      Trim(TrimWhitespace(GetEnvOrDefault("CPP_AGENT_PERMISSION_MODE", "")));
+  if (!envPermissionMode.empty()) {
+    resolvedPermissionMode =
+        ParsePermissionMode(envPermissionMode, resolvedPermissionMode);
+  }
+  permissionEngine.SetPermissionMode(resolvedPermissionMode);
+
   toolOrchestrator.SetToolRegistry(&toolRegistry);
   toolOrchestrator.SetSubAgentManager(&subAgentManager);
   toolOrchestrator.SetMcpClientManager(&mcpClientManager);
@@ -1860,7 +1916,7 @@ int main() {
 
   agent::core::AgentConfig config = agent::core::AgentConfig::FromDefaults();
   config.systemPrompt = agent::app::BuildWorkspaceSystemPrompt(
-      workspace.trustedRoot, workspace.trusted);
+      workspace.trustedRoot, workspace.trusted, llmCfg.mainModel);
   config.defaultModel = llmCfg.mainModel;
   config.memoryRoot = memoryDir;
   config.sessionDir = sessionDir;

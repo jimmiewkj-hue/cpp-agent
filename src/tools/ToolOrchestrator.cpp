@@ -802,7 +802,29 @@ ToolOrchestrator::ExecuteResult ToolOrchestrator::Execute(
 
       // Collect results from parallel execution.
       for (auto& future : futures) {
-        ToolResult_ r = future.get();
+        ToolResult_ r;
+        // R4-2: future.get() rethrows any exception from the worker thread.
+        // Catch it so one crashing tool doesn't kill the whole turn.
+        try {
+          r = future.get();
+        } catch (const std::exception& e) {
+          r.toolName = "unknown";
+          r.isError = true;
+          r.error = std::string("internal error: ") + e.what();
+          r.message.role = core::MessageRole::User;
+          r.message.content.push_back(core::ContentBlock::MakeToolResult(
+              "", std::string("[Tool execution crashed] ") + r.error, true));
+          LOG_ERROR(TOOL, "Parallel tool future threw exception",
+                    {{"what", std::string(e.what())}});
+        } catch (...) {
+          r.toolName = "unknown";
+          r.isError = true;
+          r.error = "internal error: unknown exception in parallel tool";
+          r.message.role = core::MessageRole::User;
+          r.message.content.push_back(core::ContentBlock::MakeToolResult(
+              "", std::string("[Tool execution crashed] ") + r.error, true));
+          LOG_ERROR(TOOL, "Parallel tool future threw non-std exception", {});
+        }
         result.userMessages.push_back(r.message);
         if (r.isError) {
           result.errorCount++;
@@ -896,8 +918,30 @@ ToolOrchestrator::ExecuteResult ToolOrchestrator::Execute(
       }
 
       std::string execError;
-      std::string output =
-          ExecuteToolBlock(block, maxSize, &execError);
+      std::string output;
+      // R4-2: Wrap tool execution in try-catch so a thrown exception (e.g.
+      // malformed JSON args from the model, ProcessRunner resource cleanup
+      // race) becomes an error result fed back to the model, instead of
+      // crashing the entire turn via RunTurnWithRecovery's catch. Without
+      // this, graph3 sessions died silently right after a tool call with no
+      // Execute-tools log and no terminal reason.
+      try {
+        output = ExecuteToolBlock(block, maxSize, &execError);
+      } catch (const std::exception& e) {
+        execError = std::string("internal error: ") + e.what();
+        output = "[Tool execution crashed] " + execError +
+                 "\nTool: " + block.asToolUse.name +
+                 "\nInput: " + block.asToolUse.inputJson;
+        LOG_ERROR(TOOL, "ExecuteToolBlock threw exception",
+                  {{"tool", block.asToolUse.name},
+                   {"what", std::string(e.what())}});
+      } catch (...) {
+        execError = "internal error: unknown exception in tool execution";
+        output = "[Tool execution crashed] " + execError +
+                 "\nTool: " + block.asToolUse.name;
+        LOG_ERROR(TOOL, "ExecuteToolBlock threw non-std exception",
+                  {{"tool", block.asToolUse.name}});
+      }
 
       bool isError = !execError.empty();
 

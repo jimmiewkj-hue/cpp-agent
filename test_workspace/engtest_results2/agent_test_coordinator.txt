@@ -1,0 +1,16 @@
+=== Coordinator Mode Tests ===
+  is_coordinator_disabled_by_default... PASSED
+  is_coordinator_enabled_with_env... PASSED
+  match_session_mode_no_mismatch... PASSED
+  match_session_mode_empty_input... PASSED
+  build_system_prompt_contains_key_sections... PASSED
+  build_system_prompt_with_mcp_servers... PASSED
+  get_worker_tools_simple... PASSED
+  get_worker_tools_standard... PASSED
+  internal_worker_tools... PASSED
+  build_task_notification_completed... PASSED
+  parse_task_notification... PASSED
+  build_user_context_with_scratchpad... PASSED
+  coordination_phase_to_string... PASSED
+
+All coordinator mode tests PASSED

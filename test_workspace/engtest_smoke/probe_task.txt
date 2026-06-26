@@ -1,0 +1,1 @@
+Use FileWrite to create a file named probe.py containing: print("PROBE_OK"). Then use the Bash tool to run: python probe.py. Report the output and stop.
