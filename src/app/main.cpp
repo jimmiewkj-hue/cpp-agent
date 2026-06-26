@@ -1307,12 +1307,60 @@ class AnsiTui {
       return line;
     }
 
+    // ===== 重新实现的输入逻辑 =====
+    // cursorPos：光标在 wideLine 中的字符索引，范围 [0, wideLine.size()]
+    // 所有编辑操作（插入/删除/Backspace）都基于 cursorPos 进行
+    std::size_t cursorPos = 0;
+
+    // 统一的字符显示宽度计算
+    // \n 在输入框中显示为 ↵（U+21B5），显示宽度1，不产生实际换行
+    auto charDisplayWidth = [](wchar_t ch) -> int {
+      if (ch == L'\n') return 1;
+      return CodepointDisplayWidth(ch);
+    };
+
     auto redrawInput = [&]() {
-      SetCursorPosition(2, inputY);
+      const int promptWidth = 2;  // "> " 的显示宽度
+      const int maxDisplayWidth = std::max(1, sz.width - promptWidth);
+
+      // 计算光标之前的显示宽度
+      int cursorOffset = 0;
+      for (std::size_t i = 0; i < cursorPos; ++i)
+        cursorOffset += charDisplayWidth(wideLine[i]);
+
+      // 计算可见窗口起始偏移，确保光标始终可见
+      int windowStart = 0;
+      if (cursorOffset >= maxDisplayWidth)
+        windowStart = cursorOffset - maxDisplayWidth + 1;
+
+      // 清行并定位到行首
+      SetCursorPosition(0, inputY);
       WriteAnsi("\x1b[0K");
-      const std::string visibleInput = TailTruncateVisually(
-          WideToUtf8(wideLine), std::max(0, sz.width - 4));
-      std::cout << "\x1b[37m> \x1b[0m" << visibleInput << std::flush;
+
+      // 输出前缀
+      std::cout << "\x1b[37m> \x1b[0m" << std::flush;
+
+      // 输出可见范围内的字符
+      // \n 输出为 ↵（UTF-8: E2 86 B5），不产生实际换行
+      int pos = 0;
+      for (std::size_t i = 0; i < wideLine.size(); ++i) {
+        const int cw = charDisplayWidth(wideLine[i]);
+        if (pos >= windowStart &&
+            pos + cw <= windowStart + maxDisplayWidth) {
+          if (wideLine[i] == L'\n') {
+            std::cout << "\xe2\x86\xb5";  // ↵
+          } else {
+            std::cout << WideToUtf8(std::wstring(1, wideLine[i]));
+          }
+        }
+        pos += cw;
+        if (pos >= windowStart + maxDisplayWidth) break;
+      }
+      std::cout << std::flush;
+
+      // 将控制台光标定位到输入光标所在列
+      int cursorX = promptWidth + (cursorOffset - windowStart);
+      SetCursorPosition(cursorX, inputY);
     };
 
     int historyIndex = -1;
@@ -1356,22 +1404,57 @@ class AnsiTui {
           --historyIndex;
         }
         wideLine = inputHistory[historyIndex];
+        cursorPos = wideLine.size();
         redrawInput();
         continue;
       }
+      if (key.wVirtualKeyCode == VK_LEFT) {
+        if (cursorPos > 0) {
+          --cursorPos;
+          // 跳过 UTF-16 代理对的后半部分
+          if (cursorPos > 0 && wideLine[cursorPos] >= 0xDC00 &&
+              wideLine[cursorPos] <= 0xDFFF) {
+            --cursorPos;
+          }
+          redrawInput();
+        }
+        continue;
+      }
+      if (key.wVirtualKeyCode == VK_RIGHT) {
+        if (cursorPos < wideLine.size()) {
+          ++cursorPos;
+          // 跳过 UTF-16 代理对的后半部分
+          if (cursorPos < wideLine.size() && wideLine[cursorPos] >= 0xDC00 &&
+              wideLine[cursorPos] <= 0xDFFF) {
+            ++cursorPos;
+          }
+          redrawInput();
+        }
+        continue;
+      }
       if (key.wVirtualKeyCode == VK_HOME) {
-        // STRENGTHEN-TUI: Home scrolls to the very top and un-pins so new
-        // output doesn't yank the view away while the user reads history.
-        scrollOffset_ = 0;
-        userPinnedToBottom_ = false;
-        RefreshMessages();
+        // 输入框内：光标移到行首（消息区滚动改用 PgUp/PgDn 或鼠标滚轮）
+        cursorPos = 0;
+        redrawInput();
         continue;
       }
       if (key.wVirtualKeyCode == VK_END) {
-        // End re-pins to bottom (resume auto-follow).
-        scrollOffset_ = 999999;
-        userPinnedToBottom_ = true;
-        RefreshMessages();
+        // 输入框内：光标移到行尾
+        cursorPos = wideLine.size();
+        redrawInput();
+        continue;
+      }
+      if (key.wVirtualKeyCode == VK_DELETE) {
+        if (cursorPos < wideLine.size()) {
+          std::size_t eraseLen = 1;
+          if (cursorPos + 1 < wideLine.size() &&
+              wideLine[cursorPos + 1] >= 0xDC00 &&
+              wideLine[cursorPos + 1] <= 0xDFFF) {
+            eraseLen = 2;
+          }
+          wideLine.erase(cursorPos, eraseLen);
+          redrawInput();
+        }
         continue;
       }
       if (key.wVirtualKeyCode == VK_DOWN && !inputHistory.empty()) {
@@ -1383,6 +1466,7 @@ class AnsiTui {
           historyIndex = -1;
           wideLine.clear();
         }
+        cursorPos = wideLine.size();
         redrawInput();
         continue;
       }
@@ -1395,7 +1479,19 @@ class AnsiTui {
         bool ctrlPressed = (key.dwControlKeyState &
             (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
         if (ctrlPressed) {
-          wideLine.push_back(L'\n');
+          // Ctrl+Enter：在光标位置插入换行符（显示为 ↵）
+          wideLine.insert(wideLine.begin() + cursorPos, L'\n');
+          ++cursorPos;
+          redrawInput();
+          continue;
+        }
+        // 粘贴检测：如果输入队列中还有大量事件待读取，说明是粘贴
+        // 多行文本时的 Return，应转为换行符而非提交
+        DWORD remainingEvents = 0;
+        if (GetNumberOfConsoleInputEvents(inHandle, &remainingEvents) &&
+            remainingEvents > 1) {
+          wideLine.insert(wideLine.begin() + cursorPos, L'\n');
+          ++cursorPos;
           redrawInput();
           continue;
         }
@@ -1405,8 +1501,17 @@ class AnsiTui {
       }
 
       if (key.wVirtualKeyCode == VK_BACK) {
-        EraseLastWideCodepoint(&wideLine);
-        redrawInput();
+        if (cursorPos > 0) {
+          std::size_t eraseLen = 1;
+          // 处理 UTF-16 代理对
+          if (cursorPos >= 2 && wideLine[cursorPos - 1] >= 0xDC00 &&
+              wideLine[cursorPos - 1] <= 0xDFFF) {
+            eraseLen = 2;
+          }
+          wideLine.erase(cursorPos - eraseLen, eraseLen);
+          cursorPos -= eraseLen;
+          redrawInput();
+        }
         continue;
       }
 
@@ -1415,7 +1520,8 @@ class AnsiTui {
         continue;
 
       for (int i = 0; i < key.wRepeatCount; ++i) {
-        wideLine.push_back(wideChar);
+        wideLine.insert(wideLine.begin() + cursorPos, wideChar);
+        ++cursorPos;
       }
       redrawInput();
     }
@@ -2227,7 +2333,7 @@ int main() {
       tui.AppendMessage("/clear     Clear message log");
       tui.AppendMessage("/exit      Save session and quit");
       tui.AppendMessage("Permission prompt: Y allow, N deny, B bypass, A auto, D default, P plan, E acceptEdits");
-      tui.AppendMessage("Tip: Enter to send, Ctrl+Enter for newline.");
+      tui.AppendMessage("Tip: Enter to send, Ctrl+Enter for newline, Left/Right/Home/End to move cursor, Del to delete.");
       continue;
     }
     if (line.rfind("/permission ", 0) == 0) {
